@@ -1,0 +1,30 @@
+[build-system]
+requires = ["setuptools>=61.0", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[tool.setuptools.packages.find]
+include = ["textpolicy*"]
+
+[project]
+name = "textpolicy"
+version = "0.1.0"
+description = "MLX-optimized reward and verification system for text generation RL"
+readme = "README.md"
+requires-python = ">=3.12"
+dependencies = [
+    "numpy>=2.3.2",
+    "mlx>=0.21.0", # Core MLX framework for Apple Silicon acceleration
+    "mlx-lm>=0.21.0", # MLX language models for inference
+    "gymnasium>=0.29.0", 
+    "psutil>=7.0.0",
+    "wandb>=0.21.1",
+    "aiohttp>=3.12.15",
+    "pytest>=8.4.1",
+]
+
+[project.scripts]
+textpolicy = "textpolicy.cli:main"
+
+[project.optional-dependencies]
+external = ["aiohttp>=3.8.0", "pydantic>=2.0.0"]
+dev = ["pytest>=7.0.0", "black>=22.0.0", "ruff>=0.1.0"]
