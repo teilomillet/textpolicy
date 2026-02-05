@@ -55,10 +55,18 @@ Docs:
 - Full index: `docs/index.md`
 
 FAQ:
-- Do I need a model? Yes for generation with `create_policy`. Use `load_model()` (mlx‑lm) to get `(model, tokenizer)`. For reward‑only code (no generation), a model is not required.
-- Do I need a tokenizer? Yes. Both `TextGenerationEnv` and `TextGenerationEnvironment` require a tokenizer. `load_model()` returns one for mlx‑lm models.
-- How do I control generation? Pass `generation_params` to `create_policy` (for example, `max_tokens`, `temperature`, `top_p`, `repetition_penalty`).
-- What does `step()` return? A dict with `observation`, `reward`, `terminated`, `truncated`, `info`. The runner enforces this.
+- Do I need a model? 
+    - Yes for generation with `create_policy`. 
+    Use `load_model()` (mlx‑lm) to get `(model, tokenizer)`. 
+    For reward‑only code (no generation), a model is not required.
+- Do I need a tokenizer? 
+    - Yes. 
+    Both `TextGenerationEnv` and `TextGenerationEnvironment` require a tokenizer. 
+    `load_model()` returns one for mlx‑lm models.
+- How do I control generation? 
+    - Pass `generation_params` to `create_policy` (for example, `max_tokens`, `temperature`, `top_p`, `repetition_penalty`).
+- What does `step()` return? 
+    - A dict with `observation`, `reward`, `terminated`, `truncated`, `info`. The runner enforces this.
 
 Examples:
 - 01–06: reward functions, batch processing, minimal training

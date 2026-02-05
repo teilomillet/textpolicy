@@ -1,0 +1,22 @@
+repository:
+  description: >-
+    Reinforcement learning for text generation on MLX (Apple Silicon):
+    GRPO/GSPO algorithms, text-generation environments, rollout runner,
+    reward functions, and LoRA/QLoRA utilities.
+  homepage: ''
+  topics:
+    - mlx
+    - apple-silicon
+    - reinforcement-learning
+    - text-generation
+    - nlp
+    - lora
+    - qlora
+    - grpo
+    - gspo
+    - rlhf
+  has_issues: true
+  has_projects: false
+  has_wiki: false
+  default_branch: main
+
