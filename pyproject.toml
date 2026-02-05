@@ -7,8 +7,8 @@ include = ["textpolicy*"]
 
 [project]
 name = "textpolicy"
-version = "0.1.0"
-description = "MLX-optimized reward and verification system for text generation RL"
+version = "0.1.1"
+description = "Reinforcement learning for text generation on MLX (Apple Silicon): GRPO/GSPO, environments, rollout, rewards, LoRA/QLoRA"
 readme = "README.md"
 requires-python = ">=3.12"
 dependencies = [
@@ -21,6 +21,32 @@ dependencies = [
     "aiohttp>=3.12.15",
     "pytest>=8.4.1",
 ]
+
+keywords = [
+    "reinforcement-learning",
+    "text-generation",
+    "mlx",
+    "apple-silicon",
+    "lora",
+    "qlora",
+    "grpo",
+    "gspo",
+    "rlhf",
+]
+
+classifiers = [
+    "Programming Language :: Python :: 3",
+    "Operating System :: MacOS",
+    "Intended Audience :: Developers",
+    "Topic :: Scientific/Engineering :: Artificial Intelligence",
+    "License :: OSI Approved :: MIT License",
+]
+
+[project.urls]
+Homepage = "https://github.com/teilomillet/textpolicy"
+Repository = "https://github.com/teilomillet/textpolicy"
+Documentation = "https://github.com/teilomillet/textpolicy#readme"
+Changelog = "https://github.com/teilomillet/textpolicy/blob/main/CHANGELOG.md"
 
 [project.scripts]
 textpolicy = "textpolicy.cli:main"
