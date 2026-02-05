@@ -839,11 +839,14 @@ def _pack_episodes(episodes: List[Any]) -> Dict[str, Any]:
             # Episode object with attributes
             episode_reward = mx.sum(mx.array(episode.rew)).item()
             episode_rewards.append(episode_reward)
-            episode_lengths.append(len(episode.obs))
 
             # Flatten observation and action tokens
             flattened_obs = _flatten_tokens(episode.obs)
             flattened_acts = _flatten_tokens(episode.act)
+
+            # Use flattened token count for episode_lengths (used by _expand_advantages)
+            # This ensures alignment between expanded advantages and actual token sequences
+            episode_lengths.append(len(flattened_acts))
 
             # Create full sequence: [prompt_tokens..., response_tokens...]
             full_sequence = flattened_obs + flattened_acts
@@ -854,11 +857,13 @@ def _pack_episodes(episodes: List[Any]) -> Dict[str, Any]:
             # Serialized dictionary from multiprocessing
             episode_reward = mx.sum(mx.array(episode['rew'])).item()
             episode_rewards.append(episode_reward)
-            episode_lengths.append(len(episode['obs']))
 
             # Flatten observation and action tokens
             flattened_obs = _flatten_tokens(episode['obs'])
             flattened_acts = _flatten_tokens(episode['act'])
+
+            # Use flattened token count for episode_lengths
+            episode_lengths.append(len(flattened_acts))
 
             full_sequence = flattened_obs + flattened_acts
             all_obs.append(full_sequence)
