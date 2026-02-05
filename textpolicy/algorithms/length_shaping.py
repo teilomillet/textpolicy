@@ -12,7 +12,7 @@ References:
 
 from __future__ import annotations
 
-from typing import List, Dict
+from typing import List, Dict, Union
 
 try:
     import mlx.core as mx  # type: ignore
@@ -113,7 +113,7 @@ def compute_length_shaping_stats(
     sequence_lengths: List[int],
     max_length: int,
     cache_length: int = 100
-) -> Dict[str, float]:
+) -> Dict[str, Union[int, float]]:
     """
     Compute statistics about length penalties for monitoring.
 

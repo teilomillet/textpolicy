@@ -468,7 +468,7 @@ def filter_informative_prompts(
     episodes: List[Any],
     min_variance: float = 0.01,
     keep_single_completion: bool = True
-) -> Tuple[List[Any], Dict[str, int]]:
+) -> Tuple[List[Any], Dict[str, Union[int, float]]]:
     """
     Filter episodes to keep only informative prompts (DAPO dynamic sampling).
 
