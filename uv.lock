@@ -977,7 +977,7 @@ wheels = [
 
 [[package]]
 name = "textpolicy"
-version = "0.1.0"
+version = "0.1.1"
 source = { editable = "." }
 dependencies = [
     { name = "aiohttp" },
@@ -1007,8 +1007,8 @@ requires-dist = [
     { name = "aiohttp", marker = "extra == 'external'", specifier = ">=3.8.0" },
     { name = "black", marker = "extra == 'dev'", specifier = ">=22.0.0" },
     { name = "gymnasium", specifier = ">=0.29.0" },
-    { name = "mlx", specifier = ">=0.21.0" },
-    { name = "mlx-lm", specifier = ">=0.21.0" },
+    { name = "mlx", specifier = ">=0.22.0" },
+    { name = "mlx-lm", specifier = ">=0.22.0" },
     { name = "numpy", specifier = ">=2.3.2" },
     { name = "psutil", specifier = ">=7.0.0" },
     { name = "pydantic", marker = "extra == 'external'", specifier = ">=2.0.0" },

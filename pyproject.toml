@@ -13,9 +13,9 @@ readme = "README.md"
 requires-python = ">=3.12"
 dependencies = [
     "numpy>=2.3.2",
-    "mlx>=0.21.0", # Core MLX framework for Apple Silicon acceleration
-    "mlx-lm>=0.21.0", # MLX language models for inference
-    "gymnasium>=0.29.0", 
+    "mlx>=0.22.0", # Core MLX framework for Apple Silicon acceleration (tested up to 0.30.5)
+    "mlx-lm>=0.22.0", # MLX language models for inference (tested up to 0.30.6)
+    "gymnasium>=0.29.0",
     "psutil>=7.0.0",
     "wandb>=0.21.1",
     "aiohttp>=3.12.15",
