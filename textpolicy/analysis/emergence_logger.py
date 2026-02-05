@@ -159,13 +159,18 @@ class EmergenceLogger:
         example: Optional[dict],
     ) -> dict:
         """Build a per-generation record from a single episode."""
-        # Support both Episode objects and plain dicts
-        obs = getattr(episode, "obs", None) or episode.get("obs", [])
-        act = getattr(episode, "act", None) or episode.get("act", [])
-        rew = getattr(episode, "rew", None) or episode.get("rew", [])
-        logprob_raw = getattr(episode, "logprob", None)
-        if logprob_raw is None and isinstance(episode, dict):
+        # Support both Episode objects and plain dicts.
+        # Use isinstance check instead of `or` to avoid falsy empty-list fallthrough.
+        if isinstance(episode, dict):
+            obs = episode.get("obs", [])
+            act = episode.get("act", [])
+            rew = episode.get("rew", [])
             logprob_raw = episode.get("logprob")
+        else:
+            obs = episode.obs
+            act = episode.act
+            rew = episode.rew
+            logprob_raw = episode.logprob
 
         # Flatten to plain Python lists
         prompt_tokens = _flatten(obs[0]) if obs else []

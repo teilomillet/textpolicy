@@ -209,6 +209,15 @@ class TestPlanningPatternDetector:
         detector = PlanningPatternDetector()
         assert detector.detect("the cat sat on the mat") == []
 
+    def test_empty_pattern_list_returns_no_matches(self):
+        cfg = PlanningPatternConfig(
+            hesitation=[], verification=[], backtracking=[],
+            alternatives=[], metacognition=[],
+        )
+        detector = PlanningPatternDetector(cfg)
+        assert detector.detect("hello world") == []
+        assert detector.planning_token_ratio("hello world", 5) == 0.0
+
     def test_planning_token_ratio(self):
         detector = PlanningPatternDetector()
         # "let me think" = 3 words, total_tokens = 10
@@ -344,6 +353,18 @@ class TestEmergenceLogger:
 
         assert result["total_count"] == 0
         assert result["mean_reward"] == 0.0
+
+    def test_episode_with_empty_obs_no_attributeerror(self, tmp_dir):
+        """Episode with empty fields should not crash via falsy-or fallthrough."""
+        logger = EmergenceLogger(output_dir=tmp_dir)
+        tok = _make_tokenizer()
+        ep = Episode()  # all fields are empty lists
+        logger.log_step(step=0, episodes=[ep], tokenizer=tok)
+        logger.finish()
+
+        rec = json.loads((tmp_dir / "generations.jsonl").read_text().strip())
+        assert rec["tokens"] == []
+        assert rec["reward"] == 0.0
 
     def test_handles_none_logprobs(self, tmp_dir):
         logger = EmergenceLogger(output_dir=tmp_dir)

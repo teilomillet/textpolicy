@@ -83,11 +83,12 @@ class PlanningPatternDetector:
         # Sort longest-first so greedy alternation prefers longer matches
         patterns = sorted(self.config.all_patterns, key=len, reverse=True)
         escaped = [re.escape(p) for p in patterns]
-        self._regex = re.compile("|".join(escaped), flags)
+        # Guard against empty pattern list — an empty regex matches every position
+        self._regex = re.compile("|".join(escaped), flags) if escaped else None
 
     def detect(self, text: str) -> List[str]:
         """Return all matched planning phrases found in *text*."""
-        if not text:
+        if not text or self._regex is None:
             return []
         return [m.group() for m in self._regex.finditer(text)]
 
