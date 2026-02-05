@@ -10,6 +10,7 @@ This trainer achieves maximum efficiency through:
 - Direct MLX-LM integration
 """
 
+import logging
 from typing import Callable, Dict, Any, Optional, Union, List, cast
 import mlx.core as mx # type: ignore
 import mlx.nn as nn # type: ignore
