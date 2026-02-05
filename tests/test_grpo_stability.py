@@ -622,8 +622,11 @@ class TestComputeMetricsAsymmetric:
         assert 'clip_fraction' in metrics
 
         # Total clip fraction should be sum of upper and lower (no overlap)
-        assert metrics['clip_fraction'] == \
-            metrics['clip_fraction_lower'] + metrics['clip_fraction_upper']
+        # Use tolerance for floating point comparison
+        total = metrics['clip_fraction']
+        sum_parts = metrics['clip_fraction_lower'] + metrics['clip_fraction_upper']
+        assert abs(total - sum_parts) < 1e-6, \
+            f"clip_fraction ({total}) should equal sum of parts ({sum_parts})"
 
     def test_metrics_backward_compat_with_clip_ratio(self):
         """Test that metrics work with symmetric clip_ratio parameter."""
