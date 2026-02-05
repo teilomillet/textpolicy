@@ -206,31 +206,57 @@ def compute_advantages_compiled(rewards: mx.array) -> mx.array:
 
 
 @mx.compile
-def policy_loss_compiled(
+def _policy_loss_compiled_asymmetric(
     old_logprobs: mx.array,
     new_logprobs: mx.array,
     advantages: mx.array,
     clip_ratio_low: float = 0.2,
     clip_ratio_high: float = 0.28
 ) -> mx.array:
+    """Internal compiled function with asymmetric clipping."""
+    ratio = mx.exp(new_logprobs - old_logprobs)
+    clipped_ratio = mx.clip(ratio, 1 - clip_ratio_low, 1 + clip_ratio_high)
+    surr1 = ratio * advantages
+    surr2 = clipped_ratio * advantages
+    return -mx.mean(mx.minimum(surr1, surr2))
+
+
+def policy_loss_compiled(
+    old_logprobs: mx.array,
+    new_logprobs: mx.array,
+    advantages: mx.array,
+    clip_ratio: float = None,
+    clip_ratio_low: float = 0.2,
+    clip_ratio_high: float = 0.28
+) -> mx.array:
     """
     Compiled version of policy_loss for maximum performance (mean normalization).
 
-    Supports DAPO-style asymmetric clipping bounds.
+    Supports DAPO-style asymmetric clipping bounds with backward compatibility.
     Uses mean normalization (original behavior).
 
     Args:
         old_logprobs: Log probabilities from rollout collection
         new_logprobs: Log probabilities from current policy evaluation
         advantages: Group-relative advantages
+        clip_ratio: Symmetric clipping ratio (for backward compatibility).
+                   If provided, overrides clip_ratio_low and clip_ratio_high.
         clip_ratio_low: Lower bound offset (default 0.2)
         clip_ratio_high: Upper bound offset (default 0.28)
+
+    Note:
+        This is a thin wrapper around the compiled function to handle
+        backward compatibility with the old clip_ratio parameter.
     """
-    ratio = mx.exp(new_logprobs - old_logprobs)
-    clipped_ratio = mx.clip(ratio, 1 - clip_ratio_low, 1 + clip_ratio_high)
-    surr1 = ratio * advantages
-    surr2 = clipped_ratio * advantages
-    return -mx.mean(mx.minimum(surr1, surr2))
+    # Handle backward compatibility
+    if clip_ratio is not None:
+        clip_ratio_low = clip_ratio
+        clip_ratio_high = clip_ratio
+
+    return _policy_loss_compiled_asymmetric(
+        old_logprobs, new_logprobs, advantages,
+        clip_ratio_low, clip_ratio_high
+    )
 
 
 @mx.compile

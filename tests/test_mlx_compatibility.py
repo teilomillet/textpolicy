@@ -267,6 +267,39 @@ class TestGRPOWithMLX:
         # This is the expected behavior with constant normalization
         assert abs(float(loss_long_const)) > abs(float(loss_short_const)) * 3
 
+    def test_policy_loss_compiled_backward_compatibility(self):
+        """Test that policy_loss_compiled maintains backward compatibility."""
+        from textpolicy.algorithms import grpo
+
+        old_lp = mx.array([-1.0, -1.2, -0.8, -1.1, -0.9])
+        new_lp = mx.array([-1.1, -1.0, -0.9, -1.0, -1.0])
+        advantages = mx.array([0.6, 0.1, -0.9, 0.4, -0.2])
+
+        # Test OLD API: clip_ratio parameter (backward compatibility)
+        loss_old_api = grpo.policy_loss_compiled(
+            old_lp, new_lp, advantages, clip_ratio=0.2
+        )
+        assert not mx.isnan(loss_old_api)
+        assert loss_old_api.shape == ()
+
+        # Test NEW API: separate clip_ratio_low and clip_ratio_high
+        loss_new_api = grpo.policy_loss_compiled(
+            old_lp, new_lp, advantages,
+            clip_ratio_low=0.2, clip_ratio_high=0.2
+        )
+        assert not mx.isnan(loss_new_api)
+        assert loss_new_api.shape == ()
+
+        # With same bounds, results should be identical
+        assert abs(float(loss_old_api) - float(loss_new_api)) < 1e-6
+
+        # Test asymmetric bounds (new feature)
+        loss_asymmetric = grpo.policy_loss_compiled(
+            old_lp, new_lp, advantages,
+            clip_ratio_low=0.2, clip_ratio_high=0.28
+        )
+        assert not mx.isnan(loss_asymmetric)
+
     def test_policy_loss_compiled_constant_norm(self):
         """Test compiled policy loss with constant normalization."""
         from textpolicy.algorithms import grpo
