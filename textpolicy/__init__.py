@@ -8,6 +8,9 @@ training, generation, environment, and rewards.
 # Submodule imports for building the public API
 from . import algorithms, generation, training
 
+# Import tasks to trigger auto-registration of task reward functions
+from . import tasks  # noqa: F401
+
 # Export RL algorithms as defined in textpolicy.algorithms.__all__
 from .algorithms import *  # noqa: F403,F401
 
