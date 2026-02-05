@@ -218,31 +218,33 @@ def run_baseline(config: BaselineConfig) -> None:
 
     # 10. Training loop
     print(f"\nStarting training for {config.max_steps} steps...")
+    global_episode_count = 0
     for step in range(config.max_steps):
         # Clear buffer each step (on-policy)
         buffer.clear()
 
-        # Collect rollouts
+        # Collect rollouts.  The runner's internal buffer persists across
+        # calls and accumulates old episodes, so we copy everything into
+        # our training buffer (FIFO keeps the most recent) but only log
+        # the newest episode for emergence analysis.
         rollout_buffer = rollout.collect()
         for ep in rollout_buffer.episodes:
             buffer.add_episode_from_dict(ep.to_dict())
 
-        # Map each episode to the correct problem.  The environment cycles
-        # prompts via current_episode % len(prompts), so the global offset
-        # must be accounted for — local episode index alone is wrong after
-        # step 0.
-        num_eps = len(rollout_buffer.episodes)
-        step_examples = [
-            problems[(step * config.episodes_per_step + i) % len(problems)]
-            for i in range(num_eps)
-        ]
+        # The newest episode is always appended at the end of the
+        # runner's buffer.  Use a global counter to map it to the
+        # correct problem (the environment cycles via
+        # current_episode % len(prompts)).
+        new_episode = rollout_buffer.episodes[-1]
+        example = problems[global_episode_count % len(problems)]
+        global_episode_count += 1
 
-        # Log generations BEFORE training
+        # Log only the new episode with its correct example
         step_stats = emergence.log_step(
             step=step,
-            episodes=rollout_buffer.episodes,
+            episodes=[new_episode],
             tokenizer=tokenizer,
-            examples=step_examples,
+            examples=[example],
         )
 
         # Train

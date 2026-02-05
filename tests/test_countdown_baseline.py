@@ -320,51 +320,40 @@ class TestEmergenceLoggerIntegration:
 # Example alignment across steps
 # ---------------------------------------------------------------------------
 class TestExampleAlignment:
-    def test_step_examples_match_env_cycling(self):
-        """Verify that step_examples aligns with the env's prompt cycling."""
-        from experiments.countdown_baseline import BaselineConfig
-
-        config = BaselineConfig(num_problems=5, episodes_per_step=3)
-
-        problems = [{"target": i, "numbers": [i]} for i in range(config.num_problems)]
-
-        for step in range(4):
-            step_examples = [
-                problems[
-                    (step * config.episodes_per_step + i) % len(problems)
-                ]
-                for i in range(config.episodes_per_step)
-            ]
-            for i, ex in enumerate(step_examples):
-                global_idx = step * config.episodes_per_step + i
-                expected = problems[global_idx % len(problems)]
-                assert ex is expected, (
-                    f"step={step} i={i}: expected problem {expected['target']}, "
-                    f"got {ex['target']}"
-                )
-
-    def test_step_examples_wrap_around(self):
-        """After exhausting all problems, cycling wraps to the beginning."""
-        from experiments.countdown_baseline import BaselineConfig
-
-        config = BaselineConfig(num_problems=3, episodes_per_step=2)
+    def test_global_counter_cycles_through_problems(self):
+        """Global counter maps each step to the correct problem."""
         problems = [{"target": t} for t in [10, 20, 30]]
+        global_episode_count = 0
 
-        # step 0: problems[0], problems[1]
-        # step 1: problems[2], problems[0]  (wraps)
-        # step 2: problems[1], problems[2]
-        expected_targets = [
-            [10, 20],
-            [30, 10],
-            [20, 30],
-        ]
-        for step in range(3):
-            step_examples = [
-                problems[(step * config.episodes_per_step + i) % len(problems)]
-                for i in range(config.episodes_per_step)
-            ]
-            targets = [ex["target"] for ex in step_examples]
-            assert targets == expected_targets[step], f"step={step}"
+        expected_targets = [10, 20, 30, 10, 20]
+        for step_idx in range(5):
+            example = problems[global_episode_count % len(problems)]
+            assert example["target"] == expected_targets[step_idx], f"step={step_idx}"
+            global_episode_count += 1
+
+    def test_global_counter_wraps_with_many_problems(self):
+        """Counter wraps correctly across many problems."""
+        problems = [{"target": i} for i in range(5)]
+        global_episode_count = 0
+
+        all_targets = []
+        for _ in range(8):
+            example = problems[global_episode_count % len(problems)]
+            all_targets.append(example["target"])
+            global_episode_count += 1
+
+        assert all_targets == [0, 1, 2, 3, 4, 0, 1, 2]
+
+    def test_newest_episode_is_last_in_buffer(self):
+        """The newest episode is always at episodes[-1] in the runner buffer."""
+        # Simulate accumulating buffer: episodes are appended, oldest evicted
+        buffer_max = 3
+        buffer = []
+        for i in range(6):
+            buffer.append(f"ep_{i}")
+            if len(buffer) > buffer_max:
+                buffer.pop(0)
+            assert buffer[-1] == f"ep_{i}"  # newest always last
 
 
 # ---------------------------------------------------------------------------
@@ -451,3 +440,12 @@ class TestRunBaseline:
             assert mock_trainer.train.call_count == 2
             assert mock_rollout.collect.call_count == 2
             mock_rollout.close.assert_called_once()
+
+            # Verify create_policy received correct generation params
+            mock_create_policy.assert_called_once()
+            call_kwargs = mock_create_policy.call_args
+            gen_params = call_kwargs[1]["generation_params"] if call_kwargs[1] else call_kwargs[0][2]
+            assert gen_params["temperature"] == config.temperature
+            assert gen_params["max_tokens"] == config.max_completion_tokens
+            assert gen_params["top_p"] == config.top_p
+            assert gen_params["repetition_penalty"] == config.repetition_penalty
