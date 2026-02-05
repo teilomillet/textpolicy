@@ -171,8 +171,9 @@ class _Parser:
         if token == ')':
             raise ExpressionError("Unmatched closing parenthesis")
 
-        # Number
-        if token.isdigit() or (len(token) > 1 and token[0].isdigit()):
+        # Number — _tokenize only produces all-digit tokens, so isdigit()
+        # is sufficient. Avoid masking malformed tokens with a looser check.
+        if token.isdigit():
             self._consume()
             num = int(token)
             self.numbers_used.append(num)

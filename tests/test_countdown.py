@@ -270,6 +270,19 @@ class TestDatasetGeneration:
         for p in problems:
             assert len(p["numbers"]) == 4
 
+    def test_max_attempts_exceeded(self):
+        """Impossible constraints should raise RuntimeError, not loop forever."""
+        with pytest.raises(RuntimeError, match="Could not generate"):
+            # target_range=(9999, 9999) with tiny numbers is nearly impossible
+            generate_countdown_problems(
+                10,
+                num_numbers=2,
+                number_range=(1, 2),
+                target_range=(9999, 9999),
+                ensure_solvable=True,
+                max_attempts=50,
+            )
+
     def test_reproducible_with_seed(self):
         p1 = generate_countdown_problems(5, seed=99)
         p2 = generate_countdown_problems(5, seed=99)

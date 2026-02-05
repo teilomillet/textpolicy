@@ -14,6 +14,7 @@ def generate_countdown_problems(
     target_range: Tuple[int, int] = (10, 100),
     ensure_solvable: bool = True,
     seed: Optional[int] = None,
+    max_attempts: Optional[int] = None,
 ) -> List[Dict]:
     """
     Generate Countdown Numbers Game problems.
@@ -25,16 +26,33 @@ def generate_countdown_problems(
         target_range: (min, max) inclusive range for target.
         ensure_solvable: If True, only return problems with at least one solution.
         seed: Random seed for reproducibility.
+        max_attempts: Maximum number of candidate problems to try before stopping.
+                      Defaults to num_problems * 100 when ensure_solvable is True.
 
     Returns:
         List of dicts with keys 'target' and 'numbers'.
+
+    Raises:
+        RuntimeError: If max_attempts is exhausted before generating enough problems.
     """
     rng = random.Random(seed)
     problems = []
 
+    if max_attempts is None:
+        max_attempts = num_problems * 100 if ensure_solvable else num_problems
+
+    attempts = 0
     while len(problems) < num_problems:
+        if attempts >= max_attempts:
+            raise RuntimeError(
+                f"Could not generate {num_problems} problems within "
+                f"{max_attempts} attempts (got {len(problems)}). "
+                f"Try wider number_range/target_range or increase max_attempts."
+            )
+
         numbers = [rng.randint(*number_range) for _ in range(num_numbers)]
         target = rng.randint(*target_range)
+        attempts += 1
 
         if ensure_solvable and not _is_solvable(numbers, target):
             continue
