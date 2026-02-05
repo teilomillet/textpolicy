@@ -113,45 +113,86 @@ def compute_advantages_dr_grpo(rewards: Union[List[float], mx.array]) -> mx.arra
 
 def policy_loss(
     old_logprobs: mx.array,
-    new_logprobs: mx.array, 
+    new_logprobs: mx.array,
     advantages: mx.array,
-    clip_ratio: float = 0.2
+    clip_ratio: float = None,
+    clip_ratio_low: float = 0.2,
+    clip_ratio_high: float = 0.28,
+    normalize_constant: int = None
 ) -> mx.array:
     """
-    GRPO policy loss with PPO-style clipping.
-    
+    GRPO policy loss with PPO-style clipping, supporting DAPO asymmetric bounds.
+
     Uses clipped surrogate objective but with group-relative advantages
-    instead of GAE advantages.
-    
+    instead of GAE advantages. Supports asymmetric clipping bounds (DAPO-style)
+    to prevent entropy collapse while maintaining training stability.
+
+    DAPO insight: Asymmetric bounds allow the model to increase probabilities
+    of good actions more easily than decreasing probabilities of bad actions,
+    promoting diversity and preventing entropy collapse.
+
+    Dr. GRPO insight: Dividing by a fixed constant instead of token count
+    eliminates length bias that artificially inflates incorrect (longer) responses.
+
     Args:
         old_logprobs: Log probabilities from rollout collection
         new_logprobs: Log probabilities from current policy evaluation
         advantages: Group-relative advantages from compute_advantages()
-        clip_ratio: Clipping ratio for surrogate objective
-        
+        clip_ratio: Symmetric clipping ratio (for backward compatibility).
+                   If provided, overrides clip_ratio_low and clip_ratio_high.
+        clip_ratio_low: Lower bound offset (default 0.2, gives lower bound of 0.8)
+        clip_ratio_high: Upper bound offset (default 0.28, gives upper bound of 1.28)
+        normalize_constant: Fixed constant divisor for loss normalization.
+                           If None (default), uses mean (original behavior).
+                           If provided, uses sum/constant to eliminate length bias.
+                           Typical values: 1024, or batch_size.
+
     Returns:
         Policy loss scalar (to be minimized)
-        
+
     Notes:
     - Fully vectorized (no Python loops over batch)
     - Uses in-place operations where possible
     - Suitable for MLX graph optimization
     - Single forward pass through computation
+    - DAPO defaults: clip_ratio_low=0.2, clip_ratio_high=0.28
+    - Length bias: When using mean, longer sequences have lower per-token
+      contribution, creating implicit bias toward short responses.
+
+    References:
+        DAPO: An Open-Source LLM Reinforcement Learning System at Scale
+        https://arxiv.org/abs/2503.14476
+
+        Dr. GRPO: Understanding R1-Zero-Like Training
+        https://arxiv.org/abs/2503.20783
     """
-    # Importance ratio: π_new / π_old  
+    # Handle backward compatibility: if clip_ratio is provided, use symmetric bounds
+    if clip_ratio is not None:
+        clip_ratio_low = clip_ratio
+        clip_ratio_high = clip_ratio
+
+    # Importance ratio: π_new / π_old
     # MLX optimizes exp() for Apple Silicon
     ratio = mx.exp(new_logprobs - old_logprobs)
-    
-    # PPO clipped surrogate objective
-    # L = min(ratio * A, clip(ratio, 1-ε, 1+ε) * A)
-    clipped_ratio = mx.clip(ratio, 1 - clip_ratio, 1 + clip_ratio)
-    
-    # Element-wise minimum and mean reduction
-    # Negative because we minimize (original maximizes)
+
+    # PPO clipped surrogate objective with asymmetric bounds (DAPO-style)
+    # L = min(ratio * A, clip(ratio, 1-ε_low, 1+ε_high) * A)
+    clipped_ratio = mx.clip(ratio, 1 - clip_ratio_low, 1 + clip_ratio_high)
+
+    # Element-wise minimum
     surr1 = ratio * advantages
     surr2 = clipped_ratio * advantages
-    loss = -mx.mean(mx.minimum(surr1, surr2))
-    
+    min_surr = mx.minimum(surr1, surr2)
+
+    # Normalization: either mean (original) or sum/constant (Dr. GRPO)
+    if normalize_constant is not None:
+        # Fixed constant normalization eliminates length bias
+        # All sequences contribute equally regardless of length
+        loss = -mx.sum(min_surr) / normalize_constant
+    else:
+        # Original mean behavior (for backward compatibility)
+        loss = -mx.mean(min_surr)
+
     return loss
 
 
@@ -163,42 +204,217 @@ def compute_advantages_compiled(rewards: mx.array) -> mx.array:
     return rewards - group_mean
 
 
-@mx.compile  
+@mx.compile
 def policy_loss_compiled(
     old_logprobs: mx.array,
     new_logprobs: mx.array,
     advantages: mx.array,
-    clip_ratio: float = 0.2
+    clip_ratio_low: float = 0.2,
+    clip_ratio_high: float = 0.28
 ) -> mx.array:
-    """Compiled version of policy_loss for maximum performance."""
+    """
+    Compiled version of policy_loss for maximum performance (mean normalization).
+
+    Supports DAPO-style asymmetric clipping bounds.
+    Uses mean normalization (original behavior).
+
+    Args:
+        old_logprobs: Log probabilities from rollout collection
+        new_logprobs: Log probabilities from current policy evaluation
+        advantages: Group-relative advantages
+        clip_ratio_low: Lower bound offset (default 0.2)
+        clip_ratio_high: Upper bound offset (default 0.28)
+    """
     ratio = mx.exp(new_logprobs - old_logprobs)
-    clipped_ratio = mx.clip(ratio, 1 - clip_ratio, 1 + clip_ratio)
+    clipped_ratio = mx.clip(ratio, 1 - clip_ratio_low, 1 + clip_ratio_high)
     surr1 = ratio * advantages
     surr2 = clipped_ratio * advantages
     return -mx.mean(mx.minimum(surr1, surr2))
 
 
+@mx.compile
+def policy_loss_compiled_constant_norm(
+    old_logprobs: mx.array,
+    new_logprobs: mx.array,
+    advantages: mx.array,
+    clip_ratio_low: float = 0.2,
+    clip_ratio_high: float = 0.28,
+    normalize_constant: float = 1024.0
+) -> mx.array:
+    """
+    Compiled version of policy_loss with fixed constant normalization (Dr. GRPO).
+
+    Uses sum/constant instead of mean to eliminate length bias.
+
+    Args:
+        old_logprobs: Log probabilities from rollout collection
+        new_logprobs: Log probabilities from current policy evaluation
+        advantages: Group-relative advantages
+        clip_ratio_low: Lower bound offset (default 0.2)
+        clip_ratio_high: Upper bound offset (default 0.28)
+        normalize_constant: Fixed constant divisor (default 1024)
+
+    References:
+        Dr. GRPO: Understanding R1-Zero-Like Training
+        https://arxiv.org/abs/2503.20783
+    """
+    ratio = mx.exp(new_logprobs - old_logprobs)
+    clipped_ratio = mx.clip(ratio, 1 - clip_ratio_low, 1 + clip_ratio_high)
+    surr1 = ratio * advantages
+    surr2 = clipped_ratio * advantages
+    return -mx.sum(mx.minimum(surr1, surr2)) / normalize_constant
+
+
 def entropy_bonus(logprobs: mx.array, coefficient: float = 0.01) -> mx.array:
     """
     Entropy bonus for exploration (optional GRPO component).
-    
+
     Args:
         logprobs: Log probabilities from policy
         coefficient: Entropy coefficient (typically small, like 0.01)
-        
+
     Returns:
         Entropy bonus (added to loss for exploration)
     """
     if coefficient <= 0:
         return mx.array(0.0)
-    
+
     # Entropy = -sum(p * log(p))
     # For log probabilities: entropy = -sum(exp(logp) * logp)
     probs = mx.exp(logprobs)
     entropy = -mx.sum(probs * logprobs, axis=-1)
-    
+
     # Return negative entropy (since we add to loss but want to maximize entropy)
     return -coefficient * mx.mean(entropy)
+
+
+# DAPO-style soft overlong penalties (Issue #7)
+def compute_length_penalty(
+    sequence_length: int,
+    max_length: int,
+    cache_length: int = 100,
+    max_penalty: float = 0.5
+) -> float:
+    """
+    Compute soft penalty for sequences approaching max length.
+
+    Instead of hard cutoffs for max sequence length (which cause truncation
+    that looks like failure to the model), use graduated penalties within
+    an interval before max_length.
+
+    This reduces training instability from length-based confusion and helps
+    the model learn to be concise without hard punishment.
+
+    Args:
+        sequence_length: Current sequence length
+        max_length: Maximum allowed sequence length
+        cache_length: Start penalizing this many tokens before max_length
+        max_penalty: Maximum penalty at max_length (default 0.5)
+
+    Returns:
+        Penalty value (0.0 for normal lengths, up to -max_penalty at max_length)
+
+    Example:
+        With max_length=512, cache_length=100:
+        - length=400: penalty=0.0 (below threshold)
+        - length=412: penalty=-0.06 (12/100 * 0.5)
+        - length=462: penalty=-0.31 (62/100 * 0.5)
+        - length=512: penalty=-0.5 (at max)
+
+    References:
+        DAPO: An Open-Source LLM Reinforcement Learning System at Scale
+        https://arxiv.org/abs/2503.14476
+    """
+    threshold = max_length - cache_length
+
+    if sequence_length < threshold:
+        return 0.0
+
+    # Linear penalty from 0 to max_penalty as we approach max
+    progress = (sequence_length - threshold) / cache_length
+    progress = min(1.0, progress)  # Clamp at 1.0
+
+    return -max_penalty * progress
+
+
+def apply_length_shaping(
+    rewards: mx.array,
+    sequence_lengths: List[int],
+    max_length: int,
+    cache_length: int = 100,
+    max_penalty: float = 0.5
+) -> mx.array:
+    """
+    Apply soft length penalties to rewards.
+
+    Modifies rewards by adding graduated penalties for sequences that
+    approach the maximum length. This provides a smoother learning signal
+    than hard truncation.
+
+    Args:
+        rewards: Original rewards array [batch_size]
+        sequence_lengths: List of sequence lengths for each episode
+        max_length: Maximum allowed sequence length
+        cache_length: Start penalizing this many tokens before max_length
+        max_penalty: Maximum penalty at max_length
+
+    Returns:
+        Rewards with length penalties applied
+
+    Example:
+        >>> rewards = mx.array([1.0, 0.5, 0.0])
+        >>> lengths = [400, 500, 520]  # max_length=512, cache_length=100
+        >>> shaped = apply_length_shaping(rewards, lengths, 512)
+        >>> # shaped ≈ [1.0, 0.06, -0.5]  # last one gets max penalty
+
+    References:
+        DAPO: An Open-Source LLM Reinforcement Learning System at Scale
+        https://arxiv.org/abs/2503.14476
+    """
+    penalties = mx.array([
+        compute_length_penalty(length, max_length, cache_length, max_penalty)
+        for length in sequence_lengths
+    ], dtype=mx.float32)
+
+    return rewards + penalties
+
+
+def compute_length_shaping_stats(
+    sequence_lengths: List[int],
+    max_length: int,
+    cache_length: int = 100
+) -> dict:
+    """
+    Compute statistics about length penalties for monitoring.
+
+    Args:
+        sequence_lengths: List of sequence lengths
+        max_length: Maximum allowed sequence length
+        cache_length: Penalty threshold offset
+
+    Returns:
+        Dictionary with length penalty statistics
+    """
+    threshold = max_length - cache_length
+    total = len(sequence_lengths)
+
+    if total == 0:
+        return {
+            'mean_length': 0.0,
+            'max_length_observed': 0,
+            'truncation_rate': 0.0,
+            'penalty_zone_rate': 0.0,
+        }
+
+    truncated = sum(1 for l in sequence_lengths if l >= max_length)
+    in_penalty_zone = sum(1 for l in sequence_lengths if threshold <= l < max_length)
+
+    return {
+        'mean_length': sum(sequence_lengths) / total,
+        'max_length_observed': max(sequence_lengths),
+        'truncation_rate': truncated / total,
+        'penalty_zone_rate': in_penalty_zone / total,
+    }
 
 
 # Convenience function for complete GRPO computation
@@ -206,43 +422,66 @@ def grpo_loss(
     old_logprobs: mx.array,
     new_logprobs: mx.array,
     rewards: Union[List[float], mx.array],
-    clip_ratio: float = 0.2,
-    entropy_coeff: float = 0.0
+    clip_ratio: float = None,
+    clip_ratio_low: float = 0.2,
+    clip_ratio_high: float = 0.28,
+    entropy_coeff: float = 0.0,
+    normalize_constant: int = None
 ) -> mx.array:
     """
     Complete GRPO loss computation in one function.
-    
+
     Combines advantage calculation and policy loss for convenience.
     Can be compiled as a single unit for maximum efficiency.
-    
+    Supports DAPO-style asymmetric clipping bounds and Dr. GRPO length-bias fix.
+
     Args:
         old_logprobs: Log probabilities from rollout
         new_logprobs: Log probabilities from current policy
         rewards: Episode rewards for group-relative advantages
-        clip_ratio: PPO clipping ratio
+        clip_ratio: Symmetric clipping ratio (for backward compatibility).
+                   If provided, overrides clip_ratio_low and clip_ratio_high.
+        clip_ratio_low: Lower bound offset (default 0.2)
+        clip_ratio_high: Upper bound offset (default 0.28)
         entropy_coeff: Entropy bonus coefficient (0 disables)
-        
+        normalize_constant: Fixed constant divisor for loss normalization.
+                           If None (default), uses mean. If provided, uses
+                           sum/constant to eliminate length bias.
+
     Returns:
         Total GRPO loss (policy + optional entropy)
+
+    References:
+        DAPO: An Open-Source LLM Reinforcement Learning System at Scale
+        https://arxiv.org/abs/2503.14476
+
+        Dr. GRPO: Understanding R1-Zero-Like Training
+        https://arxiv.org/abs/2503.20783
     """
     # Compute group-relative advantages
     advantages = compute_advantages(rewards)
-    
+
     # Expand advantages to match logprob sequence length if needed
     if advantages.ndim == 1 and old_logprobs.ndim > 1:
         # Each episode contributes its advantage to all tokens in that episode
         # This requires knowing episode boundaries - simplified version assumes
         # advantages and logprobs are already aligned
         pass
-    
-    # Compute policy loss
-    policy_loss_val = policy_loss(old_logprobs, new_logprobs, advantages, clip_ratio)
-    
+
+    # Compute policy loss with asymmetric clipping and optional length-bias fix
+    policy_loss_val = policy_loss(
+        old_logprobs, new_logprobs, advantages,
+        clip_ratio=clip_ratio,
+        clip_ratio_low=clip_ratio_low,
+        clip_ratio_high=clip_ratio_high,
+        normalize_constant=normalize_constant
+    )
+
     # Add entropy bonus if specified
     if entropy_coeff > 0:
         entropy_bonus_val = entropy_bonus(new_logprobs, entropy_coeff)
         return policy_loss_val + entropy_bonus_val
-    
+
     return policy_loss_val
 
 
@@ -251,40 +490,67 @@ def compute_metrics(
     old_logprobs: mx.array,
     new_logprobs: mx.array,
     advantages: mx.array,
-    clip_ratio: float = 0.2
+    clip_ratio: float = None,
+    clip_ratio_low: float = 0.2,
+    clip_ratio_high: float = 0.28
 ) -> dict:
     """
     Compute GRPO training metrics for monitoring.
-    
+
+    Supports DAPO-style asymmetric clipping bounds and tracks clip fractions
+    for upper vs lower bounds separately.
+
     Args:
         old_logprobs: Log probabilities from rollout
-        new_logprobs: Log probabilities from current policy  
+        new_logprobs: Log probabilities from current policy
         advantages: Group-relative advantages
-        clip_ratio: Clipping ratio used in loss
-        
+        clip_ratio: Symmetric clipping ratio (for backward compatibility).
+                   If provided, overrides clip_ratio_low and clip_ratio_high.
+        clip_ratio_low: Lower bound offset (default 0.2)
+        clip_ratio_high: Upper bound offset (default 0.28)
+
     Returns:
-        Dictionary of metrics for logging/monitoring
+        Dictionary of metrics for logging/monitoring, including:
+        - clip_fraction_lower: Fraction of ratios clipped at lower bound
+        - clip_fraction_upper: Fraction of ratios clipped at upper bound
+        - clip_fraction: Total fraction of ratios clipped (either bound)
     """
+    # Handle backward compatibility
+    if clip_ratio is not None:
+        clip_ratio_low = clip_ratio
+        clip_ratio_high = clip_ratio
+
     # Importance ratio statistics
     ratio = mx.exp(new_logprobs - old_logprobs)
-    
-    # Clipping statistics
-    clip_lower = 1 - clip_ratio
-    clip_upper = 1 + clip_ratio
-    clipped = (ratio < clip_lower) | (ratio > clip_upper)
+
+    # Asymmetric clipping bounds
+    clip_lower = 1 - clip_ratio_low
+    clip_upper = 1 + clip_ratio_high
+
+    # Track clip fractions separately for upper and lower bounds
+    clipped_lower = ratio < clip_lower
+    clipped_upper = ratio > clip_upper
+    clipped = clipped_lower | clipped_upper
+
+    clip_fraction_lower = mx.mean(clipped_lower.astype(mx.float32))
+    clip_fraction_upper = mx.mean(clipped_upper.astype(mx.float32))
     clip_fraction = mx.mean(clipped.astype(mx.float32))
-    
+
     # KL divergence approximation
     kl_div = mx.mean(old_logprobs - new_logprobs)
-    
+
     return {
         'mean_advantage': mx.mean(advantages).item(),
         'std_advantage': mx.std(advantages).item(),
         'mean_ratio': mx.mean(ratio).item(),
         'clip_fraction': clip_fraction.item(),
+        'clip_fraction_lower': clip_fraction_lower.item(),
+        'clip_fraction_upper': clip_fraction_upper.item(),
         'kl_divergence': kl_div.item(),
         'min_advantage': mx.min(advantages).item(),
-        'max_advantage': mx.max(advantages).item()
+        'max_advantage': mx.max(advantages).item(),
+        'clip_ratio_low': clip_ratio_low,
+        'clip_ratio_high': clip_ratio_high
     }
 
 

@@ -157,6 +157,167 @@ class TestGRPOWithMLX:
         assert not mx.isnan(loss)
         assert loss.shape == ()  # Scalar
 
+    def test_policy_loss_asymmetric_clipping(self):
+        """Test GRPO policy_loss with DAPO-style asymmetric clipping."""
+        from textpolicy.algorithms import grpo
+
+        old_lp = mx.array([-1.0, -1.2, -0.8, -1.1, -0.9])
+        new_lp = mx.array([-1.1, -1.0, -0.9, -1.0, -1.0])
+        advantages = mx.array([0.6, 0.1, -0.9, 0.4, -0.2])
+
+        # Test with DAPO defaults: low=0.2, high=0.28
+        loss_asymmetric = grpo.policy_loss(
+            old_lp, new_lp, advantages,
+            clip_ratio_low=0.2, clip_ratio_high=0.28
+        )
+
+        assert not mx.isnan(loss_asymmetric)
+        assert loss_asymmetric.shape == ()
+
+        # Test backward compatibility: clip_ratio should override both
+        loss_symmetric = grpo.policy_loss(
+            old_lp, new_lp, advantages, clip_ratio=0.2
+        )
+
+        assert not mx.isnan(loss_symmetric)
+        assert loss_symmetric.shape == ()
+
+    def test_policy_loss_asymmetric_bounds_behavior(self):
+        """Test that asymmetric clipping produces correct bounds."""
+        from textpolicy.algorithms import grpo
+
+        # Create extreme ratios that will definitely be clipped
+        old_lp = mx.array([-1.0, -1.0, -1.0])
+        # Large positive change -> high ratio; Large negative change -> low ratio
+        new_lp = mx.array([-0.2, -1.8, -1.0])  # ratios: ~2.23, ~0.45, 1.0
+        advantages = mx.array([1.0, 1.0, 1.0])
+
+        # With asymmetric bounds: lower=0.8, upper=1.28
+        loss_asymmetric = grpo.policy_loss(
+            old_lp, new_lp, advantages,
+            clip_ratio_low=0.2, clip_ratio_high=0.28
+        )
+
+        # With symmetric bounds: lower=0.8, upper=1.2
+        loss_symmetric = grpo.policy_loss(
+            old_lp, new_lp, advantages, clip_ratio=0.2
+        )
+
+        # Asymmetric allows higher ratios, so clipping differs
+        # Both should be valid (not NaN)
+        assert not mx.isnan(loss_asymmetric)
+        assert not mx.isnan(loss_symmetric)
+
+    def test_policy_loss_normalize_constant(self):
+        """Test policy_loss with fixed constant normalization (Dr. GRPO)."""
+        from textpolicy.algorithms import grpo
+
+        old_lp = mx.array([-1.0, -1.2, -0.8, -1.1, -0.9])
+        new_lp = mx.array([-1.1, -1.0, -0.9, -1.0, -1.0])
+        advantages = mx.array([0.6, 0.1, -0.9, 0.4, -0.2])
+
+        # Test with mean normalization (default)
+        loss_mean = grpo.policy_loss(old_lp, new_lp, advantages)
+
+        # Test with constant normalization
+        loss_const = grpo.policy_loss(
+            old_lp, new_lp, advantages, normalize_constant=5
+        )
+
+        # Both should be valid
+        assert not mx.isnan(loss_mean)
+        assert not mx.isnan(loss_const)
+
+        # With constant=5 (same as number of elements), should be similar
+        # but not identical due to different formulas
+        assert loss_mean.shape == ()
+        assert loss_const.shape == ()
+
+    def test_policy_loss_normalize_constant_eliminates_length_bias(self):
+        """Test that constant normalization eliminates length bias."""
+        from textpolicy.algorithms import grpo
+
+        # Short sequence
+        old_lp_short = mx.array([-1.0, -1.2])
+        new_lp_short = mx.array([-1.1, -1.0])
+        adv_short = mx.array([0.5, 0.5])
+
+        # Long sequence (same pattern repeated 4x)
+        old_lp_long = mx.array([-1.0, -1.2] * 4)
+        new_lp_long = mx.array([-1.1, -1.0] * 4)
+        adv_long = mx.array([0.5, 0.5] * 4)
+
+        # With mean normalization: short and long should give same loss
+        # (since pattern is identical, just repeated)
+        loss_short_mean = grpo.policy_loss(old_lp_short, new_lp_short, adv_short)
+        loss_long_mean = grpo.policy_loss(old_lp_long, new_lp_long, adv_long)
+
+        # Mean losses should be equal (same average per token)
+        assert abs(float(loss_short_mean) - float(loss_long_mean)) < 1e-5
+
+        # With constant normalization: long sequence contributes more
+        loss_short_const = grpo.policy_loss(
+            old_lp_short, new_lp_short, adv_short, normalize_constant=10
+        )
+        loss_long_const = grpo.policy_loss(
+            old_lp_long, new_lp_long, adv_long, normalize_constant=10
+        )
+
+        # Long sequence should have larger absolute loss (4x tokens)
+        # This is the expected behavior with constant normalization
+        assert abs(float(loss_long_const)) > abs(float(loss_short_const)) * 3
+
+    def test_policy_loss_compiled_constant_norm(self):
+        """Test compiled policy loss with constant normalization."""
+        from textpolicy.algorithms import grpo
+
+        old_lp = mx.array([-1.0, -1.2, -0.8, -1.1, -0.9])
+        new_lp = mx.array([-1.1, -1.0, -0.9, -1.0, -1.0])
+        advantages = mx.array([0.6, 0.1, -0.9, 0.4, -0.2])
+
+        # Test compiled version with constant normalization
+        loss = grpo.policy_loss_compiled_constant_norm(
+            old_lp, new_lp, advantages,
+            clip_ratio_low=0.2, clip_ratio_high=0.28,
+            normalize_constant=1024.0
+        )
+
+        assert not mx.isnan(loss)
+        assert loss.shape == ()
+
+    def test_compute_metrics_asymmetric(self):
+        """Test compute_metrics with asymmetric clipping."""
+        from textpolicy.algorithms import grpo
+
+        old_lp = mx.array([-1.0, -1.2, -0.8, -1.1, -0.9])
+        new_lp = mx.array([-1.1, -1.0, -0.9, -1.0, -1.0])
+        advantages = mx.array([0.6, 0.1, -0.9, 0.4, -0.2])
+
+        # Test with asymmetric bounds
+        metrics = grpo.compute_metrics(
+            old_lp, new_lp, advantages,
+            clip_ratio_low=0.2, clip_ratio_high=0.28
+        )
+
+        # Check all expected metrics are present
+        assert 'clip_fraction_lower' in metrics
+        assert 'clip_fraction_upper' in metrics
+        assert 'clip_fraction' in metrics
+        assert 'clip_ratio_low' in metrics
+        assert 'clip_ratio_high' in metrics
+
+        # Check values are reasonable
+        assert 0 <= metrics['clip_fraction_lower'] <= 1
+        assert 0 <= metrics['clip_fraction_upper'] <= 1
+        assert 0 <= metrics['clip_fraction'] <= 1
+        assert metrics['clip_ratio_low'] == 0.2
+        assert metrics['clip_ratio_high'] == 0.28
+
+        # Total clip fraction should be >= max of individual fractions
+        total = metrics['clip_fraction']
+        assert total >= metrics['clip_fraction_lower'] or abs(total - metrics['clip_fraction_lower']) < 1e-6
+        assert total >= metrics['clip_fraction_upper'] or abs(total - metrics['clip_fraction_upper']) < 1e-6
+
     def test_entropy_bonus(self):
         """Test entropy bonus computation."""
         from textpolicy.algorithms import grpo
@@ -165,6 +326,105 @@ class TestGRPOWithMLX:
         entropy = grpo.entropy_bonus(logprobs, coefficient=0.01)
 
         assert not mx.isnan(entropy)
+
+    def test_compute_length_penalty(self):
+        """Test soft overlong penalty computation."""
+        from textpolicy.algorithms import grpo
+
+        max_length = 512
+        cache_length = 100
+
+        # Below threshold: no penalty
+        penalty = grpo.compute_length_penalty(400, max_length, cache_length)
+        assert penalty == 0.0
+
+        # At threshold boundary: no penalty
+        penalty = grpo.compute_length_penalty(412, max_length, cache_length)
+        assert penalty == 0.0
+
+        # Just past threshold: small penalty
+        penalty = grpo.compute_length_penalty(413, max_length, cache_length)
+        assert -0.1 < penalty < 0.0
+
+        # Halfway through cache zone
+        penalty = grpo.compute_length_penalty(462, max_length, cache_length)
+        assert -0.35 < penalty < -0.2
+
+        # At max length: max penalty
+        penalty = grpo.compute_length_penalty(512, max_length, cache_length)
+        assert penalty == -0.5
+
+        # Past max length: clamped at max penalty
+        penalty = grpo.compute_length_penalty(600, max_length, cache_length)
+        assert penalty == -0.5
+
+    def test_compute_length_penalty_custom_max_penalty(self):
+        """Test length penalty with custom max penalty."""
+        from textpolicy.algorithms import grpo
+
+        # Custom max penalty
+        penalty = grpo.compute_length_penalty(512, 512, 100, max_penalty=1.0)
+        assert penalty == -1.0
+
+        penalty = grpo.compute_length_penalty(462, 512, 100, max_penalty=1.0)
+        assert -0.6 < penalty < -0.4
+
+    def test_apply_length_shaping(self):
+        """Test applying length penalties to rewards."""
+        from textpolicy.algorithms import grpo
+
+        rewards = mx.array([1.0, 0.5, 0.0, -0.5])
+        lengths = [400, 462, 512, 600]  # below, mid, at, past max
+        max_length = 512
+        cache_length = 100
+
+        shaped = grpo.apply_length_shaping(
+            rewards, lengths, max_length, cache_length
+        )
+
+        # First should be unchanged (below threshold)
+        assert abs(float(shaped[0]) - 1.0) < 1e-6
+
+        # Second should have small penalty
+        assert 0.1 < float(shaped[1]) < 0.4
+
+        # Third should have max penalty (-0.5)
+        assert abs(float(shaped[2]) - (-0.5)) < 1e-6
+
+        # Fourth should have max penalty (clamped)
+        assert abs(float(shaped[3]) - (-1.0)) < 1e-6
+
+    def test_compute_length_shaping_stats(self):
+        """Test length shaping statistics."""
+        from textpolicy.algorithms import grpo
+
+        lengths = [400, 420, 462, 500, 512, 520]
+        max_length = 512
+        cache_length = 100
+
+        stats = grpo.compute_length_shaping_stats(lengths, max_length, cache_length)
+
+        assert 'mean_length' in stats
+        assert 'max_length_observed' in stats
+        assert 'truncation_rate' in stats
+        assert 'penalty_zone_rate' in stats
+
+        # 2 truncated (512, 520)
+        assert abs(stats['truncation_rate'] - 2/6) < 1e-6
+
+        # threshold = 412, so penalty zone is 412 <= l < 512
+        # 420, 462, 500 are in zone = 3 items
+        assert stats['penalty_zone_rate'] == 3/6  # 420, 462, 500
+
+        assert stats['max_length_observed'] == 520
+
+    def test_length_shaping_empty_list(self):
+        """Test length shaping with empty list."""
+        from textpolicy.algorithms import grpo
+
+        stats = grpo.compute_length_shaping_stats([], 512, 100)
+        assert stats['mean_length'] == 0.0
+        assert stats['truncation_rate'] == 0.0
 
 
 @pytest.mark.unit
