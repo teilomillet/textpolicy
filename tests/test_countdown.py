@@ -16,7 +16,10 @@ from textpolicy.tasks.countdown.prompt import (
     extract_expression_from_completion,
 )
 from textpolicy.tasks.countdown.reward import countdown_reward
-from textpolicy.tasks.countdown.dataset import generate_countdown_problems
+from textpolicy.tasks.countdown.dataset import (
+    generate_countdown_problems,
+    load_countdown_dataset,
+)
 
 
 # =========================================================================
@@ -46,6 +49,24 @@ class TestEvaluatorSimple:
     def test_spaces_ignored(self):
         r = evaluate_expression("  1 + 2  ")
         assert r.value == pytest.approx(3.0)
+
+    def test_unary_minus(self):
+        r = evaluate_expression("-1+2")
+        assert r.value == pytest.approx(1.0)
+        assert r.numbers_used == [1, 2]
+
+    def test_unary_plus(self):
+        r = evaluate_expression("+3*2")
+        assert r.value == pytest.approx(6.0)
+
+    def test_inline_unary_minus(self):
+        r = evaluate_expression("1+-2")
+        assert r.value == pytest.approx(-1.0)
+
+    def test_parenthesized_negative(self):
+        r = evaluate_expression("(-3+5)*2")
+        assert r.value == pytest.approx(4.0)
+        assert sorted(r.numbers_used) == [2, 3, 5]
 
 
 class TestEvaluatorPrecedence:
@@ -106,6 +127,10 @@ class TestEvaluatorErrors:
     def test_unmatched_close_paren(self):
         with pytest.raises(ExpressionError):
             evaluate_expression("1+2)")
+
+    def test_trailing_junk(self):
+        with pytest.raises(ExpressionError, match="Unexpected token after end"):
+            evaluate_expression("1+2 3")
 
     def test_code_injection_semicolon(self):
         with pytest.raises(ExpressionError, match="disallowed"):
@@ -298,6 +323,107 @@ class TestDatasetGeneration:
         p1 = generate_countdown_problems(5, seed=99)
         p2 = generate_countdown_problems(5, seed=99)
         assert p1 == p2
+
+
+class TestLoadCountdownDataset:
+    """Tests for load_countdown_dataset."""
+
+    def test_import_error_when_datasets_missing(self, monkeypatch):
+        """Raises ImportError when the optional datasets dependency is missing."""
+        import builtins
+        real_import = builtins.__import__
+
+        def mock_import(name, *args, **kwargs):
+            if name == "datasets":
+                raise ImportError("no module named 'datasets'")
+            return real_import(name, *args, **kwargs)
+
+        monkeypatch.setattr(builtins, "__import__", mock_import)
+        with pytest.raises(ImportError, match="datasets"):
+            load_countdown_dataset(split="train")
+
+    def test_parses_stringified_number_lists(self, monkeypatch):
+        """Parses nums when stored as stringified lists."""
+        from unittest.mock import MagicMock
+
+        fake_ds = [
+            {"target": 100, "nums": "[1, 2, 3, 4]"},
+            {"target": 200, "nums": "[5, 6, 7, 8]"},
+        ]
+        mock_load = MagicMock(return_value=fake_ds)
+
+        monkeypatch.setattr(
+            "textpolicy.tasks.countdown.dataset.load_dataset", mock_load,
+            raising=False,
+        )
+        # Ensure the function uses our mock instead of importing from datasets
+        import textpolicy.tasks.countdown.dataset as ds_mod
+        monkeypatch.setattr(ds_mod, "load_dataset", mock_load, raising=False)
+
+        # Patch the import inside the function
+        import builtins
+        real_import = builtins.__import__
+
+        def patched_import(name, *args, **kwargs):
+            if name == "datasets":
+                mod = MagicMock()
+                mod.load_dataset = mock_load
+                return mod
+            return real_import(name, *args, **kwargs)
+
+        monkeypatch.setattr(builtins, "__import__", patched_import)
+
+        examples = load_countdown_dataset(split="train")
+        assert len(examples) == 2
+        assert examples[0] == {"target": 100, "numbers": [1, 2, 3, 4]}
+        assert examples[1] == {"target": 200, "numbers": [5, 6, 7, 8]}
+
+    def test_max_examples_truncates(self, monkeypatch):
+        """Respects max_examples by truncating results."""
+        from unittest.mock import MagicMock
+
+        fake_ds = [
+            {"target": 10, "nums": [1, 2, 3]},
+            {"target": 20, "nums": [4, 5, 6]},
+            {"target": 30, "nums": [7, 8, 9]},
+        ]
+
+        import builtins
+        real_import = builtins.__import__
+
+        def patched_import(name, *args, **kwargs):
+            if name == "datasets":
+                mod = MagicMock()
+                mod.load_dataset = MagicMock(return_value=fake_ds)
+                return mod
+            return real_import(name, *args, **kwargs)
+
+        monkeypatch.setattr(builtins, "__import__", patched_import)
+
+        examples = load_countdown_dataset(split="train", max_examples=2)
+        assert len(examples) == 2
+
+    def test_handles_numbers_key(self, monkeypatch):
+        """Falls back to 'numbers' key when 'nums' is absent."""
+        from unittest.mock import MagicMock
+
+        fake_ds = [{"target": 42, "numbers": [10, 20, 12]}]
+
+        import builtins
+        real_import = builtins.__import__
+
+        def patched_import(name, *args, **kwargs):
+            if name == "datasets":
+                mod = MagicMock()
+                mod.load_dataset = MagicMock(return_value=fake_ds)
+                return mod
+            return real_import(name, *args, **kwargs)
+
+        monkeypatch.setattr(builtins, "__import__", patched_import)
+
+        examples = load_countdown_dataset(split="train")
+        assert len(examples) == 1
+        assert examples[0] == {"target": 42, "numbers": [10, 20, 12]}
 
 
 # =========================================================================

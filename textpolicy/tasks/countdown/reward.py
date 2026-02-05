@@ -24,8 +24,8 @@ def countdown_reward(
 
     Scoring:
         1.0  — expression equals target with valid numbers
-        0.0  — evaluates but wrong answer or invalid numbers
-       -0.5  — syntax error, empty, or unparseable
+        0.0  — evaluates but wrong answer, or malformed example
+       -0.5  — syntax error, empty, unparseable, number reuse, or invalid numbers
 
     The example dict must contain 'target' (int) and 'numbers' (list of int).
     """
