@@ -317,6 +317,57 @@ class TestEmergenceLoggerIntegration:
 
 
 # ---------------------------------------------------------------------------
+# Example alignment across steps
+# ---------------------------------------------------------------------------
+class TestExampleAlignment:
+    def test_step_examples_match_env_cycling(self):
+        """Verify that step_examples aligns with the env's prompt cycling."""
+        from experiments.countdown_baseline import BaselineConfig
+
+        config = BaselineConfig(num_problems=5, episodes_per_step=3)
+
+        problems = [{"target": i, "numbers": [i]} for i in range(config.num_problems)]
+
+        for step in range(4):
+            step_examples = [
+                problems[
+                    (step * config.episodes_per_step + i) % len(problems)
+                ]
+                for i in range(config.episodes_per_step)
+            ]
+            for i, ex in enumerate(step_examples):
+                global_idx = step * config.episodes_per_step + i
+                expected = problems[global_idx % len(problems)]
+                assert ex is expected, (
+                    f"step={step} i={i}: expected problem {expected['target']}, "
+                    f"got {ex['target']}"
+                )
+
+    def test_step_examples_wrap_around(self):
+        """After exhausting all problems, cycling wraps to the beginning."""
+        from experiments.countdown_baseline import BaselineConfig
+
+        config = BaselineConfig(num_problems=3, episodes_per_step=2)
+        problems = [{"target": t} for t in [10, 20, 30]]
+
+        # step 0: problems[0], problems[1]
+        # step 1: problems[2], problems[0]  (wraps)
+        # step 2: problems[1], problems[2]
+        expected_targets = [
+            [10, 20],
+            [30, 10],
+            [20, 30],
+        ]
+        for step in range(3):
+            step_examples = [
+                problems[(step * config.episodes_per_step + i) % len(problems)]
+                for i in range(config.episodes_per_step)
+            ]
+            targets = [ex["target"] for ex in step_examples]
+            assert targets == expected_targets[step], f"step={step}"
+
+
+# ---------------------------------------------------------------------------
 # Full run_baseline integration (fully mocked)
 # ---------------------------------------------------------------------------
 class TestRunBaseline:

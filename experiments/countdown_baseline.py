@@ -227,12 +227,22 @@ def run_baseline(config: BaselineConfig) -> None:
         for ep in rollout_buffer.episodes:
             buffer.add_episode_from_dict(ep.to_dict())
 
+        # Map each episode to the correct problem.  The environment cycles
+        # prompts via current_episode % len(prompts), so the global offset
+        # must be accounted for — local episode index alone is wrong after
+        # step 0.
+        num_eps = len(rollout_buffer.episodes)
+        step_examples = [
+            problems[(step * config.episodes_per_step + i) % len(problems)]
+            for i in range(num_eps)
+        ]
+
         # Log generations BEFORE training
         step_stats = emergence.log_step(
             step=step,
             episodes=rollout_buffer.episodes,
             tokenizer=tokenizer,
-            examples=problems,
+            examples=step_examples,
         )
 
         # Train
