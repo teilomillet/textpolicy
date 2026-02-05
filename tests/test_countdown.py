@@ -260,6 +260,17 @@ class TestDatasetGeneration:
                 f"Problem claimed solvable but isn't: {p}"
             )
 
+    def test_solvable_with_subset_of_numbers(self):
+        """Target reachable with a subset should count as solvable."""
+        from textpolicy.tasks.countdown.dataset import _is_solvable
+
+        # 5 is reachable by just using the number 5 (subset of [5, 3])
+        assert _is_solvable([5, 3], 5)
+        # 8 is reachable as 5+3, using all numbers
+        assert _is_solvable([5, 3], 8)
+        # 10 is reachable as (1+4)*2, ignoring 7
+        assert _is_solvable([1, 4, 2, 7], 10)
+
     def test_num_numbers_3(self):
         problems = generate_countdown_problems(5, num_numbers=3, seed=42)
         for p in problems:

@@ -125,9 +125,18 @@ def _is_solvable(numbers: List[int], target: int) -> bool:
 
 
 def _solve(nums: List[float], target: float) -> bool:
-    """Recursively try all pairs of numbers with all operations."""
-    if len(nums) == 1:
-        return abs(nums[0] - target) < 1e-9
+    """Recursively try all pairs of numbers with all operations.
+
+    Allows using a subset of numbers — if any single number in the
+    current list already equals the target, that counts as solved.
+    """
+    # Any number in the current set already equals the target → solvable
+    for n in nums:
+        if abs(n - target) < 1e-9:
+            return True
+
+    if len(nums) < 2:
+        return False
 
     for i, j in itertools.permutations(range(len(nums)), 2):
         a, b = nums[i], nums[j]
