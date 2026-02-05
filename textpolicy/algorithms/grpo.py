@@ -423,8 +423,8 @@ def _precompute_episode_rewards(episodes: List[Any]) -> List[float]:
     """
     Pre-compute rewards for all episodes in a single pass.
 
-    This avoids repeated _get_episode_reward calls when processing
-    prompt groups, improving performance for large buffers.
+    Uses batched MLX evaluation to avoid per-episode .item() sync barriers.
+    All mx.sum() calls are built lazily, then evaluated in one mx.eval() call.
 
     Args:
         episodes: List of episodes
@@ -432,18 +432,33 @@ def _precompute_episode_rewards(episodes: List[Any]) -> List[float]:
     Returns:
         List of rewards in the same order as episodes
     """
-    rewards = []
-    for ep in episodes:
+    if not episodes:
+        return []
+
+    rewards: List[Optional[float]] = [None] * len(episodes)
+    pending: List[Tuple[int, mx.array]] = []  # (index, lazy_sum) pairs
+
+    for i, ep in enumerate(episodes):
         if hasattr(ep, 'rew'):
-            reward = float(mx.sum(mx.array(ep.rew)).item())
+            rew = ep.rew
         else:
             rew = ep.get('rew', ep.get('reward', [0.0]))
-            if isinstance(rew, (int, float)):
-                reward = float(rew)
-            else:
-                reward = float(mx.sum(mx.array(rew)).item())
-        rewards.append(reward)
-    return rewards
+
+        if isinstance(rew, (int, float)):
+            rewards[i] = float(rew)
+        else:
+            pending.append((i, mx.sum(mx.array(rew))))
+
+    # Single sync barrier for all array rewards
+    if pending:
+        indices, lazy_sums = zip(*pending)
+        stacked = mx.stack(list(lazy_sums))
+        mx.eval(stacked)
+        values = stacked.tolist()
+        for idx, val in zip(indices, values):
+            rewards[idx] = float(val)
+
+    return rewards  # type: ignore[return-value]
 
 
 def _compute_group_variance_and_mean(
@@ -828,17 +843,17 @@ def _pack_episodes(episodes: List[Any]) -> Dict[str, Any]:
             'episode_lengths': [],
         }
 
-    episode_rewards = []
     episode_lengths = []
     all_obs = []
     all_acts = []
     all_logprobs = []
+    pending_reward_sums: List[Tuple[int, mx.array]] = []
+    scalar_rewards: Dict[int, float] = {}
 
-    for episode in episodes:
+    for i, episode in enumerate(episodes):
         if hasattr(episode, 'rew'):
             # Episode object with attributes
-            episode_reward = mx.sum(mx.array(episode.rew)).item()
-            episode_rewards.append(episode_reward)
+            pending_reward_sums.append((i, mx.sum(mx.array(episode.rew))))
 
             # Flatten observation and action tokens
             flattened_obs = _flatten_tokens(episode.obs)
@@ -855,8 +870,11 @@ def _pack_episodes(episodes: List[Any]) -> Dict[str, Any]:
             all_logprobs.append(episode.logprob if episode.logprob is not None else [])
         else:
             # Serialized dictionary from multiprocessing
-            episode_reward = mx.sum(mx.array(episode['rew'])).item()
-            episode_rewards.append(episode_reward)
+            rew = episode['rew']
+            if isinstance(rew, (int, float)):
+                scalar_rewards[i] = float(rew)
+            else:
+                pending_reward_sums.append((i, mx.sum(mx.array(rew))))
 
             # Flatten observation and action tokens
             flattened_obs = _flatten_tokens(episode['obs'])
@@ -869,6 +887,18 @@ def _pack_episodes(episodes: List[Any]) -> Dict[str, Any]:
             all_obs.append(full_sequence)
             all_acts.append(flattened_acts)
             all_logprobs.append(episode.get('logprob', []))
+
+    # Batch evaluate all pending reward sums (single sync barrier instead of N)
+    episode_rewards = [0.0] * len(episodes)
+    for idx, val in scalar_rewards.items():
+        episode_rewards[idx] = val
+    if pending_reward_sums:
+        indices, lazy_sums = zip(*pending_reward_sums)
+        stacked = mx.stack(list(lazy_sums))
+        mx.eval(stacked)
+        values = stacked.tolist()
+        for idx, val in zip(indices, values):
+            episode_rewards[idx] = float(val)
 
     # Find maximum sequence lengths for padding
     max_obs_len = max(len(obs) for obs in all_obs) if all_obs else 0
