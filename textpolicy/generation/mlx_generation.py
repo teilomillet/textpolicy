@@ -27,8 +27,8 @@ try:
     from mlx_lm.sample_utils import make_sampler, make_logits_processors
 # sampling utilities fallback when sample_utils is unavailable
 except ImportError:
-    _make_sampler = None
-    _make_logits_processors = None
+    make_sampler = None
+    make_logits_processors = None
 
 
 def _get_eos_configs_for_model(
