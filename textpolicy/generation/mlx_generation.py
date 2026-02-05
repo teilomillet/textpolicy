@@ -27,8 +27,8 @@ try:
     from mlx_lm.sample_utils import make_sampler, make_logits_processors
 # sampling utilities fallback when sample_utils is unavailable
 except ImportError:
-    _make_sampler = None
-    _make_logits_processors = None
+    make_sampler = None
+    make_logits_processors = None
 
 
 def _get_eos_configs_for_model(
@@ -194,7 +194,9 @@ def generate_tokens(
         return _simple_generate(model, prompt_tokens, max_tokens, temperature)
     
     prompt_list = prompt_tokens.tolist()
-    
+    response_token_list: list = []
+    response_logprob_list: list = []
+
     # Use stream_generate instead of generate to get proper EOS token handling
     # This is the core fix - stream_generate respects EOS tokens, generate() does not
     try:
@@ -216,19 +218,20 @@ def generate_tokens(
             logits_processors=logits_processors,
         ))
         
-        # Extract tokens from response segments and detect natural EOS stopping
-        response_token_list = []
-        
+        # Extract tokens and logprobs from response segments
         for segment in response_segments:
             response_token_list.append(segment.token)
+            # Capture per-token logprob inline to avoid a redundant forward pass
+            if segment.logprobs is not None:
+                response_logprob_list.append(float(segment.logprobs[segment.token]))
             # Check if this segment indicates natural stopping (EOS token)
             if hasattr(segment, 'finish_reason') and segment.finish_reason == "stop":
                 break
-        
+
         # Convert to MLX array
         response_tokens = mx.array(response_token_list) if response_token_list else mx.array([])
-        
-        
+
+
     except ImportError:
         # Fallback to original generate method if stream_generate unavailable
         print("WARNING: stream_generate not available, using fallback generate method")
@@ -248,8 +251,12 @@ def generate_tokens(
         
         response_tokens = _extract_response_tokens(response, prompt_list, tokenizer)
     
-    # Compute logprobs for the response tokens
-    logprobs = compute_logprobs(model, prompt_tokens, response_tokens)
+    # Use inline logprobs captured during generation when available,
+    # falling back to a full forward pass only if logprobs were missing.
+    if response_logprob_list and len(response_logprob_list) == len(response_token_list):
+        logprobs = mx.array(response_logprob_list)
+    else:
+        logprobs = compute_logprobs(model, prompt_tokens, response_tokens)
     return response_tokens, {'logprob': logprobs}
 
 
@@ -292,35 +299,43 @@ def _simple_generate(
     """
     current_tokens = prompt_tokens
     generated = []
-    
+    generated_logprobs = []
+
     for _ in range(max_tokens):
         # Model forward pass
         logits = model(current_tokens[None])  # Add batch dimension
         next_token_logits = logits[0, -1, :]  # Last token logits
-        
+
         # Temperature scaling
         if temperature > 0:
             scaled_logits = next_token_logits / temperature
         else:
             scaled_logits = next_token_logits
-        
+
         # Sample next token
         probs = mx.softmax(scaled_logits)
         next_token = mx.random.categorical(probs[None])[0]
-        
+
+        # Capture logprob inline: log_softmax of the *unscaled* logits at the selected token
+        log_probs = next_token_logits - mx.logsumexp(next_token_logits)
+        generated_logprobs.append(float(log_probs[next_token]))
+
         # Add to sequence
         generated.append(next_token)
         current_tokens = mx.concatenate([current_tokens, next_token[None]])
-        
+
         # Stop on EOS (approximate) - avoid .item() calls
         if len(generated) > 5 and next_token < 5:  # Simple stop condition
             break
-    
+
     response_tokens = mx.array(generated) if generated else mx.array([2])
-    
-    # Compute simple logprobs
-    logprobs = compute_logprobs(model, prompt_tokens, response_tokens)
-    
+
+    # Use inline logprobs captured during generation (avoids redundant forward pass)
+    if generated_logprobs and len(generated_logprobs) == len(generated):
+        logprobs = mx.array(generated_logprobs)
+    else:
+        logprobs = compute_logprobs(model, prompt_tokens, response_tokens)
+
     return response_tokens, {'logprob': logprobs}
 
 

@@ -51,11 +51,12 @@ class Trainer:
         compile_training: bool = True,
         buffer: Optional[Buffer] = None,
         data_selector_fn: Optional[Callable] = None,
-        auto_save_lora: Optional[str] = None
+        auto_save_lora: Optional[str] = None,
+        metrics_interval: int = 10
     ):
         """
         Initialize unified trainer with composable algorithm functions.
-        
+
         Args:
             model: MLX model (typically from MLX-LM)
             advantage_fn: Pure function for computing advantages
@@ -68,6 +69,10 @@ class Trainer:
             buffer: Optional linked buffer for automatic data selection
             data_selector_fn: Algorithm-specific function to select data from buffer
             auto_save_lora: Optional path to auto-save LoRA adapters after training
+            metrics_interval: Compute detailed metrics every N steps. Setting >1
+                avoids a duplicate model forward pass on non-metric steps.
+                Default 10 balances insight and throughput; set to 1 for
+                every-step metrics when needed.
         """
         self.model = model
         self.advantage_fn = advantage_fn
@@ -76,11 +81,12 @@ class Trainer:
         self.get_logprobs_fn = get_logprobs_fn or self._default_get_logprobs
         self.metrics_fn = metrics_fn
         self.max_grad_norm = max_grad_norm
-        
+        self.metrics_interval = max(1, metrics_interval)
+
         # Buffer management
         self.buffer = buffer
         self.data_selector_fn = data_selector_fn or self._default_data_selector
-        
+
         # LoRA management - detect auto-reload models
         self.auto_save_lora = auto_save_lora or self._detect_auto_reload_lora(model)
         self._has_lora = self._detect_lora_model(model)
@@ -497,12 +503,15 @@ class Trainer:
         
         # Compute metrics if function provided
         metrics = {'loss': loss.item(), 'step': self._step_count}
-        if self.metrics_fn is not None:
+        if self.metrics_fn is not None and self._step_count % self.metrics_interval == 0:
             # Compute new logprobs using the same pipeline as training to ensure consistency
             # This properly handles GRPO data structure with format conversion
+            #
+            # NOTE: This is a second model forward pass (the first happens inside
+            # loss_and_grad_fn). Set metrics_interval > 1 to amortize this cost.
             observations = batch_data['obs']
             actions = batch_data['act']
-            
+
             # Use GRPO-specific extraction if episode_lengths available, otherwise fallback
             if 'episode_lengths' in batch_data:
                 episode_lengths = batch_data['episode_lengths']
@@ -515,7 +524,7 @@ class Trainer:
                     model_input = observations  # Already batched
                 model_output = self.model(model_input)
                 new_logprobs = self.get_logprobs_fn(model_output, actions)
-            
+
             algorithm_metrics = self.metrics_fn(
                 batch_data['logprob'],
                 new_logprobs,
@@ -551,27 +560,37 @@ class Trainer:
         
         if not episodes:
             raise ValueError("Buffer is empty - no episodes to train on")
-        
-        # Extract episode rewards for advantage computation
-        episode_rewards = []
+
+        # Extract episode rewards and lengths
+        # Build reward sums lazily, then evaluate in a single sync barrier
         episode_lengths = []
-        
+        pending_sums = []
+
         # Collect all transitions
         all_obs = []
         all_acts = []
         all_logprobs = []
-        
+
         for episode in episodes:
-            # Episode reward (sum of all rewards in episode)
-            episode_reward = mx.sum(episode['rew']).item()
-            episode_rewards.append(episode_reward)
-            episode_lengths.append(len(episode['obs']))
-            
+            # Support both Episode objects (attribute access) and dicts
+            rew = episode.rew if hasattr(episode, 'rew') else episode['rew']
+            obs = episode.obs if hasattr(episode, 'obs') else episode['obs']
+            act = episode.act if hasattr(episode, 'act') else episode['act']
+            logprob = episode.logprob if hasattr(episode, 'logprob') else episode['logprob']
+
+            pending_sums.append(mx.sum(mx.array(rew)))
+            episode_lengths.append(len(obs))
+
             # Collect transitions
-            all_obs.append(episode['obs'])
-            all_acts.append(episode['act'])
-            all_logprobs.append(episode['logprob'])
-        
+            all_obs.append(mx.array(obs))
+            all_acts.append(mx.array(act))
+            all_logprobs.append(mx.array(logprob))
+
+        # Single sync barrier for all episode rewards
+        reward_stack = mx.stack(pending_sums)
+        mx.eval(reward_stack)
+        episode_rewards = reward_stack.tolist()
+
         # Concatenate all transitions
         batch_data = {
             'obs': mx.concatenate(all_obs),
