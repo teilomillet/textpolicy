@@ -419,6 +419,51 @@ def _get_prompt_key(episode) -> tuple:
     return tuple(flattened)
 
 
+def _precompute_episode_rewards(episodes: List[Any]) -> List[float]:
+    """
+    Pre-compute rewards for all episodes in a single pass.
+
+    This avoids repeated _get_episode_reward calls when processing
+    prompt groups, improving performance for large buffers.
+
+    Args:
+        episodes: List of episodes
+
+    Returns:
+        List of rewards in the same order as episodes
+    """
+    rewards = []
+    for ep in episodes:
+        if hasattr(ep, 'rew'):
+            reward = float(mx.sum(mx.array(ep.rew)).item())
+        else:
+            rew = ep.get('rew', ep.get('reward', [0.0]))
+            if isinstance(rew, (int, float)):
+                reward = float(rew)
+            else:
+                reward = float(mx.sum(mx.array(rew)).item())
+        rewards.append(reward)
+    return rewards
+
+
+def _compute_group_variance_and_mean(
+    group_indices: List[int],
+    all_rewards: List[float]
+) -> Tuple[float, float]:
+    """
+    Compute variance and mean for a group of episodes using pre-computed rewards.
+
+    Args:
+        group_indices: Indices into all_rewards for this group
+        all_rewards: Pre-computed rewards for all episodes
+
+    Returns:
+        Tuple of (variance, mean)
+    """
+    group_rewards = mx.array([all_rewards[i] for i in group_indices])
+    return mx.var(group_rewards).item(), mx.mean(group_rewards).item()
+
+
 def filter_informative_prompts(
     episodes: List[Any],
     min_variance: float = 0.01,
@@ -493,11 +538,14 @@ def filter_informative_prompts(
             'filter_rate': 0.0,
         }
 
-    # Group episodes by prompt
-    prompt_groups: Dict[tuple, List[Any]] = defaultdict(list)
-    for ep in episodes:
+    # Pre-compute all rewards once (avoids repeated _get_episode_reward calls)
+    all_rewards = _precompute_episode_rewards(episodes)
+
+    # Group episodes by prompt, storing indices instead of episodes
+    prompt_groups: Dict[tuple, List[int]] = defaultdict(list)
+    for idx, ep in enumerate(episodes):
         prompt_key = _get_prompt_key(ep)
-        prompt_groups[prompt_key].append(ep)
+        prompt_groups[prompt_key].append(idx)
 
     filtered = []
     stats = {
@@ -510,14 +558,14 @@ def filter_informative_prompts(
         'episodes_dropped': 0,
     }
 
-    for prompt_key, group in prompt_groups.items():
-        group_size = len(group)
+    for prompt_key, group_indices in prompt_groups.items():
+        group_size = len(group_indices)
 
         # Handle single-completion prompts separately
         if group_size == 1:
             if keep_single_completion:
                 # Keep single-completion prompts (variance undefined, not "zero")
-                filtered.extend(group)
+                filtered.append(episodes[group_indices[0]])
                 stats['prompts_kept'] += 1
                 stats['prompts_kept_single'] += 1
                 stats['episodes_kept'] += 1
@@ -528,13 +576,12 @@ def filter_informative_prompts(
             continue
 
         # For groups with 2+ completions, use variance criterion
-        rewards = mx.array([_get_episode_reward(ep) for ep in group])
-        variance = mx.var(rewards).item()
-        mean_reward = mx.mean(rewards).item()
+        variance, mean_reward = _compute_group_variance_and_mean(group_indices, all_rewards)
 
         if variance > min_variance:
             # Informative: mixed outcomes, keep all episodes from this prompt
-            filtered.extend(group)
+            for idx in group_indices:
+                filtered.append(episodes[idx])
             stats['prompts_kept'] += 1
             stats['episodes_kept'] += group_size
         else:
@@ -579,17 +626,20 @@ def compute_prompt_group_stats(episodes: List[Any]) -> Dict[str, Any]:
             'reward_variance_std': 0.0,
         }
 
-    # Group by prompt
-    prompt_groups: Dict[tuple, List[Any]] = defaultdict(list)
-    for ep in episodes:
-        prompt_key = _get_prompt_key(ep)
-        prompt_groups[prompt_key].append(ep)
+    # Pre-compute all rewards once
+    all_rewards = _precompute_episode_rewards(episodes)
 
-    # Compute variance for each group
+    # Group by prompt, storing indices
+    prompt_groups: Dict[tuple, List[int]] = defaultdict(list)
+    for idx, ep in enumerate(episodes):
+        prompt_key = _get_prompt_key(ep)
+        prompt_groups[prompt_key].append(idx)
+
+    # Compute variance for each group using pre-computed rewards
     variances = []
-    for group in prompt_groups.values():
-        rewards = mx.array([_get_episode_reward(ep) for ep in group])
-        variances.append(mx.var(rewards).item())
+    for group_indices in prompt_groups.values():
+        group_rewards = mx.array([all_rewards[i] for i in group_indices])
+        variances.append(mx.var(group_rewards).item())
 
     variances_arr = mx.array(variances) if variances else mx.array([0.0])
 
