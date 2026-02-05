@@ -12,6 +12,7 @@ Usage:
 """
 
 import argparse
+import functools
 import json
 from dataclasses import asdict, dataclass
 from pathlib import Path
@@ -53,7 +54,6 @@ class BaselineConfig:
     max_grad_norm: float = 0.5
 
     # Generation
-    num_generations_per_prompt: int = 4
     max_completion_tokens: int = 512
     temperature: float = 0.7
     top_p: float = 0.9
@@ -196,11 +196,16 @@ def run_baseline(config: BaselineConfig) -> None:
     )
 
     # 8. Create buffer + trainer
-    buffer = Buffer(max_episodes=config.episodes_per_step * 2)
+    buffer = Buffer(max_episodes=config.episodes_per_step)
+    loss_fn = functools.partial(
+        grpo.policy_loss,
+        clip_ratio_low=config.clip_ratio_low,
+        clip_ratio_high=config.clip_ratio_high,
+    )
     trainer = Trainer(
         model=model,
         advantage_fn=grpo.compute_advantages,
-        loss_fn=grpo.policy_loss,
+        loss_fn=loss_fn,
         optimizer=optim.Adam(learning_rate=config.learning_rate),
         max_grad_norm=config.max_grad_norm,
         buffer=buffer,

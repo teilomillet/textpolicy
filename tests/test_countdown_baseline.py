@@ -79,11 +79,11 @@ class TestBaselineConfig:
         config2 = BaselineConfig(**restored)
         assert asdict(config2) == asdict(config)
 
-    def test_episodes_per_step_is_multiple_of_group_size(self):
+    def test_no_num_generations_per_prompt_field(self):
         from experiments.countdown_baseline import BaselineConfig
 
         config = BaselineConfig()
-        assert config.episodes_per_step % config.num_generations_per_prompt == 0
+        assert not hasattr(config, "num_generations_per_prompt")
 
 
 # ---------------------------------------------------------------------------
