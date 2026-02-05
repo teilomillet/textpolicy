@@ -426,6 +426,124 @@ class TestGRPOWithMLX:
         assert stats['mean_length'] == 0.0
         assert stats['truncation_rate'] == 0.0
 
+    def test_filter_informative_prompts_keeps_varied(self):
+        """Test that filter_informative_prompts keeps prompts with varied rewards."""
+        from textpolicy.algorithms import grpo
+
+        # Create mock episodes with same prompt but different rewards
+        # Simulate 2 prompts, each with 3 completions
+        episodes = [
+            # Prompt 1: varied rewards (should be kept)
+            {'obs': [1, 2, 3], 'act': [4], 'rew': [1.0]},
+            {'obs': [1, 2, 3], 'act': [5], 'rew': [0.0]},
+            {'obs': [1, 2, 3], 'act': [6], 'rew': [0.5]},
+            # Prompt 2: all correct (should be filtered)
+            {'obs': [7, 8, 9], 'act': [10], 'rew': [1.0]},
+            {'obs': [7, 8, 9], 'act': [11], 'rew': [1.0]},
+            {'obs': [7, 8, 9], 'act': [12], 'rew': [1.0]},
+        ]
+
+        filtered, stats = grpo.filter_informative_prompts(episodes, min_variance=0.01)
+
+        # Should keep prompt 1 (3 episodes) and filter prompt 2
+        assert len(filtered) == 3
+        assert stats['prompts_kept'] == 1
+        assert stats['prompts_dropped_all_correct'] == 1
+        assert stats['prompts_dropped_all_wrong'] == 0
+        assert stats['episodes_kept'] == 3
+        assert stats['episodes_dropped'] == 3
+
+    def test_filter_informative_prompts_filters_all_wrong(self):
+        """Test that filter_informative_prompts filters prompts where all completions fail."""
+        from textpolicy.algorithms import grpo
+
+        episodes = [
+            # Prompt 1: all wrong (should be filtered)
+            {'obs': [1, 2], 'act': [3], 'rew': [0.0]},
+            {'obs': [1, 2], 'act': [4], 'rew': [0.0]},
+            # Prompt 2: varied (should be kept)
+            {'obs': [5, 6], 'act': [7], 'rew': [1.0]},
+            {'obs': [5, 6], 'act': [8], 'rew': [0.0]},
+        ]
+
+        filtered, stats = grpo.filter_informative_prompts(episodes, min_variance=0.01)
+
+        assert len(filtered) == 2
+        assert stats['prompts_kept'] == 1
+        assert stats['prompts_dropped_all_correct'] == 0
+        assert stats['prompts_dropped_all_wrong'] == 1
+
+    def test_filter_informative_prompts_min_variance_threshold(self):
+        """Test that min_variance threshold controls filtering sensitivity."""
+        from textpolicy.algorithms import grpo
+
+        # Prompt with moderate variance (0.7 and 1.0)
+        # variance = ((0.7-0.85)^2 + (1.0-0.85)^2)/2 = (0.0225 + 0.0225)/2 = 0.0225
+        episodes = [
+            {'obs': [1], 'act': [2], 'rew': [0.7]},
+            {'obs': [1], 'act': [3], 'rew': [1.0]},
+        ]
+
+        # With threshold below variance (0.0225), should be kept
+        filtered_low, _ = grpo.filter_informative_prompts(episodes, min_variance=0.01)
+        assert len(filtered_low) == 2
+
+        # With threshold above variance (0.0225), should be filtered
+        filtered_high, _ = grpo.filter_informative_prompts(episodes, min_variance=0.05)
+        assert len(filtered_high) == 0
+
+    def test_filter_informative_prompts_empty_list(self):
+        """Test filter_informative_prompts with empty episode list."""
+        from textpolicy.algorithms import grpo
+
+        filtered, stats = grpo.filter_informative_prompts([])
+
+        assert filtered == []
+        assert stats['prompts_kept'] == 0
+        assert stats['filter_rate'] == 0.0
+
+    def test_compute_prompt_group_stats(self):
+        """Test compute_prompt_group_stats returns correct statistics."""
+        from textpolicy.algorithms import grpo
+
+        episodes = [
+            # Prompt 1: 3 completions
+            {'obs': [1, 2], 'act': [3], 'rew': [1.0]},
+            {'obs': [1, 2], 'act': [4], 'rew': [0.5]},
+            {'obs': [1, 2], 'act': [5], 'rew': [0.0]},
+            # Prompt 2: 2 completions
+            {'obs': [6, 7], 'act': [8], 'rew': [1.0]},
+            {'obs': [6, 7], 'act': [9], 'rew': [1.0]},
+        ]
+
+        stats = grpo.compute_prompt_group_stats(episodes)
+
+        assert stats['num_prompts'] == 2
+        assert stats['num_episodes'] == 5
+        assert stats['completions_per_prompt'] == 2.5
+        assert stats['reward_variance_mean'] > 0  # Some variance expected
+        assert 'reward_variance_std' in stats
+
+    def test_filter_preserves_episode_structure(self):
+        """Test that filtered episodes maintain their structure."""
+        from textpolicy.algorithms import grpo
+
+        # Episodes with various fields
+        episodes = [
+            {'obs': [1, 2], 'act': [3, 4], 'rew': [1.0], 'logprob': [-0.5]},
+            {'obs': [1, 2], 'act': [5, 6], 'rew': [0.0], 'logprob': [-0.7]},
+        ]
+
+        filtered, _ = grpo.filter_informative_prompts(episodes, min_variance=0.01)
+
+        # Both should be kept (varied rewards)
+        assert len(filtered) == 2
+        # Check structure preserved
+        assert 'obs' in filtered[0]
+        assert 'act' in filtered[0]
+        assert 'rew' in filtered[0]
+        assert 'logprob' in filtered[0]
+
 
 @pytest.mark.unit
 @pytest.mark.algorithm

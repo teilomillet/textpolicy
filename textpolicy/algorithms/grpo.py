@@ -26,7 +26,8 @@ if mx is None:
             return fn
 
     mx = _DummyMx()
-from typing import List, Union
+from typing import List, Union, Tuple, Dict, Any
+from collections import defaultdict
 
 
 def compute_advantages(rewards: Union[List[float], mx.array]) -> mx.array:
@@ -417,6 +418,190 @@ def compute_length_shaping_stats(
     }
 
 
+# DAPO-style dynamic batch filtering (Issue #9)
+def _get_episode_reward(episode) -> float:
+    """Extract total reward from episode (handles both Episode objects and dicts)."""
+    if hasattr(episode, 'rew'):
+        # Episode object
+        return float(mx.sum(mx.array(episode.rew)).item())
+    else:
+        # Serialized dictionary
+        rew = episode.get('rew', episode.get('reward', [0.0]))
+        if isinstance(rew, (int, float)):
+            return float(rew)
+        return float(mx.sum(mx.array(rew)).item())
+
+
+def _get_prompt_key(episode) -> tuple:
+    """
+    Generate a hashable key for an episode's prompt.
+
+    Handles both Episode objects and serialized dictionaries.
+    Uses the observation (prompt) tokens to identify the prompt.
+    """
+    if hasattr(episode, 'obs'):
+        obs = episode.obs
+    else:
+        obs = episode.get('obs', [])
+
+    # Flatten nested structures to create consistent key
+    flattened = []
+    for item in obs:
+        if hasattr(item, 'tolist'):  # MLX array
+            flattened.extend(item.tolist())
+        elif isinstance(item, list):
+            flattened.extend(item)
+        else:
+            flattened.append(item)
+
+    return tuple(flattened)
+
+
+def filter_informative_prompts(
+    episodes: List[Any],
+    min_variance: float = 0.01
+) -> Tuple[List[Any], Dict[str, int]]:
+    """
+    Filter episodes to keep only informative prompts (DAPO dynamic sampling).
+
+    Removes prompts where all completions have same outcome:
+    - All correct (reward ~1.0): no learning signal (nothing to improve)
+    - All wrong (reward ~0.0): no positive signal (can't learn what works)
+
+    GRPO uses group-relative advantages. If all completions have the same
+    outcome, advantages are zero, producing no gradient and wasting compute.
+
+    Args:
+        episodes: List of episodes (Episode objects or serialized dicts)
+        min_variance: Minimum reward variance to keep a prompt group.
+                     Groups with variance below this threshold are filtered out.
+                     Default 0.01 filters prompts with essentially identical rewards.
+
+    Returns:
+        Tuple of:
+        - filtered: List of episodes from informative prompts
+        - stats: Dictionary with filtering statistics:
+            - 'prompts_kept': Number of prompt groups kept
+            - 'prompts_dropped_all_correct': Prompts where all completions succeeded
+            - 'prompts_dropped_all_wrong': Prompts where all completions failed
+            - 'episodes_kept': Total episodes kept
+            - 'episodes_dropped': Total episodes filtered out
+            - 'filter_rate': Fraction of prompts filtered
+
+    Example:
+        >>> filtered, stats = filter_informative_prompts(episodes, min_variance=0.01)
+        >>> print(f"Kept {stats['prompts_kept']} prompts, "
+        ...       f"dropped {stats['prompts_dropped_all_correct']} all-correct, "
+        ...       f"{stats['prompts_dropped_all_wrong']} all-wrong")
+
+    References:
+        DAPO: An Open-Source LLM Reinforcement Learning System at Scale
+        https://arxiv.org/abs/2503.14476
+
+        GRPO++ Tricks
+        https://cameronrwolfe.substack.com/p/grpo-tricks
+    """
+    if not episodes:
+        return [], {
+            'prompts_kept': 0,
+            'prompts_dropped_all_correct': 0,
+            'prompts_dropped_all_wrong': 0,
+            'episodes_kept': 0,
+            'episodes_dropped': 0,
+            'filter_rate': 0.0,
+        }
+
+    # Group episodes by prompt
+    prompt_groups: Dict[tuple, List[Any]] = defaultdict(list)
+    for ep in episodes:
+        prompt_key = _get_prompt_key(ep)
+        prompt_groups[prompt_key].append(ep)
+
+    filtered = []
+    stats = {
+        'prompts_kept': 0,
+        'prompts_dropped_all_correct': 0,
+        'prompts_dropped_all_wrong': 0,
+        'episodes_kept': 0,
+        'episodes_dropped': 0,
+    }
+
+    for prompt_key, group in prompt_groups.items():
+        # Get rewards for all completions in this group
+        rewards = mx.array([_get_episode_reward(ep) for ep in group])
+        variance = mx.var(rewards).item()
+        mean_reward = mx.mean(rewards).item()
+
+        if variance > min_variance:
+            # Informative: keep all episodes from this prompt
+            filtered.extend(group)
+            stats['prompts_kept'] += 1
+            stats['episodes_kept'] += len(group)
+        else:
+            # Uninformative: all completions have same outcome
+            stats['episodes_dropped'] += len(group)
+            if mean_reward > 0.5:
+                stats['prompts_dropped_all_correct'] += 1
+            else:
+                stats['prompts_dropped_all_wrong'] += 1
+
+    # Compute filter rate
+    total_prompts = len(prompt_groups)
+    stats['filter_rate'] = 1.0 - (stats['prompts_kept'] / total_prompts) if total_prompts > 0 else 0.0
+
+    return filtered, stats
+
+
+def compute_prompt_group_stats(episodes: List[Any]) -> Dict[str, Any]:
+    """
+    Compute statistics about prompt groups for monitoring.
+
+    Useful for understanding the distribution of prompts and completions
+    before and after filtering.
+
+    Args:
+        episodes: List of episodes
+
+    Returns:
+        Dictionary with:
+        - 'num_prompts': Total unique prompts
+        - 'num_episodes': Total episodes
+        - 'completions_per_prompt': Average completions per prompt
+        - 'reward_variance_mean': Mean variance across prompt groups
+        - 'reward_variance_std': Std of variance across prompt groups
+    """
+    if not episodes:
+        return {
+            'num_prompts': 0,
+            'num_episodes': 0,
+            'completions_per_prompt': 0.0,
+            'reward_variance_mean': 0.0,
+            'reward_variance_std': 0.0,
+        }
+
+    # Group by prompt
+    prompt_groups: Dict[tuple, List[Any]] = defaultdict(list)
+    for ep in episodes:
+        prompt_key = _get_prompt_key(ep)
+        prompt_groups[prompt_key].append(ep)
+
+    # Compute variance for each group
+    variances = []
+    for group in prompt_groups.values():
+        rewards = mx.array([_get_episode_reward(ep) for ep in group])
+        variances.append(mx.var(rewards).item())
+
+    variances_arr = mx.array(variances) if variances else mx.array([0.0])
+
+    return {
+        'num_prompts': len(prompt_groups),
+        'num_episodes': len(episodes),
+        'completions_per_prompt': len(episodes) / len(prompt_groups) if prompt_groups else 0.0,
+        'reward_variance_mean': float(mx.mean(variances_arr).item()),
+        'reward_variance_std': float(mx.std(variances_arr).item()),
+    }
+
+
 # Convenience function for complete GRPO computation
 def grpo_loss(
     old_logprobs: mx.array,
@@ -706,13 +891,173 @@ def select_all_data(buffer):
     return batch_data
 
 
+def select_informative_data(buffer, min_variance: float = 0.01):
+    """
+    GRPO data selector with dynamic batch filtering (DAPO-style).
+
+    Filters out uninformative prompts where all completions have the same
+    outcome (all correct or all wrong), improving sample efficiency by
+    maintaining meaningful gradient signals.
+
+    This is the recommended selector for GRPO training when using multiple
+    completions per prompt, as it eliminates wasted compute on prompts
+    that provide no learning signal.
+
+    Args:
+        buffer: Buffer containing episodes (Episode objects or serialized dictionaries)
+        min_variance: Minimum reward variance to keep a prompt group.
+                     Prompts with variance below this are filtered out.
+
+    Returns:
+        Filtered episode data prepared for training, plus filtering stats.
+
+    Example:
+        >>> batch_data = select_informative_data(buffer, min_variance=0.01)
+        >>> # batch_data includes 'filter_stats' with filtering information
+
+    References:
+        DAPO: An Open-Source LLM Reinforcement Learning System at Scale
+        https://arxiv.org/abs/2503.14476
+    """
+    from textpolicy.buffer import Buffer
+    if not isinstance(buffer, Buffer):
+        raise TypeError(f"Expected Buffer, got {type(buffer)}")
+
+    episodes = buffer.episodes
+    if not episodes:
+        raise ValueError("Buffer is empty - no episodes to train on")
+
+    # Filter to keep only informative prompts
+    filtered_episodes, filter_stats = filter_informative_prompts(episodes, min_variance)
+
+    if not filtered_episodes:
+        raise ValueError(
+            f"All prompts filtered out (min_variance={min_variance}). "
+            f"Stats: {filter_stats}. Consider lowering min_variance or "
+            "ensuring diversity in completions."
+        )
+
+    # Process filtered episodes (same logic as select_all_data)
+    episode_rewards = []
+    episode_lengths = []
+    all_obs = []
+    all_acts = []
+    all_logprobs = []
+
+    for episode in filtered_episodes:
+        if hasattr(episode, 'rew'):
+            episode_reward = mx.sum(mx.array(episode.rew)).item()
+            episode_rewards.append(episode_reward)
+            episode_lengths.append(len(episode.obs))
+
+            flattened_obs = []
+            for obs in episode.obs:
+                if hasattr(obs, 'tolist'):
+                    flattened_obs.extend(obs.tolist())
+                elif isinstance(obs, list):
+                    flattened_obs.extend(obs)
+                else:
+                    flattened_obs.append(obs)
+
+            flattened_acts = []
+            for act in episode.act:
+                if hasattr(act, 'tolist'):
+                    flattened_acts.extend(act.tolist())
+                elif isinstance(act, list):
+                    flattened_acts.extend(act)
+                else:
+                    flattened_acts.append(act)
+
+            full_sequence = flattened_obs + flattened_acts
+            all_obs.append(full_sequence)
+            all_acts.append(flattened_acts)
+            all_logprobs.append(episode.logprob if episode.logprob else [])
+        else:
+            episode_reward = mx.sum(episode['rew']).item()
+            episode_rewards.append(episode_reward)
+            episode_lengths.append(len(episode['obs']))
+
+            obs_as_lists = []
+            for obs_item in episode['obs']:
+                if hasattr(obs_item, 'tolist'):
+                    obs_as_lists.extend(obs_item.tolist())
+                elif isinstance(obs_item, list):
+                    obs_as_lists.extend(obs_item)
+                else:
+                    obs_as_lists.append(obs_item)
+
+            act_as_lists = []
+            for act_item in episode['act']:
+                if hasattr(act_item, 'tolist'):
+                    act_as_lists.extend(act_item.tolist())
+                elif isinstance(act_item, list):
+                    act_as_lists.extend(act_item)
+                else:
+                    act_as_lists.append(act_item)
+
+            full_sequence = obs_as_lists + act_as_lists
+            all_obs.append(full_sequence)
+            all_acts.append(act_as_lists)
+            all_logprobs.append(episode.get('logprob', []))
+
+    # Convert to MLX arrays with padding
+    max_obs_len = max(len(obs) for obs in all_obs) if all_obs else 0
+    max_act_len = max(len(act) for act in all_acts) if all_acts else 0
+    max_logprob_len = max(len(logprob) for logprob in all_logprobs) if all_logprobs else 0
+
+    try:
+        all_obs_mx = [mx.array(obs, dtype=mx.int64) for obs in all_obs if obs]
+        all_acts_mx = [mx.array(act, dtype=mx.int64) for act in all_acts if act]
+        all_logprobs_mx = [mx.array(logprob, dtype=mx.float32) for logprob in all_logprobs if logprob]
+
+        if all_obs_mx:
+            padded_obs_mx = [mx.pad(obs, (0, max_obs_len - obs.shape[0]), constant_values=0)
+                           if obs.shape[0] < max_obs_len else obs[:max_obs_len]
+                           for obs in all_obs_mx]
+        else:
+            padded_obs_mx = []
+
+        if all_acts_mx:
+            padded_acts_mx = [mx.pad(act, (0, max_act_len - act.shape[0]), constant_values=0)
+                            if act.shape[0] < max_act_len else act[:max_act_len]
+                            for act in all_acts_mx]
+        else:
+            padded_acts_mx = []
+
+        if all_logprobs_mx:
+            padded_logprobs_mx = [mx.pad(logprob, (0, max_logprob_len - logprob.shape[0]), constant_values=0.0)
+                                if logprob.shape[0] < max_logprob_len else logprob[:max_logprob_len]
+                                for logprob in all_logprobs_mx]
+        else:
+            padded_logprobs_mx = []
+
+        all_obs_mx = padded_obs_mx
+        all_acts_mx = padded_acts_mx
+        all_logprobs_mx = padded_logprobs_mx
+
+    except Exception as e:
+        print(f"ERROR in MLX array conversion: {e}")
+        raise
+
+    batch_data = {
+        'obs': mx.concatenate(all_obs_mx) if all_obs_mx else mx.array([]),
+        'act': mx.concatenate(all_acts_mx) if all_acts_mx else mx.array([]),
+        'logprob': mx.concatenate([logprob.flatten() for logprob in all_logprobs_mx]) if all_logprobs_mx else mx.array([]),
+        'rewards': mx.array(episode_rewards),
+        'episode_lengths': episode_lengths,
+        'filter_stats': filter_stats,  # Include filtering statistics
+    }
+
+    return batch_data
+
+
 def select_recent_data(buffer, max_episodes: int = 100):
     """
     GRPO data selector: Use only recent episodes.
-    
+
     Alternative selector for GRPO that limits to recent episodes
     for faster training on large buffers.
-    
+
     Args:
         buffer: Buffer containing episodes (Episode objects or serialized dictionaries)
         max_episodes: Maximum number of recent episodes to use
