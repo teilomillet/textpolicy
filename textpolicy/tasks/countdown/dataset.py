@@ -108,13 +108,18 @@ def load_countdown_dataset(
 
 
 # ---------------------------------------------------------------------------
-# Brute-force solvability check (tractable for 3-4 numbers)
+# Brute-force solvability check
 # ---------------------------------------------------------------------------
 
-_OPS = [
+# Commutative ops: only need (a, b), not (b, a)
+_COMMUTATIVE_OPS = [
     lambda a, b: a + b,
-    lambda a, b: a - b,
     lambda a, b: a * b,
+]
+
+# Non-commutative ops: must try both orderings
+_NON_COMMUTATIVE_OPS = [
+    lambda a, b: a - b,
     lambda a, b: a / b if b != 0 else None,
 ]
 
@@ -129,6 +134,9 @@ def _solve(nums: List[float], target: float) -> bool:
 
     Allows using a subset of numbers — if any single number in the
     current list already equals the target, that counts as solved.
+
+    Uses combinations (not permutations) for pair selection and only
+    tries both orderings for non-commutative operations (-, /).
     """
     # Any number in the current set already equals the target → solvable
     for n in nums:
@@ -138,14 +146,22 @@ def _solve(nums: List[float], target: float) -> bool:
     if len(nums) < 2:
         return False
 
-    for i, j in itertools.permutations(range(len(nums)), 2):
-        a, b = nums[i], nums[j]
-        remaining = [nums[k] for k in range(len(nums)) if k != i and k != j]
-        for op in _OPS:
-            result = op(a, b)
-            if result is None:
-                continue
-            if _solve(remaining + [result], target):
-                return True
+    for i in range(len(nums)):
+        for j in range(i + 1, len(nums)):
+            a, b = nums[i], nums[j]
+            remaining = [nums[k] for k in range(len(nums)) if k != i and k != j]
+
+            # Commutative: a+b == b+a, a*b == b*a — one ordering suffices
+            for op in _COMMUTATIVE_OPS:
+                result = op(a, b)
+                if _solve(remaining + [result], target):
+                    return True
+
+            # Non-commutative: try both (a,b) and (b,a)
+            for op in _NON_COMMUTATIVE_OPS:
+                for x, y in ((a, b), (b, a)):
+                    result = op(x, y)
+                    if result is not None and _solve(remaining + [result], target):
+                        return True
 
     return False
