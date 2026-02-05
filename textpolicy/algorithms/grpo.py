@@ -737,76 +737,64 @@ def compute_metrics(
     }
 
 
-# Algorithm-specific data selection strategies
-def select_all_data(buffer):
+# --- Episode Packing Helper ---
+def _flatten_tokens(items: List[Any]) -> List:
+    """Flatten nested token sequences into a flat list."""
+    flattened = []
+    for item in items:
+        if hasattr(item, 'tolist'):  # MLX array
+            flattened.extend(item.tolist())
+        elif isinstance(item, list):  # Python list
+            flattened.extend(item)
+        else:  # Single token
+            flattened.append(item)
+    return flattened
+
+
+def _pack_episodes(episodes: List[Any]) -> Dict[str, Any]:
     """
-    GRPO data selector: Use all available data.
-    
-    GRPO is on-policy but can benefit from using all collected episodes
-    since group-relative advantages normalize across the entire group.
-    
+    Pack episodes into batch data for GRPO training.
+
+    This is the shared helper for episode-to-batch conversion, used by all
+    data selectors (select_all_data, select_informative_data, select_recent_data).
+
     Args:
-        buffer: Buffer containing episodes
-        
+        episodes: List of episodes (Episode objects or serialized dicts)
+
     Returns:
-        All episode data prepared for training
+        Dictionary with:
+        - 'obs': Flat concatenated full sequences (prompt + response)
+        - 'act': Flat concatenated response tokens
+        - 'logprob': Flat concatenated log probabilities
+        - 'rewards': Episode rewards as MLX array
+        - 'episode_lengths': List of episode lengths
     """
-    from textpolicy.buffer import Buffer
-    if not isinstance(buffer, Buffer):
-        raise TypeError(f"Expected Buffer, got {type(buffer)}")
-    
-    # Use all available data - GRPO benefits from larger groups
-    episodes_data = buffer.sample()  # This returns concatenated transitions
-    
-    # We need to convert this back to episode structure for reward extraction
-    episodes = buffer.episodes  # Access episodes directly from storage
-    
     if not episodes:
-        raise ValueError("Buffer is empty - no episodes to train on")
-    
-    # Extract episode rewards for advantage computation
+        return {
+            'obs': mx.array([], dtype=mx.int64),
+            'act': mx.array([], dtype=mx.int64),
+            'logprob': mx.array([], dtype=mx.float32),
+            'rewards': mx.array([]),
+            'episode_lengths': [],
+        }
+
     episode_rewards = []
     episode_lengths = []
-    
-    # Collect all transitions
     all_obs = []
     all_acts = []
     all_logprobs = []
-    
+
     for episode in episodes:
-        # Episode reward (sum of all rewards in episode)
-        # Handle both Episode objects and serialized dictionaries
         if hasattr(episode, 'rew'):
             # Episode object with attributes
             episode_reward = mx.sum(mx.array(episode.rew)).item()
             episode_rewards.append(episode_reward)
             episode_lengths.append(len(episode.obs))
-            
-            # Collect transitions
-            # For proper logprob extraction during training, we need the full context (prompt + response)
-            # This matches how the model was called during rollout generation
-            # Flatten nested token sequences to create uniform token arrays
-            
-            # Extract and flatten observation tokens (prompt)
-            flattened_obs = []
-            for obs in episode.obs:
-                if hasattr(obs, 'tolist'):  # MLX array
-                    flattened_obs.extend(obs.tolist())
-                elif isinstance(obs, list):  # Python list
-                    flattened_obs.extend(obs)
-                else:  # Single token
-                    flattened_obs.append(obs)
-            
-            # Extract and flatten action tokens (response)
-            flattened_acts = []
-            for act in episode.act:
-                if hasattr(act, 'tolist'):  # MLX array
-                    flattened_acts.extend(act.tolist())
-                elif isinstance(act, list):  # Python list
-                    flattened_acts.extend(act)
-                else:  # Single token
-                    flattened_acts.append(act)
-            
+
+            # Flatten observation and action tokens
+            flattened_obs = _flatten_tokens(episode.obs)
+            flattened_acts = _flatten_tokens(episode.act)
+
             # Create full sequence: [prompt_tokens..., response_tokens...]
             full_sequence = flattened_obs + flattened_acts
             all_obs.append(full_sequence)
@@ -814,85 +802,89 @@ def select_all_data(buffer):
             all_logprobs.append(episode.logprob if episode.logprob is not None else [])
         else:
             # Serialized dictionary from multiprocessing
-            episode_reward = mx.sum(episode['rew']).item()
+            episode_reward = mx.sum(mx.array(episode['rew'])).item()
             episode_rewards.append(episode_reward)
             episode_lengths.append(len(episode['obs']))
-            
-            # Collect transitions
-            # For proper logprob extraction during training, we need the full context (prompt + response)
-            # This matches how the model was called during rollout generation
-            full_sequence = episode['obs'] + episode['act']  # Concatenate prompt + response
+
+            # Flatten observation and action tokens
+            flattened_obs = _flatten_tokens(episode['obs'])
+            flattened_acts = _flatten_tokens(episode['act'])
+
+            full_sequence = flattened_obs + flattened_acts
             all_obs.append(full_sequence)
-            all_acts.append(episode['act'])
+            all_acts.append(flattened_acts)
             all_logprobs.append(episode.get('logprob', []))
-    
-    # Convert Python lists to MLX arrays before concatenation
-    # This is required because Episode objects store data as Python lists for memory efficiency
-    # For proper logprob extraction, we need uniform-length sequences, so we pad to the maximum length
-    
-    # Find maximum sequence length for padding
+
+    # Find maximum sequence lengths for padding
     max_obs_len = max(len(obs) for obs in all_obs) if all_obs else 0
     max_act_len = max(len(act) for act in all_acts) if all_acts else 0
     max_logprob_len = max(len(logprob) for logprob in all_logprobs) if all_logprobs else 0
-    
-    # MLX-native padding and array operations for optimal Apple Silicon performance
-    # Convert all sequences to MLX arrays and pad directly in MLX space
-    try:
-        # Convert all sequences to MLX arrays first (staying in unified memory)
-        # Always create an array for each episode to maintain alignment with episode_rewards/lengths
-        all_obs_mx = [mx.array(obs, dtype=mx.int64) if obs else mx.array([], dtype=mx.int64) for obs in all_obs]
-        all_acts_mx = [mx.array(act, dtype=mx.int64) if act else mx.array([], dtype=mx.int64) for act in all_acts]
-        all_logprobs_mx = [mx.array(logprob, dtype=mx.float32) if logprob else mx.array([], dtype=mx.float32) for logprob in all_logprobs]
 
-        # Filter out empty arrays for padding/concatenation (after maintaining alignment for conversion)
-        non_empty_obs = [obs for obs in all_obs_mx if obs.size > 0]
-        non_empty_acts = [act for act in all_acts_mx if act.size > 0]
-        non_empty_logprobs = [logprob for logprob in all_logprobs_mx if logprob.size > 0]
+    # Convert to MLX arrays with padding
+    # Always create an array for each episode to maintain alignment
+    all_obs_mx = [mx.array(obs, dtype=mx.int64) if obs else mx.array([], dtype=mx.int64) for obs in all_obs]
+    all_acts_mx = [mx.array(act, dtype=mx.int64) if act else mx.array([], dtype=mx.int64) for act in all_acts]
+    all_logprobs_mx = [mx.array(logprob, dtype=mx.float32) if logprob else mx.array([], dtype=mx.float32) for logprob in all_logprobs]
 
-        # Pad using native MLX operations (more efficient for Apple Silicon)
-        if non_empty_obs:
-            padded_obs_mx = [mx.pad(obs, (0, max_obs_len - obs.shape[0]), constant_values=0)
-                           if obs.shape[0] < max_obs_len else obs[:max_obs_len]
-                           for obs in non_empty_obs]
-        else:
-            padded_obs_mx = []
+    # Filter out empty arrays for padding/concatenation
+    non_empty_obs = [obs for obs in all_obs_mx if obs.size > 0]
+    non_empty_acts = [act for act in all_acts_mx if act.size > 0]
+    non_empty_logprobs = [logprob for logprob in all_logprobs_mx if logprob.size > 0]
 
-        if non_empty_acts:
-            padded_acts_mx = [mx.pad(act, (0, max_act_len - act.shape[0]), constant_values=0)
-                            if act.shape[0] < max_act_len else act[:max_act_len]
-                            for act in non_empty_acts]
-        else:
-            padded_acts_mx = []
+    # Pad using native MLX operations
+    if non_empty_obs:
+        padded_obs = [mx.pad(obs, (0, max_obs_len - obs.shape[0]), constant_values=0)
+                      if obs.shape[0] < max_obs_len else obs[:max_obs_len]
+                      for obs in non_empty_obs]
+    else:
+        padded_obs = []
 
-        if non_empty_logprobs:
-            padded_logprobs_mx = [mx.pad(logprob, (0, max_logprob_len - logprob.shape[0]), constant_values=0.0)
-                                if logprob.shape[0] < max_logprob_len else logprob[:max_logprob_len]
-                                for logprob in non_empty_logprobs]
-        else:
-            padded_logprobs_mx = []
+    if non_empty_acts:
+        padded_acts = [mx.pad(act, (0, max_act_len - act.shape[0]), constant_values=0)
+                       if act.shape[0] < max_act_len else act[:max_act_len]
+                       for act in non_empty_acts]
+    else:
+        padded_acts = []
 
-        # Use padded MLX arrays directly (no intermediate conversion needed)
-        all_obs_mx = padded_obs_mx
-        all_acts_mx = padded_acts_mx
-        all_logprobs_mx = padded_logprobs_mx
-        
-    except Exception as e:
-        print(f"ERROR in MLX array conversion: {e}")
-        print(f"DEBUG: all_obs types: {[type(obs) for obs in all_obs[:3]]}")  # Show first 3 for brevity
-        print(f"DEBUG: all_logprobs types: {[type(logprob) for logprob in all_logprobs[:3]]}")
-        raise
-    
-    # GRPO data structure: both observations and actions as flat concatenated sequences
-    # This matches the expected format for GRPO logprob extraction function
-    batch_data = {
-        'obs': mx.concatenate(all_obs_mx) if all_obs_mx else mx.array([]),  # Flat concatenated full sequences
-        'act': mx.concatenate(all_acts_mx) if all_acts_mx else mx.array([]),  # Flat concatenated response tokens
-        'logprob': mx.concatenate([logprob.flatten() for logprob in all_logprobs_mx]) if all_logprobs_mx else mx.array([]),  # Flat sequence for training
+    if non_empty_logprobs:
+        padded_logprobs = [mx.pad(logprob, (0, max_logprob_len - logprob.shape[0]), constant_values=0.0)
+                          if logprob.shape[0] < max_logprob_len else logprob[:max_logprob_len]
+                          for logprob in non_empty_logprobs]
+    else:
+        padded_logprobs = []
+
+    return {
+        'obs': mx.concatenate(padded_obs) if padded_obs else mx.array([], dtype=mx.int64),
+        'act': mx.concatenate(padded_acts) if padded_acts else mx.array([], dtype=mx.int64),
+        'logprob': mx.concatenate([lp.flatten() for lp in padded_logprobs]) if padded_logprobs else mx.array([], dtype=mx.float32),
         'rewards': mx.array(episode_rewards),
-        'episode_lengths': episode_lengths
+        'episode_lengths': episode_lengths,
     }
-    
-    return batch_data
+
+
+# Algorithm-specific data selection strategies
+def select_all_data(buffer):
+    """
+    GRPO data selector: Use all available data.
+
+    GRPO is on-policy but can benefit from using all collected episodes
+    since group-relative advantages normalize across the entire group.
+
+    Args:
+        buffer: Buffer containing episodes
+
+    Returns:
+        All episode data prepared for training
+    """
+    from textpolicy.buffer import Buffer
+    if not isinstance(buffer, Buffer):
+        raise TypeError(f"Expected Buffer, got {type(buffer)}")
+
+    episodes = buffer.episodes
+    if not episodes:
+        raise ValueError("Buffer is empty - no episodes to train on")
+
+    return _pack_episodes(episodes)
 
 
 def select_informative_data(buffer, min_variance: float = 0.01):
@@ -941,124 +933,9 @@ def select_informative_data(buffer, min_variance: float = 0.01):
             "ensuring diversity in completions."
         )
 
-    # Process filtered episodes (same logic as select_all_data)
-    episode_rewards = []
-    episode_lengths = []
-    all_obs = []
-    all_acts = []
-    all_logprobs = []
-
-    for episode in filtered_episodes:
-        if hasattr(episode, 'rew'):
-            episode_reward = mx.sum(mx.array(episode.rew)).item()
-            episode_rewards.append(episode_reward)
-            episode_lengths.append(len(episode.obs))
-
-            flattened_obs = []
-            for obs in episode.obs:
-                if hasattr(obs, 'tolist'):
-                    flattened_obs.extend(obs.tolist())
-                elif isinstance(obs, list):
-                    flattened_obs.extend(obs)
-                else:
-                    flattened_obs.append(obs)
-
-            flattened_acts = []
-            for act in episode.act:
-                if hasattr(act, 'tolist'):
-                    flattened_acts.extend(act.tolist())
-                elif isinstance(act, list):
-                    flattened_acts.extend(act)
-                else:
-                    flattened_acts.append(act)
-
-            full_sequence = flattened_obs + flattened_acts
-            all_obs.append(full_sequence)
-            all_acts.append(flattened_acts)
-            all_logprobs.append(episode.logprob if episode.logprob is not None else [])
-        else:
-            episode_reward = mx.sum(episode['rew']).item()
-            episode_rewards.append(episode_reward)
-            episode_lengths.append(len(episode['obs']))
-
-            obs_as_lists = []
-            for obs_item in episode['obs']:
-                if hasattr(obs_item, 'tolist'):
-                    obs_as_lists.extend(obs_item.tolist())
-                elif isinstance(obs_item, list):
-                    obs_as_lists.extend(obs_item)
-                else:
-                    obs_as_lists.append(obs_item)
-
-            act_as_lists = []
-            for act_item in episode['act']:
-                if hasattr(act_item, 'tolist'):
-                    act_as_lists.extend(act_item.tolist())
-                elif isinstance(act_item, list):
-                    act_as_lists.extend(act_item)
-                else:
-                    act_as_lists.append(act_item)
-
-            full_sequence = obs_as_lists + act_as_lists
-            all_obs.append(full_sequence)
-            all_acts.append(act_as_lists)
-            all_logprobs.append(episode.get('logprob', []))
-
-    # Convert to MLX arrays with padding
-    max_obs_len = max(len(obs) for obs in all_obs) if all_obs else 0
-    max_act_len = max(len(act) for act in all_acts) if all_acts else 0
-    max_logprob_len = max(len(logprob) for logprob in all_logprobs) if all_logprobs else 0
-
-    try:
-        # Convert all sequences to MLX arrays first (staying in unified memory)
-        # Always create an array for each episode to maintain alignment with episode_rewards/lengths
-        all_obs_mx = [mx.array(obs, dtype=mx.int64) if obs else mx.array([], dtype=mx.int64) for obs in all_obs]
-        all_acts_mx = [mx.array(act, dtype=mx.int64) if act else mx.array([], dtype=mx.int64) for act in all_acts]
-        all_logprobs_mx = [mx.array(logprob, dtype=mx.float32) if logprob else mx.array([], dtype=mx.float32) for logprob in all_logprobs]
-
-        # Filter out empty arrays for padding/concatenation (after maintaining alignment for conversion)
-        non_empty_obs = [obs for obs in all_obs_mx if obs.size > 0]
-        non_empty_acts = [act for act in all_acts_mx if act.size > 0]
-        non_empty_logprobs = [logprob for logprob in all_logprobs_mx if logprob.size > 0]
-
-        if non_empty_obs:
-            padded_obs_mx = [mx.pad(obs, (0, max_obs_len - obs.shape[0]), constant_values=0)
-                           if obs.shape[0] < max_obs_len else obs[:max_obs_len]
-                           for obs in non_empty_obs]
-        else:
-            padded_obs_mx = []
-
-        if non_empty_acts:
-            padded_acts_mx = [mx.pad(act, (0, max_act_len - act.shape[0]), constant_values=0)
-                            if act.shape[0] < max_act_len else act[:max_act_len]
-                            for act in non_empty_acts]
-        else:
-            padded_acts_mx = []
-
-        if non_empty_logprobs:
-            padded_logprobs_mx = [mx.pad(logprob, (0, max_logprob_len - logprob.shape[0]), constant_values=0.0)
-                                if logprob.shape[0] < max_logprob_len else logprob[:max_logprob_len]
-                                for logprob in non_empty_logprobs]
-        else:
-            padded_logprobs_mx = []
-
-        all_obs_mx = padded_obs_mx
-        all_acts_mx = padded_acts_mx
-        all_logprobs_mx = padded_logprobs_mx
-
-    except Exception as e:
-        print(f"ERROR in MLX array conversion: {e}")
-        raise
-
-    batch_data = {
-        'obs': mx.concatenate(all_obs_mx) if all_obs_mx else mx.array([]),
-        'act': mx.concatenate(all_acts_mx) if all_acts_mx else mx.array([]),
-        'logprob': mx.concatenate([logprob.flatten() for logprob in all_logprobs_mx]) if all_logprobs_mx else mx.array([]),
-        'rewards': mx.array(episode_rewards),
-        'episode_lengths': episode_lengths,
-        'filter_stats': filter_stats,  # Include filtering statistics
-    }
-
+    # Pack filtered episodes using shared helper
+    batch_data = _pack_episodes(filtered_episodes)
+    batch_data['filter_stats'] = filter_stats
     return batch_data
 
 
@@ -1072,199 +949,19 @@ def select_recent_data(buffer, max_episodes: int = 100):
     Args:
         buffer: Buffer containing episodes (Episode objects or serialized dictionaries)
         max_episodes: Maximum number of recent episodes to use
-        
+
     Returns:
         Recent episode data prepared for training
     """
     from textpolicy.buffer import Buffer
     if not isinstance(buffer, Buffer):
         raise TypeError(f"Expected Buffer, got {type(buffer)}")
-    
+
     episodes = buffer.episodes
     if not episodes:
         raise ValueError("Buffer is empty - no episodes to train on")
-    
+
     # Select recent episodes
     recent_episodes = episodes[-max_episodes:] if len(episodes) > max_episodes else episodes
-    
-    # Process recent episodes
-    episode_rewards = []
-    episode_lengths = []
-    all_obs = []
-    all_acts = []
-    all_logprobs = []
-    
-    for episode in recent_episodes:
-        # Handle both Episode objects and serialized dictionaries
-        if hasattr(episode, 'rew'):
-            # Episode object with attributes
-            episode_reward = mx.sum(mx.array(episode.rew)).item()
-            episode_rewards.append(episode_reward)
-            episode_lengths.append(len(episode.obs))
-            
-            # For proper logprob extraction during training, we need the full context (prompt + response)
-            # This matches how the model was called during rollout generation
-            # Convert both obs and act to consistent Python list format before concatenation
-            obs_as_lists = []
-            for obs_item in episode.obs:
-                if hasattr(obs_item, 'tolist'):  # MLX array
-                    obs_as_lists.extend(obs_item.tolist())
-                elif isinstance(obs_item, list):  # Already Python list
-                    obs_as_lists.extend(obs_item)
-                else:  # Single item
-                    obs_as_lists.append(obs_item)
-            
-            act_as_lists = []
-            for act_item in episode.act:
-                if hasattr(act_item, 'tolist'):  # MLX array
-                    act_as_lists.extend(act_item.tolist())
-                elif isinstance(act_item, list):  # Already Python list
-                    act_as_lists.extend(act_item)
-                else:  # Single item
-                    act_as_lists.append(act_item)
-            
-            # Now concatenate the normalized lists
-            full_sequence = obs_as_lists + act_as_lists
-            all_obs.append(full_sequence)
-            
-            # Extract actions as consistent Python lists
-            episode_actions = []
-            for act_item in episode.act:
-                if hasattr(act_item, 'tolist'):  # MLX array
-                    episode_actions.extend(act_item.tolist())
-                elif isinstance(act_item, list):  # Already Python list
-                    episode_actions.extend(act_item)
-                else:  # Single item
-                    episode_actions.append(act_item)
-            all_acts.append(episode_actions)
-            
-            # Extract logprobs as consistent Python lists
-            episode_logprobs = []
-            if episode.logprob is not None:
-                for logprob_item in episode.logprob:
-                    if hasattr(logprob_item, 'tolist'):  # MLX array
-                        episode_logprobs.extend(logprob_item.tolist())
-                    elif isinstance(logprob_item, list):  # Already Python list
-                        episode_logprobs.extend(logprob_item)
-                    else:  # Single item
-                        episode_logprobs.append(logprob_item)
-            all_logprobs.append(episode_logprobs)
-        else:
-            # Serialized dictionary from multiprocessing
-            episode_reward = mx.sum(episode['rew']).item()
-            episode_rewards.append(episode_reward)
-            episode_lengths.append(len(episode['obs']))
-            
-            # For proper logprob extraction during training, we need the full context (prompt + response)
-            # This matches how the model was called during rollout generation
-            # Convert both obs and act to consistent Python list format before concatenation
-            obs_as_lists = []
-            for obs_item in episode['obs']:
-                if hasattr(obs_item, 'tolist'):  # MLX array
-                    obs_as_lists.extend(obs_item.tolist())
-                elif isinstance(obs_item, list):  # Already Python list
-                    obs_as_lists.extend(obs_item)
-                else:  # Single item
-                    obs_as_lists.append(obs_item)
-            
-            act_as_lists = []
-            for act_item in episode['act']:
-                if hasattr(act_item, 'tolist'):  # MLX array
-                    act_as_lists.extend(act_item.tolist())
-                elif isinstance(act_item, list):  # Already Python list
-                    act_as_lists.extend(act_item)
-                else:  # Single item
-                    act_as_lists.append(act_item)
-            
-            # Now concatenate the normalized lists
-            full_sequence = obs_as_lists + act_as_lists
-            all_obs.append(full_sequence)
-            
-            # Extract actions as consistent Python lists
-            episode_actions = []
-            for act_item in episode['act']:
-                if hasattr(act_item, 'tolist'):  # MLX array
-                    episode_actions.extend(act_item.tolist())
-                elif isinstance(act_item, list):  # Already Python list
-                    episode_actions.extend(act_item)
-                else:  # Single item
-                    episode_actions.append(act_item)
-            all_acts.append(episode_actions)
-            
-            # Extract logprobs as consistent Python lists
-            episode_logprobs = []
-            if episode.get('logprob'):
-                for logprob_item in episode['logprob']:
-                    if hasattr(logprob_item, 'tolist'):  # MLX array
-                        episode_logprobs.extend(logprob_item.tolist())
-                    elif isinstance(logprob_item, list):  # Already Python list
-                        episode_logprobs.extend(logprob_item)
-                    else:  # Single item
-                        episode_logprobs.append(logprob_item)
-            all_logprobs.append(episode_logprobs)
-    
-    # Convert Python lists to MLX arrays before concatenation
-    # This is required because Episode objects store data as Python lists for memory efficiency
-    # For proper logprob extraction, we need uniform-length sequences, so we pad to the maximum length
-    
-    # Find maximum sequence length for padding
-    max_obs_len = max(len(obs) for obs in all_obs) if all_obs else 0
-    max_act_len = max(len(act) for act in all_acts) if all_acts else 0
-    max_logprob_len = max(len(logprob) for logprob in all_logprobs) if all_logprobs else 0
-    
-    # MLX-native padding and array operations for optimal Apple Silicon performance
-    # Convert all sequences to MLX arrays and pad directly in MLX space
-    try:
-        # Convert all sequences to MLX arrays first (staying in unified memory)
-        # Always create an array for each episode to maintain alignment with episode_rewards/lengths
-        all_obs_mx = [mx.array(obs, dtype=mx.int64) if obs else mx.array([], dtype=mx.int64) for obs in all_obs]
-        all_acts_mx = [mx.array(act, dtype=mx.int64) if act else mx.array([], dtype=mx.int64) for act in all_acts]
-        all_logprobs_mx = [mx.array(logprob, dtype=mx.float32) if logprob else mx.array([], dtype=mx.float32) for logprob in all_logprobs]
 
-        # Filter out empty arrays for padding/concatenation (after maintaining alignment for conversion)
-        non_empty_obs = [obs for obs in all_obs_mx if obs.size > 0]
-        non_empty_acts = [act for act in all_acts_mx if act.size > 0]
-        non_empty_logprobs = [logprob for logprob in all_logprobs_mx if logprob.size > 0]
-
-        # Pad using native MLX operations (more efficient for Apple Silicon)
-        if non_empty_obs:
-            padded_obs_mx = [mx.pad(obs, (0, max_obs_len - obs.shape[0]), constant_values=0)
-                           if obs.shape[0] < max_obs_len else obs[:max_obs_len]
-                           for obs in non_empty_obs]
-        else:
-            padded_obs_mx = []
-
-        if non_empty_acts:
-            padded_acts_mx = [mx.pad(act, (0, max_act_len - act.shape[0]), constant_values=0)
-                            if act.shape[0] < max_act_len else act[:max_act_len]
-                            for act in non_empty_acts]
-        else:
-            padded_acts_mx = []
-
-        if non_empty_logprobs:
-            padded_logprobs_mx = [mx.pad(logprob, (0, max_logprob_len - logprob.shape[0]), constant_values=0.0)
-                                if logprob.shape[0] < max_logprob_len else logprob[:max_logprob_len]
-                                for logprob in non_empty_logprobs]
-        else:
-            padded_logprobs_mx = []
-
-        # Use padded MLX arrays directly (no intermediate conversion needed)
-        all_obs_mx = padded_obs_mx
-        all_acts_mx = padded_acts_mx
-        all_logprobs_mx = padded_logprobs_mx
-
-    except Exception as e:
-        print(f"ERROR in MLX array conversion: {e}")
-        print(f"DEBUG: all_obs types: {[type(obs) for obs in all_obs[:3]]}")  # Show first 3 for brevity
-        print(f"DEBUG: all_logprobs types: {[type(logprob) for logprob in all_logprobs[:3]]}")
-        raise
-    
-    batch_data = {
-        'obs': mx.concatenate(all_obs_mx) if all_obs_mx else mx.array([]),  # Flat concatenated full sequences
-        'act': mx.concatenate(all_acts_mx) if all_acts_mx else mx.array([]),  # Flat concatenated response tokens
-        'logprob': mx.concatenate([logprob.flatten() for logprob in all_logprobs_mx]) if all_logprobs_mx else mx.array([]),  # Flat sequence for training
-        'rewards': mx.array(episode_rewards),
-        'episode_lengths': episode_lengths
-    }
-    
-    return batch_data
+    return _pack_episodes(recent_episodes)
