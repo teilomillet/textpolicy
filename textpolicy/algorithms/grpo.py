@@ -421,7 +421,8 @@ def _get_prompt_key(episode) -> tuple:
 
 def filter_informative_prompts(
     episodes: List[Any],
-    min_variance: float = 0.01
+    min_variance: float = 0.01,
+    keep_single_completion: bool = True
 ) -> Tuple[List[Any], Dict[str, int]]:
     """
     Filter episodes to keep only informative prompts (DAPO dynamic sampling).
@@ -433,11 +434,26 @@ def filter_informative_prompts(
     GRPO uses group-relative advantages. If all completions have the same
     outcome, advantages are zero, producing no gradient and wasting compute.
 
+    Note on single-completion prompts:
+        The DAPO paper (Equation 11) defines informative prompts as having
+        mixed outcomes: `0 < |correct| < G`. This assumes G > 1 completions
+        per prompt. For single-completion prompts (G=1), variance is always 0
+        by definition, but this doesn't mean "all outcomes are the same" -
+        it means we have insufficient data to determine variance.
+
+        By default (keep_single_completion=True), single-completion prompts
+        are kept since they still provide valid gradient signal. Set to False
+        to filter them out (stricter DAPO interpretation).
+
     Args:
         episodes: List of episodes (Episode objects or serialized dicts)
         min_variance: Minimum reward variance to keep a prompt group.
                      Groups with variance below this threshold are filtered out.
                      Default 0.01 filters prompts with essentially identical rewards.
+                     Only applied to groups with 2+ completions.
+        keep_single_completion: Whether to keep prompts with only one completion.
+                               Default True (keep them). Set False to require
+                               multiple completions for variance calculation.
 
     Returns:
         Tuple of:
@@ -446,6 +462,8 @@ def filter_informative_prompts(
             - 'prompts_kept': Number of prompt groups kept
             - 'prompts_dropped_all_correct': Prompts where all completions succeeded
             - 'prompts_dropped_all_wrong': Prompts where all completions failed
+            - 'prompts_dropped_single': Prompts dropped due to single completion
+            - 'prompts_kept_single': Single-completion prompts that were kept
             - 'episodes_kept': Total episodes kept
             - 'episodes_dropped': Total episodes filtered out
             - 'filter_rate': Fraction of prompts filtered
@@ -458,7 +476,7 @@ def filter_informative_prompts(
 
     References:
         DAPO: An Open-Source LLM Reinforcement Learning System at Scale
-        https://arxiv.org/abs/2503.14476
+        https://arxiv.org/abs/2503.14476 (Equation 11: 0 < |correct| < G)
 
         GRPO++ Tricks
         https://cameronrwolfe.substack.com/p/grpo-tricks
@@ -468,6 +486,8 @@ def filter_informative_prompts(
             'prompts_kept': 0,
             'prompts_dropped_all_correct': 0,
             'prompts_dropped_all_wrong': 0,
+            'prompts_dropped_single': 0,
+            'prompts_kept_single': 0,
             'episodes_kept': 0,
             'episodes_dropped': 0,
             'filter_rate': 0.0,
@@ -484,24 +504,42 @@ def filter_informative_prompts(
         'prompts_kept': 0,
         'prompts_dropped_all_correct': 0,
         'prompts_dropped_all_wrong': 0,
+        'prompts_dropped_single': 0,
+        'prompts_kept_single': 0,
         'episodes_kept': 0,
         'episodes_dropped': 0,
     }
 
     for prompt_key, group in prompt_groups.items():
-        # Get rewards for all completions in this group
+        group_size = len(group)
+
+        # Handle single-completion prompts separately
+        if group_size == 1:
+            if keep_single_completion:
+                # Keep single-completion prompts (variance undefined, not "zero")
+                filtered.extend(group)
+                stats['prompts_kept'] += 1
+                stats['prompts_kept_single'] += 1
+                stats['episodes_kept'] += 1
+            else:
+                # Filter out single-completion prompts (strict DAPO interpretation)
+                stats['prompts_dropped_single'] += 1
+                stats['episodes_dropped'] += 1
+            continue
+
+        # For groups with 2+ completions, use variance criterion
         rewards = mx.array([_get_episode_reward(ep) for ep in group])
         variance = mx.var(rewards).item()
         mean_reward = mx.mean(rewards).item()
 
         if variance > min_variance:
-            # Informative: keep all episodes from this prompt
+            # Informative: mixed outcomes, keep all episodes from this prompt
             filtered.extend(group)
             stats['prompts_kept'] += 1
-            stats['episodes_kept'] += len(group)
+            stats['episodes_kept'] += group_size
         else:
             # Uninformative: all completions have same outcome
-            stats['episodes_dropped'] += len(group)
+            stats['episodes_dropped'] += group_size
             if mean_reward > 0.5:
                 stats['prompts_dropped_all_correct'] += 1
             else:
@@ -773,7 +811,7 @@ def select_all_data(buffer):
             full_sequence = flattened_obs + flattened_acts
             all_obs.append(full_sequence)
             all_acts.append(flattened_acts)
-            all_logprobs.append(episode.logprob if episode.logprob else [])
+            all_logprobs.append(episode.logprob if episode.logprob is not None else [])
         else:
             # Serialized dictionary from multiprocessing
             episode_reward = mx.sum(episode['rew']).item()
@@ -801,35 +839,41 @@ def select_all_data(buffer):
     # Convert all sequences to MLX arrays and pad directly in MLX space
     try:
         # Convert all sequences to MLX arrays first (staying in unified memory)
-        all_obs_mx = [mx.array(obs, dtype=mx.int64) for obs in all_obs if obs]
-        all_acts_mx = [mx.array(act, dtype=mx.int64) for act in all_acts if act]
-        all_logprobs_mx = [mx.array(logprob, dtype=mx.float32) for logprob in all_logprobs if logprob]
-        
+        # Always create an array for each episode to maintain alignment with episode_rewards/lengths
+        all_obs_mx = [mx.array(obs, dtype=mx.int64) if obs else mx.array([], dtype=mx.int64) for obs in all_obs]
+        all_acts_mx = [mx.array(act, dtype=mx.int64) if act else mx.array([], dtype=mx.int64) for act in all_acts]
+        all_logprobs_mx = [mx.array(logprob, dtype=mx.float32) if logprob else mx.array([], dtype=mx.float32) for logprob in all_logprobs]
+
+        # Filter out empty arrays for padding/concatenation (after maintaining alignment for conversion)
+        non_empty_obs = [obs for obs in all_obs_mx if obs.size > 0]
+        non_empty_acts = [act for act in all_acts_mx if act.size > 0]
+        non_empty_logprobs = [logprob for logprob in all_logprobs_mx if logprob.size > 0]
+
         # Pad using native MLX operations (more efficient for Apple Silicon)
-        if all_obs_mx:
-            padded_obs_mx = [mx.pad(obs, (0, max_obs_len - obs.shape[0]), constant_values=0) 
-                           if obs.shape[0] < max_obs_len else obs[:max_obs_len] 
-                           for obs in all_obs_mx]
+        if non_empty_obs:
+            padded_obs_mx = [mx.pad(obs, (0, max_obs_len - obs.shape[0]), constant_values=0)
+                           if obs.shape[0] < max_obs_len else obs[:max_obs_len]
+                           for obs in non_empty_obs]
         else:
             padded_obs_mx = []
-            
-        if all_acts_mx:
-            padded_acts_mx = [mx.pad(act, (0, max_act_len - act.shape[0]), constant_values=0) 
-                            if act.shape[0] < max_act_len else act[:max_act_len] 
-                            for act in all_acts_mx]
+
+        if non_empty_acts:
+            padded_acts_mx = [mx.pad(act, (0, max_act_len - act.shape[0]), constant_values=0)
+                            if act.shape[0] < max_act_len else act[:max_act_len]
+                            for act in non_empty_acts]
         else:
             padded_acts_mx = []
-            
-        if all_logprobs_mx:
-            padded_logprobs_mx = [mx.pad(logprob, (0, max_logprob_len - logprob.shape[0]), constant_values=0.0) 
-                                if logprob.shape[0] < max_logprob_len else logprob[:max_logprob_len] 
-                                for logprob in all_logprobs_mx]
+
+        if non_empty_logprobs:
+            padded_logprobs_mx = [mx.pad(logprob, (0, max_logprob_len - logprob.shape[0]), constant_values=0.0)
+                                if logprob.shape[0] < max_logprob_len else logprob[:max_logprob_len]
+                                for logprob in non_empty_logprobs]
         else:
             padded_logprobs_mx = []
-        
+
         # Use padded MLX arrays directly (no intermediate conversion needed)
         all_obs_mx = padded_obs_mx
-        all_acts_mx = padded_acts_mx  
+        all_acts_mx = padded_acts_mx
         all_logprobs_mx = padded_logprobs_mx
         
     except Exception as e:
@@ -931,7 +975,7 @@ def select_informative_data(buffer, min_variance: float = 0.01):
             full_sequence = flattened_obs + flattened_acts
             all_obs.append(full_sequence)
             all_acts.append(flattened_acts)
-            all_logprobs.append(episode.logprob if episode.logprob else [])
+            all_logprobs.append(episode.logprob if episode.logprob is not None else [])
         else:
             episode_reward = mx.sum(episode['rew']).item()
             episode_rewards.append(episode_reward)
@@ -966,28 +1010,35 @@ def select_informative_data(buffer, min_variance: float = 0.01):
     max_logprob_len = max(len(logprob) for logprob in all_logprobs) if all_logprobs else 0
 
     try:
-        all_obs_mx = [mx.array(obs, dtype=mx.int64) for obs in all_obs if obs]
-        all_acts_mx = [mx.array(act, dtype=mx.int64) for act in all_acts if act]
-        all_logprobs_mx = [mx.array(logprob, dtype=mx.float32) for logprob in all_logprobs if logprob]
+        # Convert all sequences to MLX arrays first (staying in unified memory)
+        # Always create an array for each episode to maintain alignment with episode_rewards/lengths
+        all_obs_mx = [mx.array(obs, dtype=mx.int64) if obs else mx.array([], dtype=mx.int64) for obs in all_obs]
+        all_acts_mx = [mx.array(act, dtype=mx.int64) if act else mx.array([], dtype=mx.int64) for act in all_acts]
+        all_logprobs_mx = [mx.array(logprob, dtype=mx.float32) if logprob else mx.array([], dtype=mx.float32) for logprob in all_logprobs]
 
-        if all_obs_mx:
+        # Filter out empty arrays for padding/concatenation (after maintaining alignment for conversion)
+        non_empty_obs = [obs for obs in all_obs_mx if obs.size > 0]
+        non_empty_acts = [act for act in all_acts_mx if act.size > 0]
+        non_empty_logprobs = [logprob for logprob in all_logprobs_mx if logprob.size > 0]
+
+        if non_empty_obs:
             padded_obs_mx = [mx.pad(obs, (0, max_obs_len - obs.shape[0]), constant_values=0)
                            if obs.shape[0] < max_obs_len else obs[:max_obs_len]
-                           for obs in all_obs_mx]
+                           for obs in non_empty_obs]
         else:
             padded_obs_mx = []
 
-        if all_acts_mx:
+        if non_empty_acts:
             padded_acts_mx = [mx.pad(act, (0, max_act_len - act.shape[0]), constant_values=0)
                             if act.shape[0] < max_act_len else act[:max_act_len]
-                            for act in all_acts_mx]
+                            for act in non_empty_acts]
         else:
             padded_acts_mx = []
 
-        if all_logprobs_mx:
+        if non_empty_logprobs:
             padded_logprobs_mx = [mx.pad(logprob, (0, max_logprob_len - logprob.shape[0]), constant_values=0.0)
                                 if logprob.shape[0] < max_logprob_len else logprob[:max_logprob_len]
-                                for logprob in all_logprobs_mx]
+                                for logprob in non_empty_logprobs]
         else:
             padded_logprobs_mx = []
 
@@ -1089,7 +1140,7 @@ def select_recent_data(buffer, max_episodes: int = 100):
             
             # Extract logprobs as consistent Python lists
             episode_logprobs = []
-            if episode.logprob:
+            if episode.logprob is not None:
                 for logprob_item in episode.logprob:
                     if hasattr(logprob_item, 'tolist'):  # MLX array
                         episode_logprobs.extend(logprob_item.tolist())
@@ -1161,41 +1212,47 @@ def select_recent_data(buffer, max_episodes: int = 100):
     max_act_len = max(len(act) for act in all_acts) if all_acts else 0
     max_logprob_len = max(len(logprob) for logprob in all_logprobs) if all_logprobs else 0
     
-    # MLX-native padding and array operations for optimal Apple Silicon performance  
+    # MLX-native padding and array operations for optimal Apple Silicon performance
     # Convert all sequences to MLX arrays and pad directly in MLX space
     try:
         # Convert all sequences to MLX arrays first (staying in unified memory)
-        all_obs_mx = [mx.array(obs, dtype=mx.int64) for obs in all_obs if obs]
-        all_acts_mx = [mx.array(act, dtype=mx.int64) for act in all_acts if act]  
-        all_logprobs_mx = [mx.array(logprob, dtype=mx.float32) for logprob in all_logprobs if logprob]
-        
+        # Always create an array for each episode to maintain alignment with episode_rewards/lengths
+        all_obs_mx = [mx.array(obs, dtype=mx.int64) if obs else mx.array([], dtype=mx.int64) for obs in all_obs]
+        all_acts_mx = [mx.array(act, dtype=mx.int64) if act else mx.array([], dtype=mx.int64) for act in all_acts]
+        all_logprobs_mx = [mx.array(logprob, dtype=mx.float32) if logprob else mx.array([], dtype=mx.float32) for logprob in all_logprobs]
+
+        # Filter out empty arrays for padding/concatenation (after maintaining alignment for conversion)
+        non_empty_obs = [obs for obs in all_obs_mx if obs.size > 0]
+        non_empty_acts = [act for act in all_acts_mx if act.size > 0]
+        non_empty_logprobs = [logprob for logprob in all_logprobs_mx if logprob.size > 0]
+
         # Pad using native MLX operations (more efficient for Apple Silicon)
-        if all_obs_mx:
-            padded_obs_mx = [mx.pad(obs, (0, max_obs_len - obs.shape[0]), constant_values=0) 
-                           if obs.shape[0] < max_obs_len else obs[:max_obs_len] 
-                           for obs in all_obs_mx]
+        if non_empty_obs:
+            padded_obs_mx = [mx.pad(obs, (0, max_obs_len - obs.shape[0]), constant_values=0)
+                           if obs.shape[0] < max_obs_len else obs[:max_obs_len]
+                           for obs in non_empty_obs]
         else:
             padded_obs_mx = []
-            
-        if all_acts_mx:
-            padded_acts_mx = [mx.pad(act, (0, max_act_len - act.shape[0]), constant_values=0) 
-                            if act.shape[0] < max_act_len else act[:max_act_len] 
-                            for act in all_acts_mx]
+
+        if non_empty_acts:
+            padded_acts_mx = [mx.pad(act, (0, max_act_len - act.shape[0]), constant_values=0)
+                            if act.shape[0] < max_act_len else act[:max_act_len]
+                            for act in non_empty_acts]
         else:
             padded_acts_mx = []
-            
-        if all_logprobs_mx:
-            padded_logprobs_mx = [mx.pad(logprob, (0, max_logprob_len - logprob.shape[0]), constant_values=0.0) 
-                                if logprob.shape[0] < max_logprob_len else logprob[:max_logprob_len] 
-                                for logprob in all_logprobs_mx]
+
+        if non_empty_logprobs:
+            padded_logprobs_mx = [mx.pad(logprob, (0, max_logprob_len - logprob.shape[0]), constant_values=0.0)
+                                if logprob.shape[0] < max_logprob_len else logprob[:max_logprob_len]
+                                for logprob in non_empty_logprobs]
         else:
             padded_logprobs_mx = []
-        
+
         # Use padded MLX arrays directly (no intermediate conversion needed)
         all_obs_mx = padded_obs_mx
         all_acts_mx = padded_acts_mx
         all_logprobs_mx = padded_logprobs_mx
-        
+
     except Exception as e:
         print(f"ERROR in MLX array conversion: {e}")
         print(f"DEBUG: all_obs types: {[type(obs) for obs in all_obs[:3]]}")  # Show first 3 for brevity

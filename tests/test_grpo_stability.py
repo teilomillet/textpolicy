@@ -692,5 +692,114 @@ class TestGRPOLossIntegration:
             "grpo_loss should work with all features combined"
 
 
+@pytest.mark.unit
+@pytest.mark.algorithm
+class TestDynamicFiltering:
+    """Test dynamic batch filtering (DAPO-style prompt filtering)."""
+
+    def _make_episode(self, prompt_tokens, reward):
+        """Helper to create mock episode for testing."""
+        return {
+            'obs': prompt_tokens,
+            'act': [100, 101, 102],
+            'rew': [reward],
+            'logprob': [-1.0, -1.0, -1.0],
+        }
+
+    def test_single_completion_kept_by_default(self):
+        """Test that single-completion prompts are kept by default."""
+        episodes = [
+            self._make_episode([1, 2, 3], 1.0),  # Single completion for this prompt
+            self._make_episode([4, 5, 6], 1.0),  # Different prompt, single completion
+            self._make_episode([4, 5, 6], 0.0),  # Same prompt, different reward
+        ]
+
+        filtered, stats = grpo.filter_informative_prompts(episodes, min_variance=0.01)
+
+        # All 3 episodes should be kept:
+        # - [1,2,3] has 1 completion, kept by default
+        # - [4,5,6] has 2 completions with variance > 0, kept
+        assert len(filtered) == 3
+        assert stats['prompts_kept'] == 2
+        assert stats['prompts_kept_single'] == 1
+        assert stats['prompts_dropped_single'] == 0
+
+    def test_single_completion_filtered_when_disabled(self):
+        """Test that single-completion prompts are filtered when keep_single_completion=False."""
+        episodes = [
+            self._make_episode([1, 2, 3], 1.0),  # Single completion
+            self._make_episode([4, 5, 6], 1.0),  # Two completions
+            self._make_episode([4, 5, 6], 0.0),  # with variance
+        ]
+
+        filtered, stats = grpo.filter_informative_prompts(
+            episodes, min_variance=0.01, keep_single_completion=False
+        )
+
+        # Only [4,5,6] prompt should be kept (2 completions with variance)
+        assert len(filtered) == 2
+        assert stats['prompts_kept'] == 1
+        assert stats['prompts_kept_single'] == 0
+        assert stats['prompts_dropped_single'] == 1
+
+    def test_multi_completion_zero_variance_filtered(self):
+        """Test that multi-completion prompts with zero variance are filtered."""
+        episodes = [
+            self._make_episode([1, 2, 3], 1.0),  # All same reward
+            self._make_episode([1, 2, 3], 1.0),
+            self._make_episode([1, 2, 3], 1.0),
+        ]
+
+        filtered, stats = grpo.filter_informative_prompts(episodes, min_variance=0.01)
+
+        # All completions same reward -> zero variance -> filtered
+        assert len(filtered) == 0
+        assert stats['prompts_kept'] == 0
+        assert stats['prompts_dropped_all_correct'] == 1
+        assert stats['episodes_dropped'] == 3
+
+    def test_multi_completion_with_variance_kept(self):
+        """Test that multi-completion prompts with variance are kept."""
+        episodes = [
+            self._make_episode([1, 2, 3], 1.0),  # Mixed rewards
+            self._make_episode([1, 2, 3], 0.0),
+            self._make_episode([1, 2, 3], 0.5),
+        ]
+
+        filtered, stats = grpo.filter_informative_prompts(episodes, min_variance=0.01)
+
+        # Mixed rewards -> variance > 0 -> kept
+        assert len(filtered) == 3
+        assert stats['prompts_kept'] == 1
+        assert stats['episodes_kept'] == 3
+
+    def test_stats_include_single_completion_tracking(self):
+        """Test that stats properly track single-completion prompts."""
+        episodes = [
+            self._make_episode([1], 1.0),  # Single
+            self._make_episode([2], 0.0),  # Single
+            self._make_episode([3], 1.0),  # Multi, all correct
+            self._make_episode([3], 1.0),
+            self._make_episode([4], 1.0),  # Multi, mixed
+            self._make_episode([4], 0.0),
+        ]
+
+        filtered, stats = grpo.filter_informative_prompts(episodes, min_variance=0.01)
+
+        assert stats['prompts_kept_single'] == 2  # [1] and [2]
+        assert stats['prompts_dropped_all_correct'] == 1  # [3]
+        assert stats['prompts_kept'] == 3  # [1], [2], [4]
+
+    def test_empty_episodes_returns_empty_stats(self):
+        """Test that empty input returns proper empty stats."""
+        filtered, stats = grpo.filter_informative_prompts([])
+
+        assert len(filtered) == 0
+        assert stats['prompts_kept'] == 0
+        assert stats['prompts_dropped_single'] == 0
+        assert stats['prompts_kept_single'] == 0
+        assert stats['filter_rate'] == 0.0
+
+
 if __name__ == "__main__":
     pytest.main([__file__, "-v"])
