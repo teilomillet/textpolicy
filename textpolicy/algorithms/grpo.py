@@ -342,6 +342,10 @@ def policy_loss_compiled_constant_norm(
         Dr. GRPO: Understanding R1-Zero-Like Training
         https://arxiv.org/abs/2503.20783
     """
+    if normalize_constant <= 0:
+        raise ValueError(
+            f"normalize_constant must be positive, got {normalize_constant}"
+        )
     clip_cfg = resolve_clip_config(clip_ratio, clip_ratio_low, clip_ratio_high)
     return _policy_loss_compiled_constant(
         old_logprobs, new_logprobs, advantages,

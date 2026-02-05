@@ -328,6 +328,26 @@ class TestCompiledConstantNormLoss:
         assert not mx.isnan(loss) and not mx.isinf(loss), \
             "Compiled loss should handle single-element input"
 
+    def test_compiled_validates_normalize_constant(self):
+        """Test that compiled version validates normalize_constant > 0."""
+        old_logprobs = mx.array([-1.0, -1.0])
+        new_logprobs = mx.array([-0.9, -1.1])
+        advantages = mx.array([0.5, 0.5])
+
+        # Zero should raise ValueError
+        with pytest.raises(ValueError, match="normalize_constant must be positive"):
+            grpo.policy_loss_compiled_constant_norm(
+                old_logprobs, new_logprobs, advantages,
+                normalize_constant=0.0
+            )
+
+        # Negative should raise ValueError
+        with pytest.raises(ValueError, match="normalize_constant must be positive"):
+            grpo.policy_loss_compiled_constant_norm(
+                old_logprobs, new_logprobs, advantages,
+                normalize_constant=-1.0
+            )
+
 
 @pytest.mark.unit
 @pytest.mark.algorithm
