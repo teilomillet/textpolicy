@@ -26,8 +26,48 @@ if mx is None:
             return fn
 
     mx = _DummyMx()
-from typing import List, Union, Tuple, Dict, Any
+from typing import List, Union, Tuple, Dict, Any, Optional
+from dataclasses import dataclass
 from collections import defaultdict
+
+# Import length shaping utilities from dedicated module
+from .length_shaping import (
+    compute_length_penalty,
+    apply_length_shaping,
+    compute_length_shaping_stats,
+)
+
+
+# --- Clip Configuration Helper ---
+@dataclass
+class ClipConfig:
+    """Configuration for PPO/DAPO clipping bounds."""
+    low: float = 0.2
+    high: float = 0.28
+
+
+def resolve_clip_config(
+    clip_ratio: Optional[float],
+    clip_ratio_low: float = 0.2,
+    clip_ratio_high: float = 0.28,
+) -> ClipConfig:
+    """
+    Resolve clipping configuration with backward compatibility.
+
+    Centralizes the logic for handling symmetric vs asymmetric clipping bounds.
+
+    Args:
+        clip_ratio: Symmetric clipping ratio (backward compatibility).
+                   If provided, overrides clip_ratio_low and clip_ratio_high.
+        clip_ratio_low: Lower bound offset (default 0.2)
+        clip_ratio_high: Upper bound offset (default 0.28)
+
+    Returns:
+        ClipConfig with resolved low and high bounds
+    """
+    if clip_ratio is not None:
+        return ClipConfig(low=clip_ratio, high=clip_ratio)
+    return ClipConfig(low=clip_ratio_low, high=clip_ratio_high)
 
 
 def compute_advantages(rewards: Union[List[float], mx.array]) -> mx.array:
@@ -167,10 +207,8 @@ def policy_loss(
         Dr. GRPO: Understanding R1-Zero-Like Training
         https://arxiv.org/abs/2503.20783
     """
-    # Handle backward compatibility: if clip_ratio is provided, use symmetric bounds
-    if clip_ratio is not None:
-        clip_ratio_low = clip_ratio
-        clip_ratio_high = clip_ratio
+    # Resolve clipping configuration (handles backward compatibility)
+    clip_cfg = resolve_clip_config(clip_ratio, clip_ratio_low, clip_ratio_high)
 
     # Importance ratio: π_new / π_old
     # MLX optimizes exp() for Apple Silicon
@@ -178,7 +216,7 @@ def policy_loss(
 
     # PPO clipped surrogate objective with asymmetric bounds (DAPO-style)
     # L = min(ratio * A, clip(ratio, 1-ε_low, 1+ε_high) * A)
-    clipped_ratio = mx.clip(ratio, 1 - clip_ratio_low, 1 + clip_ratio_high)
+    clipped_ratio = mx.clip(ratio, 1 - clip_cfg.low, 1 + clip_cfg.high)
 
     # Element-wise minimum
     surr1 = ratio * advantages
@@ -209,20 +247,41 @@ def compute_advantages_compiled(rewards: mx.array) -> mx.array:
     return rewards - group_mean
 
 
+# --- Compiled Policy Loss Variants ---
+# Two internal compiled functions for different normalization strategies.
+# Compiled functions require static control flow, so we keep them separate.
+
 @mx.compile
-def _policy_loss_compiled_asymmetric(
+def _policy_loss_compiled_mean(
     old_logprobs: mx.array,
     new_logprobs: mx.array,
     advantages: mx.array,
-    clip_ratio_low: float = 0.2,
-    clip_ratio_high: float = 0.28
+    clip_ratio_low: float,
+    clip_ratio_high: float
 ) -> mx.array:
-    """Internal compiled function with asymmetric clipping."""
+    """Internal compiled function: mean normalization."""
     ratio = mx.exp(new_logprobs - old_logprobs)
     clipped_ratio = mx.clip(ratio, 1 - clip_ratio_low, 1 + clip_ratio_high)
     surr1 = ratio * advantages
     surr2 = clipped_ratio * advantages
     return -mx.mean(mx.minimum(surr1, surr2))
+
+
+@mx.compile
+def _policy_loss_compiled_constant(
+    old_logprobs: mx.array,
+    new_logprobs: mx.array,
+    advantages: mx.array,
+    clip_ratio_low: float,
+    clip_ratio_high: float,
+    normalize_constant: float
+) -> mx.array:
+    """Internal compiled function: constant normalization."""
+    ratio = mx.exp(new_logprobs - old_logprobs)
+    clipped_ratio = mx.clip(ratio, 1 - clip_ratio_low, 1 + clip_ratio_high)
+    surr1 = ratio * advantages
+    surr2 = clipped_ratio * advantages
+    return -mx.sum(mx.minimum(surr1, surr2)) / normalize_constant
 
 
 def policy_loss_compiled(
@@ -247,27 +306,19 @@ def policy_loss_compiled(
                    If provided, overrides clip_ratio_low and clip_ratio_high.
         clip_ratio_low: Lower bound offset (default 0.2)
         clip_ratio_high: Upper bound offset (default 0.28)
-
-    Note:
-        This is a thin wrapper around the compiled function to handle
-        backward compatibility with the old clip_ratio parameter.
     """
-    # Handle backward compatibility
-    if clip_ratio is not None:
-        clip_ratio_low = clip_ratio
-        clip_ratio_high = clip_ratio
-
-    return _policy_loss_compiled_asymmetric(
+    clip_cfg = resolve_clip_config(clip_ratio, clip_ratio_low, clip_ratio_high)
+    return _policy_loss_compiled_mean(
         old_logprobs, new_logprobs, advantages,
-        clip_ratio_low, clip_ratio_high
+        clip_cfg.low, clip_cfg.high
     )
 
 
-@mx.compile
 def policy_loss_compiled_constant_norm(
     old_logprobs: mx.array,
     new_logprobs: mx.array,
     advantages: mx.array,
+    clip_ratio: float = None,
     clip_ratio_low: float = 0.2,
     clip_ratio_high: float = 0.28,
     normalize_constant: float = 1024.0
@@ -281,6 +332,8 @@ def policy_loss_compiled_constant_norm(
         old_logprobs: Log probabilities from rollout collection
         new_logprobs: Log probabilities from current policy evaluation
         advantages: Group-relative advantages
+        clip_ratio: Symmetric clipping ratio (for backward compatibility).
+                   If provided, overrides clip_ratio_low and clip_ratio_high.
         clip_ratio_low: Lower bound offset (default 0.2)
         clip_ratio_high: Upper bound offset (default 0.28)
         normalize_constant: Fixed constant divisor (default 1024)
@@ -289,11 +342,11 @@ def policy_loss_compiled_constant_norm(
         Dr. GRPO: Understanding R1-Zero-Like Training
         https://arxiv.org/abs/2503.20783
     """
-    ratio = mx.exp(new_logprobs - old_logprobs)
-    clipped_ratio = mx.clip(ratio, 1 - clip_ratio_low, 1 + clip_ratio_high)
-    surr1 = ratio * advantages
-    surr2 = clipped_ratio * advantages
-    return -mx.sum(mx.minimum(surr1, surr2)) / normalize_constant
+    clip_cfg = resolve_clip_config(clip_ratio, clip_ratio_low, clip_ratio_high)
+    return _policy_loss_compiled_constant(
+        old_logprobs, new_logprobs, advantages,
+        clip_cfg.low, clip_cfg.high, normalize_constant
+    )
 
 
 def entropy_bonus(logprobs: mx.array, coefficient: float = 0.01) -> mx.array:
@@ -319,140 +372,8 @@ def entropy_bonus(logprobs: mx.array, coefficient: float = 0.01) -> mx.array:
     return -coefficient * mx.mean(entropy)
 
 
-# DAPO-style soft overlong penalties (Issue #7)
-def compute_length_penalty(
-    sequence_length: int,
-    max_length: int,
-    cache_length: int = 100,
-    max_penalty: float = 0.5
-) -> float:
-    """
-    Compute soft penalty for sequences approaching max length.
-
-    Instead of hard cutoffs for max sequence length (which cause truncation
-    that looks like failure to the model), use graduated penalties within
-    an interval before max_length.
-
-    This reduces training instability from length-based confusion and helps
-    the model learn to be concise without hard punishment.
-
-    Args:
-        sequence_length: Current sequence length
-        max_length: Maximum allowed sequence length
-        cache_length: Start penalizing this many tokens before max_length.
-                     Must be positive.
-        max_penalty: Maximum penalty at max_length (default 0.5)
-
-    Returns:
-        Penalty value (0.0 for normal lengths, up to -max_penalty at max_length)
-
-    Example:
-        With max_length=512, cache_length=100 (threshold=412):
-        - length=400: penalty=0.0 (below threshold)
-        - length=412: penalty=0.0 (at threshold, progress=0)
-        - length=462: penalty=-0.25 (50/100 * 0.5)
-        - length=512: penalty=-0.5 (at max)
-
-    Raises:
-        ValueError: If cache_length <= 0
-
-    References:
-        DAPO: An Open-Source LLM Reinforcement Learning System at Scale
-        https://arxiv.org/abs/2503.14476
-    """
-    if cache_length <= 0:
-        raise ValueError(f"cache_length must be positive, got {cache_length}")
-
-    threshold = max_length - cache_length
-
-    if sequence_length < threshold:
-        return 0.0
-
-    # Linear penalty from 0 to max_penalty as we approach max
-    progress = (sequence_length - threshold) / cache_length
-    progress = min(1.0, progress)  # Clamp at 1.0
-
-    return -max_penalty * progress
-
-
-def apply_length_shaping(
-    rewards: mx.array,
-    sequence_lengths: List[int],
-    max_length: int,
-    cache_length: int = 100,
-    max_penalty: float = 0.5
-) -> mx.array:
-    """
-    Apply soft length penalties to rewards.
-
-    Modifies rewards by adding graduated penalties for sequences that
-    approach the maximum length. This provides a smoother learning signal
-    than hard truncation.
-
-    Args:
-        rewards: Original rewards array [batch_size]
-        sequence_lengths: List of sequence lengths for each episode
-        max_length: Maximum allowed sequence length
-        cache_length: Start penalizing this many tokens before max_length
-        max_penalty: Maximum penalty at max_length
-
-    Returns:
-        Rewards with length penalties applied
-
-    Example:
-        >>> rewards = mx.array([1.0, 0.5, 0.0])
-        >>> lengths = [400, 500, 520]  # max_length=512, cache_length=100
-        >>> shaped = apply_length_shaping(rewards, lengths, 512)
-        >>> # shaped ≈ [1.0, 0.06, -0.5]  # last one gets max penalty
-
-    References:
-        DAPO: An Open-Source LLM Reinforcement Learning System at Scale
-        https://arxiv.org/abs/2503.14476
-    """
-    penalties = mx.array([
-        compute_length_penalty(length, max_length, cache_length, max_penalty)
-        for length in sequence_lengths
-    ], dtype=mx.float32)
-
-    return rewards + penalties
-
-
-def compute_length_shaping_stats(
-    sequence_lengths: List[int],
-    max_length: int,
-    cache_length: int = 100
-) -> dict:
-    """
-    Compute statistics about length penalties for monitoring.
-
-    Args:
-        sequence_lengths: List of sequence lengths
-        max_length: Maximum allowed sequence length
-        cache_length: Penalty threshold offset
-
-    Returns:
-        Dictionary with length penalty statistics
-    """
-    threshold = max_length - cache_length
-    total = len(sequence_lengths)
-
-    if total == 0:
-        return {
-            'mean_length': 0.0,
-            'max_length_observed': 0,
-            'truncation_rate': 0.0,
-            'penalty_zone_rate': 0.0,
-        }
-
-    truncated = sum(1 for l in sequence_lengths if l >= max_length)
-    in_penalty_zone = sum(1 for l in sequence_lengths if threshold <= l < max_length)
-
-    return {
-        'mean_length': sum(sequence_lengths) / total,
-        'max_length_observed': max(sequence_lengths),
-        'truncation_rate': truncated / total,
-        'penalty_zone_rate': in_penalty_zone / total,
-    }
+# Note: compute_length_penalty, apply_length_shaping, and compute_length_shaping_stats
+# are imported from .length_shaping module (see imports at top of file)
 
 
 # DAPO-style dynamic batch filtering (Issue #9)
@@ -737,17 +658,15 @@ def compute_metrics(
         - clip_fraction_upper: Fraction of ratios clipped at upper bound
         - clip_fraction: Total fraction of ratios clipped (either bound)
     """
-    # Handle backward compatibility
-    if clip_ratio is not None:
-        clip_ratio_low = clip_ratio
-        clip_ratio_high = clip_ratio
+    # Resolve clipping configuration (handles backward compatibility)
+    clip_cfg = resolve_clip_config(clip_ratio, clip_ratio_low, clip_ratio_high)
 
     # Importance ratio statistics
     ratio = mx.exp(new_logprobs - old_logprobs)
 
     # Asymmetric clipping bounds
-    clip_lower = 1 - clip_ratio_low
-    clip_upper = 1 + clip_ratio_high
+    clip_lower = 1 - clip_cfg.low
+    clip_upper = 1 + clip_cfg.high
 
     # Track clip fractions separately for upper and lower bounds
     clipped_lower = ratio < clip_lower
@@ -771,8 +690,8 @@ def compute_metrics(
         'kl_divergence': kl_div.item(),
         'min_advantage': mx.min(advantages).item(),
         'max_advantage': mx.max(advantages).item(),
-        'clip_ratio_low': clip_ratio_low,
-        'clip_ratio_high': clip_ratio_high
+        'clip_ratio_low': clip_cfg.low,
+        'clip_ratio_high': clip_cfg.high
     }
 
 
