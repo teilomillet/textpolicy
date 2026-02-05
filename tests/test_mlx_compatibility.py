@@ -157,6 +157,218 @@ class TestGRPOWithMLX:
         assert not mx.isnan(loss)
         assert loss.shape == ()  # Scalar
 
+    def test_policy_loss_asymmetric_clipping(self):
+        """Test GRPO policy_loss with DAPO-style asymmetric clipping."""
+        from textpolicy.algorithms import grpo
+
+        old_lp = mx.array([-1.0, -1.2, -0.8, -1.1, -0.9])
+        new_lp = mx.array([-1.1, -1.0, -0.9, -1.0, -1.0])
+        advantages = mx.array([0.6, 0.1, -0.9, 0.4, -0.2])
+
+        # Test with DAPO defaults: low=0.2, high=0.28
+        loss_asymmetric = grpo.policy_loss(
+            old_lp, new_lp, advantages,
+            clip_ratio_low=0.2, clip_ratio_high=0.28
+        )
+
+        assert not mx.isnan(loss_asymmetric)
+        assert loss_asymmetric.shape == ()
+
+        # Test backward compatibility: clip_ratio should override both
+        loss_symmetric = grpo.policy_loss(
+            old_lp, new_lp, advantages, clip_ratio=0.2
+        )
+
+        assert not mx.isnan(loss_symmetric)
+        assert loss_symmetric.shape == ()
+
+    def test_policy_loss_asymmetric_bounds_behavior(self):
+        """Test that asymmetric clipping produces correct bounds."""
+        from textpolicy.algorithms import grpo
+
+        # Create extreme ratios that will definitely be clipped
+        old_lp = mx.array([-1.0, -1.0, -1.0])
+        # Large positive change -> high ratio; Large negative change -> low ratio
+        new_lp = mx.array([-0.2, -1.8, -1.0])  # ratios: ~2.23, ~0.45, 1.0
+        advantages = mx.array([1.0, 1.0, 1.0])
+
+        # With asymmetric bounds: lower=0.8, upper=1.28
+        loss_asymmetric = grpo.policy_loss(
+            old_lp, new_lp, advantages,
+            clip_ratio_low=0.2, clip_ratio_high=0.28
+        )
+
+        # With symmetric bounds: lower=0.8, upper=1.2
+        loss_symmetric = grpo.policy_loss(
+            old_lp, new_lp, advantages, clip_ratio=0.2
+        )
+
+        # Asymmetric allows higher ratios, so clipping differs
+        # Both should be valid (not NaN)
+        assert not mx.isnan(loss_asymmetric)
+        assert not mx.isnan(loss_symmetric)
+
+        # The different upper bounds (1.28 vs 1.2) should produce different losses
+        # for these extreme ratios that hit the clipping bounds
+        assert float(loss_asymmetric) != float(loss_symmetric), \
+            "Asymmetric and symmetric clipping should produce different losses for extreme ratios"
+
+    def test_policy_loss_normalize_constant(self):
+        """Test policy_loss with fixed constant normalization (Dr. GRPO)."""
+        from textpolicy.algorithms import grpo
+
+        old_lp = mx.array([-1.0, -1.2, -0.8, -1.1, -0.9])
+        new_lp = mx.array([-1.1, -1.0, -0.9, -1.0, -1.0])
+        advantages = mx.array([0.6, 0.1, -0.9, 0.4, -0.2])
+
+        # Test with mean normalization (default)
+        loss_mean = grpo.policy_loss(old_lp, new_lp, advantages)
+
+        # Test with constant normalization
+        loss_const = grpo.policy_loss(
+            old_lp, new_lp, advantages, normalize_constant=5
+        )
+
+        # Both should be valid
+        assert not mx.isnan(loss_mean)
+        assert not mx.isnan(loss_const)
+
+        # With constant=5 (same as number of elements), should be similar
+        # but not identical due to different formulas
+        assert loss_mean.shape == ()
+        assert loss_const.shape == ()
+
+    def test_policy_loss_normalize_constant_eliminates_length_bias(self):
+        """Test that constant normalization eliminates length bias."""
+        from textpolicy.algorithms import grpo
+
+        # Short sequence
+        old_lp_short = mx.array([-1.0, -1.2])
+        new_lp_short = mx.array([-1.1, -1.0])
+        adv_short = mx.array([0.5, 0.5])
+
+        # Long sequence (same pattern repeated 4x)
+        old_lp_long = mx.array([-1.0, -1.2] * 4)
+        new_lp_long = mx.array([-1.1, -1.0] * 4)
+        adv_long = mx.array([0.5, 0.5] * 4)
+
+        # With mean normalization: short and long should give same loss
+        # (since pattern is identical, just repeated)
+        loss_short_mean = grpo.policy_loss(old_lp_short, new_lp_short, adv_short)
+        loss_long_mean = grpo.policy_loss(old_lp_long, new_lp_long, adv_long)
+
+        # Mean losses should be equal (same average per token)
+        assert abs(float(loss_short_mean) - float(loss_long_mean)) < 1e-5
+
+        # With constant normalization: long sequence contributes more
+        loss_short_const = grpo.policy_loss(
+            old_lp_short, new_lp_short, adv_short, normalize_constant=10
+        )
+        loss_long_const = grpo.policy_loss(
+            old_lp_long, new_lp_long, adv_long, normalize_constant=10
+        )
+
+        # Long sequence should have larger absolute loss (4x tokens)
+        # This is the expected behavior with constant normalization
+        assert abs(float(loss_long_const)) > abs(float(loss_short_const)) * 3
+
+    def test_policy_loss_compiled_backward_compatibility(self):
+        """Test that policy_loss_compiled maintains backward compatibility."""
+        from textpolicy.algorithms import grpo
+
+        old_lp = mx.array([-1.0, -1.2, -0.8, -1.1, -0.9])
+        new_lp = mx.array([-1.1, -1.0, -0.9, -1.0, -1.0])
+        advantages = mx.array([0.6, 0.1, -0.9, 0.4, -0.2])
+
+        # Test OLD API: clip_ratio parameter (backward compatibility)
+        loss_old_api = grpo.policy_loss_compiled(
+            old_lp, new_lp, advantages, clip_ratio=0.2
+        )
+        assert not mx.isnan(loss_old_api)
+        assert loss_old_api.shape == ()
+
+        # Test NEW API: separate clip_ratio_low and clip_ratio_high
+        loss_new_api = grpo.policy_loss_compiled(
+            old_lp, new_lp, advantages,
+            clip_ratio_low=0.2, clip_ratio_high=0.2
+        )
+        assert not mx.isnan(loss_new_api)
+        assert loss_new_api.shape == ()
+
+        # With same bounds, results should be identical
+        assert abs(float(loss_old_api) - float(loss_new_api)) < 1e-6
+
+        # Test asymmetric bounds (new feature)
+        loss_asymmetric = grpo.policy_loss_compiled(
+            old_lp, new_lp, advantages,
+            clip_ratio_low=0.2, clip_ratio_high=0.28
+        )
+        assert not mx.isnan(loss_asymmetric)
+
+    def test_policy_loss_compiled_constant_norm(self):
+        """Test compiled policy loss with constant normalization."""
+        from textpolicy.algorithms import grpo
+
+        old_lp = mx.array([-1.0, -1.2, -0.8, -1.1, -0.9])
+        new_lp = mx.array([-1.1, -1.0, -0.9, -1.0, -1.0])
+        advantages = mx.array([0.6, 0.1, -0.9, 0.4, -0.2])
+
+        # Test compiled version with constant normalization
+        loss_compiled = grpo.policy_loss_compiled_constant_norm(
+            old_lp, new_lp, advantages,
+            clip_ratio_low=0.2, clip_ratio_high=0.28,
+            normalize_constant=1024.0
+        )
+
+        # Test uncompiled version with same parameters
+        loss_uncompiled = grpo.policy_loss(
+            old_lp, new_lp, advantages,
+            clip_ratio_low=0.2, clip_ratio_high=0.28,
+            normalize_constant=1024
+        )
+
+        # Both should be valid
+        assert not mx.isnan(loss_compiled)
+        assert loss_compiled.shape == ()
+        assert not mx.isnan(loss_uncompiled)
+        assert loss_uncompiled.shape == ()
+
+        # Compiled and uncompiled should produce identical results
+        assert abs(float(loss_compiled) - float(loss_uncompiled)) < 1e-6
+
+    def test_compute_metrics_asymmetric(self):
+        """Test compute_metrics with asymmetric clipping."""
+        from textpolicy.algorithms import grpo
+
+        old_lp = mx.array([-1.0, -1.2, -0.8, -1.1, -0.9])
+        new_lp = mx.array([-1.1, -1.0, -0.9, -1.0, -1.0])
+        advantages = mx.array([0.6, 0.1, -0.9, 0.4, -0.2])
+
+        # Test with asymmetric bounds
+        metrics = grpo.compute_metrics(
+            old_lp, new_lp, advantages,
+            clip_ratio_low=0.2, clip_ratio_high=0.28
+        )
+
+        # Check all expected metrics are present
+        assert 'clip_fraction_lower' in metrics
+        assert 'clip_fraction_upper' in metrics
+        assert 'clip_fraction' in metrics
+        assert 'clip_ratio_low' in metrics
+        assert 'clip_ratio_high' in metrics
+
+        # Check values are reasonable
+        assert 0 <= metrics['clip_fraction_lower'] <= 1
+        assert 0 <= metrics['clip_fraction_upper'] <= 1
+        assert 0 <= metrics['clip_fraction'] <= 1
+        assert metrics['clip_ratio_low'] == 0.2
+        assert metrics['clip_ratio_high'] == 0.28
+
+        # Total clip fraction should be >= max of individual fractions
+        total = metrics['clip_fraction']
+        assert total >= metrics['clip_fraction_lower'] or abs(total - metrics['clip_fraction_lower']) < 1e-6
+        assert total >= metrics['clip_fraction_upper'] or abs(total - metrics['clip_fraction_upper']) < 1e-6
+
     def test_entropy_bonus(self):
         """Test entropy bonus computation."""
         from textpolicy.algorithms import grpo
@@ -165,6 +377,255 @@ class TestGRPOWithMLX:
         entropy = grpo.entropy_bonus(logprobs, coefficient=0.01)
 
         assert not mx.isnan(entropy)
+
+    def test_compute_length_penalty(self):
+        """Test soft overlong penalty computation."""
+        from textpolicy.algorithms import grpo
+
+        max_length = 512
+        cache_length = 100
+
+        # Below threshold: no penalty
+        penalty = grpo.compute_length_penalty(400, max_length, cache_length)
+        assert penalty == 0.0
+
+        # At threshold boundary: no penalty
+        penalty = grpo.compute_length_penalty(412, max_length, cache_length)
+        assert penalty == 0.0
+
+        # Just past threshold: small penalty
+        penalty = grpo.compute_length_penalty(413, max_length, cache_length)
+        assert -0.1 < penalty < 0.0
+
+        # Halfway through cache zone
+        penalty = grpo.compute_length_penalty(462, max_length, cache_length)
+        assert -0.35 < penalty < -0.2
+
+        # At max length: max penalty
+        penalty = grpo.compute_length_penalty(512, max_length, cache_length)
+        assert penalty == -0.5
+
+        # Past max length: clamped at max penalty
+        penalty = grpo.compute_length_penalty(600, max_length, cache_length)
+        assert penalty == -0.5
+
+    def test_compute_length_penalty_custom_max_penalty(self):
+        """Test length penalty with custom max penalty."""
+        from textpolicy.algorithms import grpo
+
+        # Custom max penalty
+        penalty = grpo.compute_length_penalty(512, 512, 100, max_penalty=1.0)
+        assert penalty == -1.0
+
+        penalty = grpo.compute_length_penalty(462, 512, 100, max_penalty=1.0)
+        assert -0.6 < penalty < -0.4
+
+    def test_apply_length_shaping(self):
+        """Test applying length penalties to rewards."""
+        from textpolicy.algorithms import grpo
+
+        rewards = mx.array([1.0, 0.5, 0.0, -0.5])
+        lengths = [400, 462, 512, 600]  # below, mid, at, past max
+        max_length = 512
+        cache_length = 100
+
+        shaped = grpo.apply_length_shaping(
+            rewards, lengths, max_length, cache_length
+        )
+
+        # First should be unchanged (below threshold)
+        assert abs(float(shaped[0]) - 1.0) < 1e-6
+
+        # Second should have small penalty
+        assert 0.1 < float(shaped[1]) < 0.4
+
+        # Third should have max penalty (-0.5)
+        assert abs(float(shaped[2]) - (-0.5)) < 1e-6
+
+        # Fourth should have max penalty (clamped)
+        assert abs(float(shaped[3]) - (-1.0)) < 1e-6
+
+    def test_compute_length_shaping_stats(self):
+        """Test length shaping statistics."""
+        from textpolicy.algorithms import grpo
+
+        lengths = [400, 420, 462, 500, 512, 520]
+        max_length = 512
+        cache_length = 100
+
+        stats = grpo.compute_length_shaping_stats(lengths, max_length, cache_length)
+
+        assert 'mean_length' in stats
+        assert 'max_length_observed' in stats
+        assert 'truncation_rate' in stats
+        assert 'penalty_zone_rate' in stats
+
+        # 2 truncated (512, 520)
+        assert abs(stats['truncation_rate'] - 2/6) < 1e-6
+
+        # threshold = 412, so penalty zone is 412 <= l < 512
+        # 420, 462, 500 are in zone = 3 items
+        assert stats['penalty_zone_rate'] == 3/6  # 420, 462, 500
+
+        assert stats['max_length_observed'] == 520
+
+    def test_length_shaping_empty_list(self):
+        """Test length shaping with empty list."""
+        from textpolicy.algorithms import grpo
+
+        stats = grpo.compute_length_shaping_stats([], 512, 100)
+        assert stats['mean_length'] == 0.0
+        assert stats['truncation_rate'] == 0.0
+        assert stats['max_length_observed'] == 0
+        assert stats['penalty_zone_rate'] == 0.0
+
+    def test_length_penalty_invalid_cache_length(self):
+        """Test that cache_length <= 0 raises ValueError."""
+        from textpolicy.algorithms import grpo
+        import pytest
+
+        # cache_length = 0 should raise
+        with pytest.raises(ValueError, match="cache_length must be positive"):
+            grpo.compute_length_penalty(500, 512, cache_length=0)
+
+        # cache_length < 0 should raise
+        with pytest.raises(ValueError, match="cache_length must be positive"):
+            grpo.compute_length_penalty(500, 512, cache_length=-10)
+
+    def test_normalize_constant_validation(self):
+        """Test that normalize_constant <= 0 raises ValueError."""
+        from textpolicy.algorithms import grpo
+        import pytest
+
+        old_lp = mx.array([-1.0, -1.2])
+        new_lp = mx.array([-1.1, -1.0])
+        advantages = mx.array([0.5, 0.5])
+
+        # normalize_constant = 0 should raise
+        with pytest.raises(ValueError, match="normalize_constant must be positive"):
+            grpo.policy_loss(old_lp, new_lp, advantages, normalize_constant=0)
+
+        # normalize_constant < 0 should raise
+        with pytest.raises(ValueError, match="normalize_constant must be positive"):
+            grpo.policy_loss(old_lp, new_lp, advantages, normalize_constant=-1)
+
+    def test_filter_informative_prompts_keeps_varied(self):
+        """Test that filter_informative_prompts keeps prompts with varied rewards."""
+        from textpolicy.algorithms import grpo
+
+        # Create mock episodes with same prompt but different rewards
+        # Simulate 2 prompts, each with 3 completions
+        episodes = [
+            # Prompt 1: varied rewards (should be kept)
+            {'obs': [1, 2, 3], 'act': [4], 'rew': [1.0]},
+            {'obs': [1, 2, 3], 'act': [5], 'rew': [0.0]},
+            {'obs': [1, 2, 3], 'act': [6], 'rew': [0.5]},
+            # Prompt 2: all correct (should be filtered)
+            {'obs': [7, 8, 9], 'act': [10], 'rew': [1.0]},
+            {'obs': [7, 8, 9], 'act': [11], 'rew': [1.0]},
+            {'obs': [7, 8, 9], 'act': [12], 'rew': [1.0]},
+        ]
+
+        filtered, stats = grpo.filter_informative_prompts(episodes, min_variance=0.01)
+
+        # Should keep prompt 1 (3 episodes) and filter prompt 2
+        assert len(filtered) == 3
+        assert stats['prompts_kept'] == 1
+        assert stats['prompts_dropped_all_correct'] == 1
+        assert stats['prompts_dropped_all_wrong'] == 0
+        assert stats['episodes_kept'] == 3
+        assert stats['episodes_dropped'] == 3
+
+    def test_filter_informative_prompts_filters_all_wrong(self):
+        """Test that filter_informative_prompts filters prompts where all completions fail."""
+        from textpolicy.algorithms import grpo
+
+        episodes = [
+            # Prompt 1: all wrong (should be filtered)
+            {'obs': [1, 2], 'act': [3], 'rew': [0.0]},
+            {'obs': [1, 2], 'act': [4], 'rew': [0.0]},
+            # Prompt 2: varied (should be kept)
+            {'obs': [5, 6], 'act': [7], 'rew': [1.0]},
+            {'obs': [5, 6], 'act': [8], 'rew': [0.0]},
+        ]
+
+        filtered, stats = grpo.filter_informative_prompts(episodes, min_variance=0.01)
+
+        assert len(filtered) == 2
+        assert stats['prompts_kept'] == 1
+        assert stats['prompts_dropped_all_correct'] == 0
+        assert stats['prompts_dropped_all_wrong'] == 1
+
+    def test_filter_informative_prompts_min_variance_threshold(self):
+        """Test that min_variance threshold controls filtering sensitivity."""
+        from textpolicy.algorithms import grpo
+
+        # Prompt with moderate variance (0.7 and 1.0)
+        # variance = ((0.7-0.85)^2 + (1.0-0.85)^2)/2 = (0.0225 + 0.0225)/2 = 0.0225
+        episodes = [
+            {'obs': [1], 'act': [2], 'rew': [0.7]},
+            {'obs': [1], 'act': [3], 'rew': [1.0]},
+        ]
+
+        # With threshold below variance (0.0225), should be kept
+        filtered_low, _ = grpo.filter_informative_prompts(episodes, min_variance=0.01)
+        assert len(filtered_low) == 2
+
+        # With threshold above variance (0.0225), should be filtered
+        filtered_high, _ = grpo.filter_informative_prompts(episodes, min_variance=0.05)
+        assert len(filtered_high) == 0
+
+    def test_filter_informative_prompts_empty_list(self):
+        """Test filter_informative_prompts with empty episode list."""
+        from textpolicy.algorithms import grpo
+
+        filtered, stats = grpo.filter_informative_prompts([])
+
+        assert filtered == []
+        assert stats['prompts_kept'] == 0
+        assert stats['filter_rate'] == 0.0
+
+    def test_compute_prompt_group_stats(self):
+        """Test compute_prompt_group_stats returns correct statistics."""
+        from textpolicy.algorithms import grpo
+
+        episodes = [
+            # Prompt 1: 3 completions
+            {'obs': [1, 2], 'act': [3], 'rew': [1.0]},
+            {'obs': [1, 2], 'act': [4], 'rew': [0.5]},
+            {'obs': [1, 2], 'act': [5], 'rew': [0.0]},
+            # Prompt 2: 2 completions
+            {'obs': [6, 7], 'act': [8], 'rew': [1.0]},
+            {'obs': [6, 7], 'act': [9], 'rew': [1.0]},
+        ]
+
+        stats = grpo.compute_prompt_group_stats(episodes)
+
+        assert stats['num_prompts'] == 2
+        assert stats['num_episodes'] == 5
+        assert stats['completions_per_prompt'] == 2.5
+        assert stats['reward_variance_mean'] > 0  # Some variance expected
+        assert 'reward_variance_std' in stats
+
+    def test_filter_preserves_episode_structure(self):
+        """Test that filtered episodes maintain their structure."""
+        from textpolicy.algorithms import grpo
+
+        # Episodes with various fields
+        episodes = [
+            {'obs': [1, 2], 'act': [3, 4], 'rew': [1.0], 'logprob': [-0.5]},
+            {'obs': [1, 2], 'act': [5, 6], 'rew': [0.0], 'logprob': [-0.7]},
+        ]
+
+        filtered, _ = grpo.filter_informative_prompts(episodes, min_variance=0.01)
+
+        # Both should be kept (varied rewards)
+        assert len(filtered) == 2
+        # Check structure preserved
+        assert 'obs' in filtered[0]
+        assert 'act' in filtered[0]
+        assert 'rew' in filtered[0]
+        assert 'logprob' in filtered[0]
 
 
 @pytest.mark.unit

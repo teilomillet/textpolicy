@@ -7,6 +7,7 @@ GSPO: sequence-level importance sampling (sequence, token, and hybrid variants).
 """
 
 from .grpo import (
+    # Core GRPO functions
     compute_advantages,
     compute_advantages_dr_grpo,
     policy_loss,
@@ -14,7 +15,19 @@ from .grpo import (
     compute_metrics,
     entropy_bonus,
     select_all_data,
-    select_recent_data
+    select_recent_data,
+    # Compiled versions
+    compute_advantages_compiled,
+    policy_loss_compiled,
+    policy_loss_compiled_constant_norm,
+    # Length shaping (DAPO-style soft overlong penalties)
+    compute_length_penalty,
+    apply_length_shaping,
+    compute_length_shaping_stats,
+    # Dynamic batch filtering
+    filter_informative_prompts,
+    compute_prompt_group_stats,
+    select_informative_data,
 )
 
 from .gspo import (
@@ -31,15 +44,27 @@ from .gspo import (
 )
 
 __all__ = [
-    # GRPO functions
+    # GRPO core functions
     "compute_advantages",
     "compute_advantages_dr_grpo",
     "policy_loss",
-    "grpo_loss", 
+    "grpo_loss",
     "compute_metrics",
     "entropy_bonus",
     "select_all_data",
     "select_recent_data",
+    # GRPO compiled versions
+    "compute_advantages_compiled",
+    "policy_loss_compiled",
+    "policy_loss_compiled_constant_norm",
+    # GRPO length shaping (DAPO-style)
+    "compute_length_penalty",
+    "apply_length_shaping",
+    "compute_length_shaping_stats",
+    # GRPO dynamic batch filtering
+    "filter_informative_prompts",
+    "compute_prompt_group_stats",
+    "select_informative_data",
     # GSPO functions
     "create_gspo_policy_loss",
     "create_gspo_metrics",
@@ -50,5 +75,5 @@ __all__ = [
     "compute_metrics_sequence",
     "compute_metrics_hybrid",
     "compute_metrics_token",
-    "select_gspo_data"
+    "select_gspo_data",
 ]
