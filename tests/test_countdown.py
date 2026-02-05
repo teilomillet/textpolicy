@@ -425,6 +425,35 @@ class TestLoadCountdownDataset:
         assert len(examples) == 1
         assert examples[0] == {"target": 42, "numbers": [10, 20, 12]}
 
+    def test_skips_rows_missing_fields(self, monkeypatch):
+        """Rows missing target or numbers are skipped cleanly."""
+        from unittest.mock import MagicMock
+
+        fake_ds = [
+            {"target": 100, "nums": [1, 2, 3, 4]},  # valid
+            {"nums": [9, 9, 9]},                      # missing target
+            {"target": 200},                           # missing nums/numbers
+            {"foo": "bar"},                            # completely invalid
+            {"target": 50, "numbers": [5, 6]},        # valid (numbers key)
+        ]
+
+        import builtins
+        real_import = builtins.__import__
+
+        def patched_import(name, *args, **kwargs):
+            if name == "datasets":
+                mod = MagicMock()
+                mod.load_dataset = MagicMock(return_value=fake_ds)
+                return mod
+            return real_import(name, *args, **kwargs)
+
+        monkeypatch.setattr(builtins, "__import__", patched_import)
+
+        examples = load_countdown_dataset(split="train")
+        assert len(examples) == 2
+        assert examples[0] == {"target": 100, "numbers": [1, 2, 3, 4]}
+        assert examples[1] == {"target": 50, "numbers": [5, 6]}
+
 
 # =========================================================================
 # Prompt Formatting & Extraction

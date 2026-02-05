@@ -2,6 +2,7 @@
 Problem generation and HuggingFace dataset loading for the Countdown task.
 """
 
+import ast
 import itertools
 import random
 from typing import Dict, List, Optional, Tuple
@@ -94,12 +95,7 @@ def load_countdown_dataset(
         numbers = item.get("nums") or item.get("numbers")
         if target is not None and numbers is not None:
             if isinstance(numbers, str):
-                # Parse string representation like "[1, 2, 3, 4]"
-                numbers = [
-                    int(n.strip())
-                    for n in numbers.strip("[]").split(",")
-                    if n.strip()
-                ]
+                numbers = ast.literal_eval(numbers)
             examples.append({"target": int(target), "numbers": list(numbers)})
             if max_examples is not None and len(examples) >= max_examples:
                 break
