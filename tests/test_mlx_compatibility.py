@@ -208,6 +208,11 @@ class TestGRPOWithMLX:
         assert not mx.isnan(loss_asymmetric)
         assert not mx.isnan(loss_symmetric)
 
+        # The different upper bounds (1.28 vs 1.2) should produce different losses
+        # for these extreme ratios that hit the clipping bounds
+        assert float(loss_asymmetric) != float(loss_symmetric), \
+            "Asymmetric and symmetric clipping should produce different losses for extreme ratios"
+
     def test_policy_loss_normalize_constant(self):
         """Test policy_loss with fixed constant normalization (Dr. GRPO)."""
         from textpolicy.algorithms import grpo
@@ -309,14 +314,27 @@ class TestGRPOWithMLX:
         advantages = mx.array([0.6, 0.1, -0.9, 0.4, -0.2])
 
         # Test compiled version with constant normalization
-        loss = grpo.policy_loss_compiled_constant_norm(
+        loss_compiled = grpo.policy_loss_compiled_constant_norm(
             old_lp, new_lp, advantages,
             clip_ratio_low=0.2, clip_ratio_high=0.28,
             normalize_constant=1024.0
         )
 
-        assert not mx.isnan(loss)
-        assert loss.shape == ()
+        # Test uncompiled version with same parameters
+        loss_uncompiled = grpo.policy_loss(
+            old_lp, new_lp, advantages,
+            clip_ratio_low=0.2, clip_ratio_high=0.28,
+            normalize_constant=1024
+        )
+
+        # Both should be valid
+        assert not mx.isnan(loss_compiled)
+        assert loss_compiled.shape == ()
+        assert not mx.isnan(loss_uncompiled)
+        assert loss_uncompiled.shape == ()
+
+        # Compiled and uncompiled should produce identical results
+        assert abs(float(loss_compiled) - float(loss_uncompiled)) < 1e-6
 
     def test_compute_metrics_asymmetric(self):
         """Test compute_metrics with asymmetric clipping."""
@@ -458,6 +476,38 @@ class TestGRPOWithMLX:
         stats = grpo.compute_length_shaping_stats([], 512, 100)
         assert stats['mean_length'] == 0.0
         assert stats['truncation_rate'] == 0.0
+        assert stats['max_length_observed'] == 0
+        assert stats['penalty_zone_rate'] == 0.0
+
+    def test_length_penalty_invalid_cache_length(self):
+        """Test that cache_length <= 0 raises ValueError."""
+        from textpolicy.algorithms import grpo
+        import pytest
+
+        # cache_length = 0 should raise
+        with pytest.raises(ValueError, match="cache_length must be positive"):
+            grpo.compute_length_penalty(500, 512, cache_length=0)
+
+        # cache_length < 0 should raise
+        with pytest.raises(ValueError, match="cache_length must be positive"):
+            grpo.compute_length_penalty(500, 512, cache_length=-10)
+
+    def test_normalize_constant_validation(self):
+        """Test that normalize_constant <= 0 raises ValueError."""
+        from textpolicy.algorithms import grpo
+        import pytest
+
+        old_lp = mx.array([-1.0, -1.2])
+        new_lp = mx.array([-1.1, -1.0])
+        advantages = mx.array([0.5, 0.5])
+
+        # normalize_constant = 0 should raise
+        with pytest.raises(ValueError, match="normalize_constant must be positive"):
+            grpo.policy_loss(old_lp, new_lp, advantages, normalize_constant=0)
+
+        # normalize_constant < 0 should raise
+        with pytest.raises(ValueError, match="normalize_constant must be positive"):
+            grpo.policy_loss(old_lp, new_lp, advantages, normalize_constant=-1)
 
     def test_filter_informative_prompts_keeps_varied(self):
         """Test that filter_informative_prompts keeps prompts with varied rewards."""

@@ -187,6 +187,10 @@ def policy_loss(
 
     # Normalization: either mean (original) or sum/constant (Dr. GRPO)
     if normalize_constant is not None:
+        if normalize_constant <= 0:
+            raise ValueError(
+                f"normalize_constant must be positive, got {normalize_constant}"
+            )
         # Fixed constant normalization eliminates length bias
         # All sequences contribute equally regardless of length
         loss = -mx.sum(min_surr) / normalize_constant
@@ -335,23 +339,30 @@ def compute_length_penalty(
     Args:
         sequence_length: Current sequence length
         max_length: Maximum allowed sequence length
-        cache_length: Start penalizing this many tokens before max_length
+        cache_length: Start penalizing this many tokens before max_length.
+                     Must be positive.
         max_penalty: Maximum penalty at max_length (default 0.5)
 
     Returns:
         Penalty value (0.0 for normal lengths, up to -max_penalty at max_length)
 
     Example:
-        With max_length=512, cache_length=100:
+        With max_length=512, cache_length=100 (threshold=412):
         - length=400: penalty=0.0 (below threshold)
-        - length=412: penalty=-0.06 (12/100 * 0.5)
-        - length=462: penalty=-0.31 (62/100 * 0.5)
+        - length=412: penalty=0.0 (at threshold, progress=0)
+        - length=462: penalty=-0.25 (50/100 * 0.5)
         - length=512: penalty=-0.5 (at max)
+
+    Raises:
+        ValueError: If cache_length <= 0
 
     References:
         DAPO: An Open-Source LLM Reinforcement Learning System at Scale
         https://arxiv.org/abs/2503.14476
     """
+    if cache_length <= 0:
+        raise ValueError(f"cache_length must be positive, got {cache_length}")
+
     threshold = max_length - cache_length
 
     if sequence_length < threshold:
