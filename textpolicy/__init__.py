@@ -30,7 +30,7 @@ from .validate import validate_installation
 
 # Export core reward functions and the reward decorator
 from .rewards.basic import length_reward, keyword_reward, perplexity_reward, accuracy_reward
-from .rewards.registry import reward
+from .rewards.registry import reward, verifier
 
 # Build __all__ combining submodule __all__ lists and additional symbols
 __all__ = (
@@ -48,5 +48,6 @@ __all__ = (
         "perplexity_reward",
         "accuracy_reward",
         "reward",
+        "verifier",
     ]
 )

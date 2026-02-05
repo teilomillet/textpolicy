@@ -630,24 +630,31 @@ class TextGenerationEnv(Environment):
         reward_fn: Callable[[str, str, dict], float],
         max_tokens: int = 25,
         seed: int = 42,
-        tokenizer: Any = None
+        tokenizer: Any = None,
+        examples: Optional[List[dict]] = None
     ):
         """
         Initialize simple text generation environment.
-        
+
         Args:
             prompts: List of prompts to cycle through
             reward_fn: Function that computes reward from (prompt, completion, example)
             max_tokens: Maximum tokens to generate per response
             seed: Random seed for reproducible behavior
             tokenizer: Tokenizer for converting prompts to tokens (required for MLX compatibility)
+            examples: Optional list of example dicts to pass to reward function. If provided,
+                      must have same length as prompts. examples[i] is passed when prompts[i] is used.
         """
         super().__init__()
         
         if tokenizer is None:
             raise ValueError("tokenizer is required for TextGenerationEnv to work with MLX rollout system")
-        
+
+        if examples is not None and len(examples) != len(prompts):
+            raise ValueError(f"examples length ({len(examples)}) must match prompts length ({len(prompts)})")
+
         self.prompts = prompts
+        self.examples = examples if examples is not None else [{} for _ in prompts]
         self.reward_fn = reward_fn
         self.max_tokens = max_tokens
         self.tokenizer = tokenizer
@@ -735,10 +742,11 @@ class TextGenerationEnv(Environment):
         
         # Compute reward using provided reward function
         # Pass tokenizer for EOS token detection and truncation detection
+        prompt_index = self.current_episode % len(self.prompts)
         reward = self.reward_fn(
             prompt=self.current_prompt,
             completion=response_text,
-            example={},
+            example=self.examples[prompt_index],
             tokenizer=self.tokenizer,  # Pass tokenizer for EOS detection
             truncated=truncated        # Pass truncation flag from environment
         )
