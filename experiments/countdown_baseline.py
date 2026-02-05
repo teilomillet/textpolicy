@@ -132,8 +132,19 @@ def print_summary(output_dir: Path) -> None:
     print("=" * 50)
 
 
+_RUNNER_INTERNAL_MAX_EPISODES = 10  # Hardcoded in RolloutRunner.__init__
+
+
 def run_baseline(config: BaselineConfig) -> None:
     """Run the baseline GRPO experiment on countdown."""
+    if config.episodes_per_step > _RUNNER_INTERNAL_MAX_EPISODES:
+        raise ValueError(
+            f"episodes_per_step ({config.episodes_per_step}) exceeds "
+            f"RolloutRunner's internal buffer capacity "
+            f"({_RUNNER_INTERNAL_MAX_EPISODES}). Episodes would be "
+            f"silently evicted before reaching the training buffer."
+        )
+
     output_dir = Path(config.output_dir)
     output_dir.mkdir(parents=True, exist_ok=True)
 

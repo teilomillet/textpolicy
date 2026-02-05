@@ -85,6 +85,22 @@ class TestBaselineConfig:
         config = BaselineConfig()
         assert not hasattr(config, "num_generations_per_prompt")
 
+    def test_episodes_per_step_within_runner_limit(self):
+        from experiments.countdown_baseline import (
+            BaselineConfig,
+            _RUNNER_INTERNAL_MAX_EPISODES,
+        )
+
+        config = BaselineConfig()
+        assert config.episodes_per_step <= _RUNNER_INTERNAL_MAX_EPISODES
+
+    def test_rejects_episodes_per_step_exceeding_runner_limit(self):
+        from experiments.countdown_baseline import BaselineConfig, run_baseline
+
+        config = BaselineConfig(episodes_per_step=15)
+        with pytest.raises(ValueError, match="silently evicted"):
+            run_baseline(config)
+
 
 # ---------------------------------------------------------------------------
 # Helper function tests
