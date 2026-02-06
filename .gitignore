@@ -208,3 +208,7 @@ __marimo__/
 
 wandb/
 examples/wandb/
+CLAUDE.md
+
+# Benchmark artefacts
+artefacts/
