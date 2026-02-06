@@ -645,6 +645,37 @@ class TestExtractGrpoLogprobsBatched:
             f"Batched {result.tolist()} != sequential {sequential.tolist()}"
         )
 
+    def test_all_empty_responses_loss_is_zero_not_nan(self):
+        """All-empty-response batch must produce loss=0.0, not nan.
+
+        Regression: mx.mean([]) returns nan in MLX. When every episode
+        has an empty response, policy_loss received empty arrays and
+        returned nan. The guard in _loss_fn short-circuits to 0.0.
+        """
+        from textpolicy.algorithms import grpo
+        from textpolicy.training import Trainer
+
+        model = self._make_model()
+        trainer = Trainer(
+            model=model,
+            loss_fn=grpo.policy_loss,
+            optimizer=optim.Adam(learning_rate=1e-3),
+            advantage_fn=grpo.compute_advantages,
+            compile_training=False,
+        )
+
+        batch = {
+            'obs': mx.array([[1, 2, 3], [4, 5, 6]], dtype=mx.int64),
+            'act': mx.zeros((2, 0), dtype=mx.int64),
+            'logprob': mx.array([], dtype=mx.float32),
+            'rewards': mx.array([0.0, 0.0]),
+            'episode_lengths': [0, 0],
+            'prompt_lengths': [3, 3],
+        }
+
+        metrics = trainer.train(batch)
+        assert metrics['loss'] == 0.0, f"Expected loss=0.0, got {metrics['loss']}"
+
 
 @pytest.mark.integration
 class TestCompiledTraining:

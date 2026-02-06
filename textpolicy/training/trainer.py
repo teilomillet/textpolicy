@@ -348,6 +348,12 @@ class Trainer:
             model_output = self.model(model_input)
             new_logprobs = self.get_logprobs_fn(model_output, actions)
         
+        # No tokens → no loss.  Return 0.0 so gradients are zero and the
+        # optimizer step is a no-op.  Without this guard, mx.mean([]) in
+        # policy_loss produces nan which is misleading in metrics/logging.
+        if new_logprobs.shape[0] == 0:
+            return mx.array(0.0)
+
         # Compute advantages using algorithm-specific function
         advantages = self.advantage_fn(rewards)
         
