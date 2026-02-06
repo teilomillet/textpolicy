@@ -893,22 +893,29 @@ class TestBatchedLogprobRecomputation:
 
 @pytest.mark.unit
 class TestOnPolicyBufferManagement:
-    """Verify that on_policy=True prevents unbounded buffer growth.
+    """Verify that on_policy prevents unbounded buffer growth.
 
-    Issue #35: Without bounding the buffer, training time grows exponentially
+    Issue #35: Without clearing the buffer, training time grows exponentially
     because the Trainer does a forward pass over ALL buffered episodes.  For
     on-policy algorithms (GRPO, GTPO), the buffer should be cleared after each
     train() call so only the latest rollouts are used.
+
+    The default is on_policy=True — matching the dominant use case.
     """
 
-    def _make_trainer(self, buffer, on_policy=False):
-        """Create a minimal Trainer with a linked buffer."""
+    def _make_trainer(self, buffer, on_policy=None):
+        """Create a minimal Trainer with a linked buffer.
+
+        Args:
+            on_policy: Pass True/False to set explicitly, or None to use
+                the Trainer default (True).
+        """
         import mlx.optimizers as optim
         from textpolicy.training.trainer import Trainer
 
         model = nn.Linear(4, 4)
         optimizer = optim.Adam(learning_rate=0.01)
-        return Trainer(
+        kwargs = dict(
             model=model,
             advantage_fn=lambda r: r - mx.mean(r),
             loss_fn=lambda o, n, a: mx.mean(n),
@@ -920,8 +927,10 @@ class TestOnPolicyBufferManagement:
             # produce valid sequence logits; this test is about buffer
             # management, not logprob correctness.
             get_logprobs_fn=lambda model_out, acts: -mx.ones(acts.shape),
-            on_policy=on_policy,
         )
+        if on_policy is not None:
+            kwargs['on_policy'] = on_policy
+        return Trainer(**kwargs)
 
     @staticmethod
     def _make_batch():
@@ -946,8 +955,8 @@ class TestOnPolicyBufferManagement:
             logprob=mx.array([-0.5]),
         )
 
-    def test_on_policy_clears_buffer_after_train(self):
-        """H1: on_policy=True clears the linked buffer after train()."""
+    def test_default_clears_buffer(self):
+        """H1: The default (on_policy=True) clears the buffer after train()."""
         from textpolicy.buffer import Buffer
 
         buf = Buffer(max_episodes=100)
@@ -955,15 +964,30 @@ class TestOnPolicyBufferManagement:
         self._add_episode(buf)
         assert buf.episode_count == 2
 
+        trainer = self._make_trainer(buf)  # uses default on_policy=True
+        trainer.train()
+
+        assert buf.episode_count == 0, (
+            f"Default on_policy should clear buffer, got {buf.episode_count}"
+        )
+
+    def test_on_policy_explicit_clears_buffer(self):
+        """H2: Explicit on_policy=True clears the linked buffer after train()."""
+        from textpolicy.buffer import Buffer
+
+        buf = Buffer(max_episodes=100)
+        self._add_episode(buf)
+        self._add_episode(buf)
+
         trainer = self._make_trainer(buf, on_policy=True)
-        trainer.train()  # uses linked buffer automatically
+        trainer.train()
 
         assert buf.episode_count == 0, (
             f"Expected empty buffer after on_policy train(), got {buf.episode_count}"
         )
 
-    def test_default_preserves_buffer(self):
-        """H2: on_policy=False (default) does not clear the buffer."""
+    def test_off_policy_preserves_buffer(self):
+        """H3: on_policy=False does not clear the buffer."""
         from textpolicy.buffer import Buffer
 
         buf = Buffer(max_episodes=100)
@@ -974,11 +998,11 @@ class TestOnPolicyBufferManagement:
         trainer.train()
 
         assert buf.episode_count == 2, (
-            f"Default (off-policy) should preserve buffer, got {buf.episode_count}"
+            f"off-policy should preserve buffer, got {buf.episode_count}"
         )
 
     def test_manual_rollout_data_does_not_clear_buffer(self):
-        """H3: Passing explicit rollout_data should never clear the buffer,
+        """H4: Passing explicit rollout_data should never clear the buffer,
         even when on_policy=True."""
         from textpolicy.buffer import Buffer
 
@@ -994,7 +1018,7 @@ class TestOnPolicyBufferManagement:
         )
 
     def test_on_policy_buffer_stays_empty_across_steps(self):
-        """H4: Multiple train() calls with on_policy=True keep buffer empty."""
+        """H5: Multiple train() calls with on_policy=True keep buffer empty."""
         from textpolicy.buffer import Buffer
 
         buf = Buffer(max_episodes=100)
@@ -1013,8 +1037,8 @@ class TestOnPolicyBufferManagement:
                 f"got {buf.episode_count}"
             )
 
-    def test_buffer_growth_warning(self, caplog):
-        """H5: A warning is logged when buffer grows and on_policy=False."""
+    def test_buffer_growth_warning_immediate(self, caplog):
+        """H6: Warning fires on first detected growth, not a hardcoded step."""
         import logging
         from textpolicy.buffer import Buffer
 
@@ -1036,3 +1060,156 @@ class TestOnPolicyBufferManagement:
         assert any("Buffer grew" in record.message for record in caplog.records), (
             f"Expected buffer growth warning, got: {[r.message for r in caplog.records]}"
         )
+
+    def test_buffer_growth_warning_late_start(self, caplog):
+        """H7: Warning fires even when growth starts at a later step."""
+        import logging
+        from textpolicy.buffer import Buffer
+
+        buf = Buffer(max_episodes=100)
+        trainer = self._make_trainer(buf, on_policy=False)
+
+        # Steps 0-4: train with manual rollout_data (buffer stays empty,
+        # no growth detected).
+        for _ in range(5):
+            trainer.train(rollout_data=self._make_batch())
+
+        # Step 5: first time using linked buffer — establishes baseline
+        self._add_episode(buf)
+        self._add_episode(buf)
+        with caplog.at_level(logging.WARNING, logger="textpolicy.training.trainer"):
+            trainer.train()
+
+        # Step 6: buffer grows (2 → 4), warning should fire
+        self._add_episode(buf)
+        self._add_episode(buf)
+        with caplog.at_level(logging.WARNING, logger="textpolicy.training.trainer"):
+            trainer.train()
+
+        assert any("Buffer grew" in record.message for record in caplog.records), (
+            f"Expected late-start growth warning, got: {[r.message for r in caplog.records]}"
+        )
+
+    def test_buffer_growth_warning_fires_only_once(self, caplog):
+        """H8: Warning fires only once, not on every subsequent step."""
+        import logging
+        from textpolicy.buffer import Buffer
+
+        buf = Buffer(max_episodes=100)
+        trainer = self._make_trainer(buf, on_policy=False)
+
+        with caplog.at_level(logging.WARNING, logger="textpolicy.training.trainer"):
+            for _ in range(5):
+                self._add_episode(buf)
+                trainer.train()
+
+        warning_count = sum(1 for r in caplog.records if "Buffer grew" in r.message)
+        assert warning_count == 1, (
+            f"Expected exactly 1 warning, got {warning_count}"
+        )
+
+
+# ---------------------------------------------------------------------------
+# 11. Integration: on_policy with real select_recent_data (Issue #35, P3)
+# ---------------------------------------------------------------------------
+
+@pytest.mark.unit
+class TestOnPolicyWithSelectRecentData:
+    """Verify on_policy works through the real grpo.select_recent_data path.
+
+    Unlike the unit tests above (which inject a lambda data_selector_fn),
+    this exercises the full pipeline: Buffer → select_recent_data →
+    _pack_episodes → Trainer._loss_fn.
+    """
+
+    @staticmethod
+    def _add_text_episode(buffer, prompt_tokens, response_tokens, reward, logprobs):
+        """Add a text-generation episode via add_episode_from_dict.
+
+        Builds the dict format expected by _pack_episodes:
+        obs is a list of prompt token lists (one per step),
+        act is a list of response token lists (one per step).
+        """
+        n_steps = len(response_tokens)
+        buffer.add_episode_from_dict({
+            'obs': [prompt_tokens] * n_steps,
+            'act': [[tok] for tok in response_tokens],
+            'rew': [0.0] * (n_steps - 1) + [reward],
+            'next_obs': [prompt_tokens] * n_steps,
+            'done': [False] * (n_steps - 1) + [True],
+            'timeout': [False] * n_steps,
+            'logprob': [[lp] for lp in logprobs],
+        })
+
+    def test_on_policy_clears_buffer_through_real_pipeline(self):
+        """Full pipeline: select_recent_data → _pack_episodes → train → clear."""
+        import mlx.optimizers as optim
+        from textpolicy.buffer import Buffer
+        from textpolicy.training.trainer import Trainer
+        from textpolicy.algorithms import grpo
+
+        model = _TinyLM(vocab_size=16, dim=8)
+        mx.eval(model.parameters())
+        optimizer = optim.Adam(learning_rate=0.01)
+
+        buf = Buffer(max_episodes=100)
+
+        trainer = Trainer(
+            model=model,
+            advantage_fn=grpo.compute_advantages,
+            loss_fn=grpo.policy_loss,
+            optimizer=optimizer,
+            buffer=buf,
+            data_selector_fn=grpo.select_recent_data,
+            compile_training=False,
+            on_policy=True,
+        )
+
+        # Add episodes with tokens within model vocab (0-15)
+        self._add_text_episode(buf, [1, 2, 3], [4, 5], reward=1.0, logprobs=[-0.5, -0.3])
+        self._add_text_episode(buf, [1, 2, 3], [6, 7], reward=0.0, logprobs=[-0.8, -0.4])
+        self._add_text_episode(buf, [1, 2, 3], [8, 9], reward=0.5, logprobs=[-0.6, -0.2])
+        assert buf.episode_count == 3
+
+        # Train — this goes through select_recent_data → _pack_episodes → _loss_fn
+        metrics = trainer.train()
+
+        assert 'loss' in metrics
+        assert buf.episode_count == 0, (
+            f"on_policy should clear buffer after real pipeline, got {buf.episode_count}"
+        )
+
+    def test_select_recent_data_caps_episodes(self):
+        """select_recent_data with on_policy keeps only latest batch each step."""
+        import functools
+        import mlx.optimizers as optim
+        from textpolicy.buffer import Buffer
+        from textpolicy.training.trainer import Trainer
+        from textpolicy.algorithms import grpo
+
+        model = _TinyLM(vocab_size=16, dim=8)
+        mx.eval(model.parameters())
+        optimizer = optim.Adam(learning_rate=0.01)
+
+        buf = Buffer(max_episodes=100)
+
+        # Cap select_recent_data to 2 episodes max
+        trainer = Trainer(
+            model=model,
+            advantage_fn=grpo.compute_advantages,
+            loss_fn=grpo.policy_loss,
+            optimizer=optimizer,
+            buffer=buf,
+            data_selector_fn=functools.partial(grpo.select_recent_data, max_episodes=2),
+            compile_training=False,
+            on_policy=True,
+        )
+
+        # Simulate two training steps
+        for step in range(2):
+            self._add_text_episode(buf, [1, 2], [3, 4], reward=float(step), logprobs=[-0.5, -0.3])
+            self._add_text_episode(buf, [1, 2], [5, 6], reward=float(step) + 0.5, logprobs=[-0.4, -0.2])
+
+            metrics = trainer.train()
+            assert 'loss' in metrics
+            assert buf.episode_count == 0, f"Step {step}: buffer should be cleared"

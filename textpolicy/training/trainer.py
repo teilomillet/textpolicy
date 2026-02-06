@@ -59,7 +59,7 @@ class Trainer:
         metrics_interval: int = 10,
         advantage_transform_fn: Optional[Callable] = None,
         profile: bool = False,
-        on_policy: bool = False
+        on_policy: bool = True
     ):
         """
         Initialize unified trainer with composable algorithm functions.
@@ -88,11 +88,11 @@ class Trainer:
                 phases and record per-phase wall-clock times in the metrics dict
                 returned by ``train()``.  Zero cost when False (single boolean
                 check per phase).
-            on_policy: When True, clear the linked buffer after each
-                ``train()`` call (automatic buffer mode only).  GRPO and GTPO
-                are on-policy algorithms — they should only train on the latest
-                rollouts.  Without this flag, the buffer accumulates episodes
-                across steps and training time grows with the buffer size.
+            on_policy: When True (the default), clear the linked buffer
+                after each ``train()`` call (automatic buffer mode only).
+                GRPO and GTPO are on-policy algorithms — they should only
+                train on the latest rollouts.  Set to False for off-policy
+                algorithms that intentionally replay older episodes.
         """
         self.model = model
         self.advantage_fn = advantage_fn
@@ -114,6 +114,7 @@ class Trainer:
         self.data_selector_fn = data_selector_fn or self._default_data_selector
         self.on_policy = on_policy
         self._prev_buffer_episodes = 0  # track growth for warning
+        self._buffer_growth_warned = False
 
         # LoRA management - detect auto-reload models
         self.auto_save_lora = auto_save_lora or self._detect_auto_reload_lora(model)
@@ -689,10 +690,11 @@ class Trainer:
                 # may need on_policy=True for their algorithm.
                 current_count = self.buffer.episode_count
                 if (
-                    self._prev_buffer_episodes > 0
+                    not self._buffer_growth_warned
+                    and self._prev_buffer_episodes > 0
                     and current_count > self._prev_buffer_episodes
-                    and self._step_count == 2  # warn only on 2nd step
                 ):
+                    self._buffer_growth_warned = True
                     logger.warning(
                         "Buffer grew from %d to %d episodes between training "
                         "steps. For on-policy algorithms (GRPO, GTPO), set "

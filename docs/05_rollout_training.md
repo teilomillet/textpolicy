@@ -29,7 +29,7 @@ trainer = Trainer(model=model,
                   advantage_fn=grpo.compute_advantages,
                   loss_fn=grpo.policy_loss,
                   optimizer=None,  # configure your optimizer
-                  buffer=buffer)
+                  buffer=buffer)  # on_policy=True by default: clears buffer after each train()
 # metrics = trainer.train()
 ```
 
