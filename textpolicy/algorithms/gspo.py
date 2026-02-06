@@ -11,7 +11,32 @@ import mlx.core as mx
 from typing import List, Dict
 
 
-def _segment_sums(values: mx.array, sequence_lengths: List[int]) -> mx.array:
+def _segment_indices(sequence_lengths: List[int]):
+    """
+    Compute segment boundary indices from sequence lengths.
+
+    Returns integer-typed start/end index arrays suitable for cumsum-based
+    gather. Factored out so callers that need segment sums for multiple arrays
+    over the same segmentation (e.g. old_logprobs and new_logprobs) can compute
+    the indices once.
+
+    Args:
+        sequence_lengths: Length of each segment
+
+    Returns:
+        (starts, ends) — both int32 arrays of shape [num_segments],
+        or (None, None) when the input is empty.
+    """
+    if not sequence_lengths:
+        return None, None
+    lengths = mx.array([int(x) for x in sequence_lengths], dtype=mx.int32)
+    ends = mx.cumsum(lengths)
+    starts = mx.concatenate([mx.array([0], dtype=mx.int32), ends[:-1]])
+    return starts, ends
+
+
+def _segment_sums(values: mx.array, sequence_lengths: List[int],
+                  _precomputed=None) -> mx.array:
     """
     Compute per-segment sums of a flat 1D array using cumsum indexing.
 
@@ -20,17 +45,21 @@ def _segment_sums(values: mx.array, sequence_lengths: List[int]) -> mx.array:
     Args:
         values: Flat 1D array [total_tokens]
         sequence_lengths: Length of each segment
+        _precomputed: Optional (starts, ends) from _segment_indices to avoid
+            recomputing indices when summing multiple arrays over the same
+            segmentation.
 
     Returns:
         Sum of each segment [num_segments]. Empty input returns shape-(0,).
     """
-    if not sequence_lengths:
+    if _precomputed is not None:
+        starts, ends = _precomputed
+    else:
+        starts, ends = _segment_indices(sequence_lengths)
+    if starts is None:
         return mx.array([], dtype=mx.float32)
-    lengths = mx.array([int(x) for x in sequence_lengths])
     cs = mx.concatenate([mx.array([0.0]), mx.cumsum(values)])
-    cum_lengths = mx.cumsum(lengths)
-    starts = mx.concatenate([mx.array([0], dtype=mx.int32), cum_lengths[:-1]])
-    return cs[cum_lengths] - cs[starts]
+    return cs[ends] - cs[starts]
 
 
 def _expand_to_token_level(values: mx.array, sequence_lengths: List[int]) -> mx.array:
@@ -94,9 +123,10 @@ def compute_sequence_importance_weights(
 
     lengths = mx.array([int(x) for x in sequence_lengths], dtype=mx.float32)
 
-    # Vectorized segment sums via cumsum trick — zero Python loops
-    old_sums = _segment_sums(old_logprobs, sequence_lengths)  # [M]
-    new_sums = _segment_sums(new_logprobs, sequence_lengths)  # [M]
+    # Compute segment indices once, reuse for both old and new logprobs
+    idx = _segment_indices(sequence_lengths)
+    old_sums = _segment_sums(old_logprobs, sequence_lengths, _precomputed=idx)
+    new_sums = _segment_sums(new_logprobs, sequence_lengths, _precomputed=idx)
 
     # GSPO normalization: raise to power 1/|y_i| to prevent length bias
     # Guard against zero-length sequences: use length=1 for division to avoid NaN,
@@ -155,10 +185,11 @@ def compute_hybrid_importance_weights(
     if not sequence_lengths:
         return mx.array([], dtype=mx.float32)
 
-    # Vectorized segment sums via cumsum trick — zero Python loops
+    # Compute segment indices once, reuse for both old and new logprobs
     lengths = mx.array([int(x) for x in sequence_lengths], dtype=mx.float32)
-    old_sums = _segment_sums(old_logprobs, sequence_lengths)  # [M]
-    new_sums = _segment_sums(new_logprobs, sequence_lengths)  # [M]
+    idx = _segment_indices(sequence_lengths)
+    old_sums = _segment_sums(old_logprobs, sequence_lengths, _precomputed=idx)
+    new_sums = _segment_sums(new_logprobs, sequence_lengths, _precomputed=idx)
 
     # Guard against zero-length sequences (same rationale as sequence weights)
     zero_mask = lengths == 0
