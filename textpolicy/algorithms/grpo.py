@@ -465,7 +465,9 @@ def apply_entropy_weighting(
         )
 
     # Normalize entropy: H_norm(t) = H(t) / mean(H)
-    entropy_mean = mx.mean(token_entropies)
+    # Convert to Python scalar for the conditional to avoid ambiguous
+    # truthiness of 0-D mx.array (and to be safe inside mx.compile).
+    entropy_mean = mx.mean(token_entropies).item()
 
     # If mean entropy is effectively zero, all tokens are equally confident
     # (or all entropies are zero). No meaningful signal to redistribute —
