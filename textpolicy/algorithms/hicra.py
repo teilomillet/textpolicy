@@ -21,6 +21,23 @@ from gaming advantage signal through token content.
 All functions are pure, stateless, and follow the flat 1D data layout
 invariant of the training pipeline.
 
+Subword tokenization limitation:
+    Planning token identification uses ``convert_ids_to_tokens()`` to
+    reconstruct text from subword fragments, joining them with spaces.
+    This works correctly when each word in a strategic gram maps to a
+    single token (the common case for standard LLM tokenizers and the
+    default grams, which use only common English words like "let",
+    "think", "approach", etc.).
+
+    However, if a tokenizer aggressively splits a gram's words into
+    multiple subwords — e.g. "another" → ["an", "other"] — the
+    reconstructed text becomes "an other" (two words), which will NOT
+    match the gram regex ``\\banother\\b``.  This is a known limitation
+    of text-reconstruction-based matching.  For custom grams containing
+    rare or domain-specific words, verify that your tokenizer keeps them
+    as single tokens, or use ``tokenizer.decode()`` externally and pass
+    pre-computed masks instead.
+
 References:
     Issue #11 — HICRA Planning Token Amplification
     Issue #15 — Strategic Gram Mining Pipeline (produces the vocabulary)
@@ -57,8 +74,34 @@ def identify_planning_tokens(
 
     Uses ``tokenizer.convert_ids_to_tokens()`` to decode token IDs, then
     slides a window of width [1, max_window] over the decoded fragments.
-    When a window's concatenated text contains a strategic gram (case-
-    insensitive substring match), all tokens in that window get mask=1.
+    Matching is word-boundary-aware (``\\b`` regex anchors) and case-
+    insensitive.  When a match is found, only the tokens in the *shortest*
+    matching window are marked (the window stops expanding on first match
+    to avoid over-marking adjacent tokens).
+
+    Sliding window behavior:
+        For each start position, the window expands one token at a time.
+        On the first gram match, only tokens [start, end] are marked and
+        expansion stops.  This "shortest match first" strategy ensures
+        that non-participating tokens adjacent to a match are not falsely
+        included.  Subsequent start positions will independently attempt
+        matches from their own position.
+
+    Subword tokenization:
+        Decoded token fragments are joined with spaces after stripping
+        common subword prefixes (``▁`` for SentencePiece, ``Ġ`` for
+        GPT-style BPE).  This works correctly when each word in a gram
+        is a single token — the common case for standard LLM tokenizers
+        (LLaMA, GPT, Mistral) with the default strategic grams, which
+        use only common English words (max 8 chars: "approach").
+
+        **Limitation:** If a tokenizer splits a gram word into multiple
+        subwords (e.g. "another" → ["an", "other"]), the reconstructed
+        window text becomes "an other" (two words), which will not match
+        the regex ``\\banother\\b``.  Increasing ``max_window`` does NOT
+        fix this — the issue is word reconstruction, not window size.
+        For custom grams with rare words, verify your tokenizer keeps
+        them as single tokens.
 
     Args:
         token_ids: Flat 1D token IDs [total_tokens].
@@ -67,9 +110,10 @@ def identify_planning_tokens(
         strategic_grams: List of multi-word phrases to search for.
         max_window: Maximum sliding window size in tokens.  Automatically
                     raised to at least the longest gram's word count so
-                    that no gram is silently missed.  Each word may span
-                    multiple subword tokens, so the default (5) gives
-                    headroom for 3-word grams split into up to 5 tokens.
+                    that no gram is silently missed.  The default (5)
+                    gives headroom for 3-word grams where some words
+                    occupy 2 tokens (e.g. a word with a space prefix
+                    token).
 
     Returns:
         Binary mask [total_tokens] as float32 mx.array (0.0 or 1.0).
@@ -218,6 +262,11 @@ def compute_advantages_hicra(
 
     Order: base GRPO → (optional GTPO weighting) → HICRA amplification.
 
+    Note: When used via the Trainer's ``advantage_transform_fn`` hook,
+    advantage expansion is handled by the Trainer (using real
+    ``episode_lengths`` from ``batch_data``).  This function's own
+    expansion logic is for standalone use outside the Trainer.
+
     Args:
         rewards: Episode rewards for group-relative baseline.
         token_ids: Flat 1D token IDs [total_tokens] for planning detection.
@@ -225,7 +274,11 @@ def compute_advantages_hicra(
         strategic_grams: List of strategic gram phrases.
         alpha: HICRA amplification factor (default 0.2).
         episode_lengths: Token count per episode for expanding episode-level
-                        advantages to token-level.
+                        advantages to token-level.  Required when *rewards*
+                        are episode-level (the typical case).  When None,
+                        rewards are assumed to be already token-level —
+                        a ``ValueError`` is raised if the count doesn't
+                        match ``token_ids``.
         token_entropies: Per-token entropy [total_tokens] for GTPO composition.
                         If None, skips entropy weighting.
         entropy_weight: β parameter for GTPO (only used when token_entropies
@@ -233,6 +286,11 @@ def compute_advantages_hicra(
 
     Returns:
         Amplified token-level advantages [total_tokens].
+
+    Raises:
+        ValueError: If ``episode_lengths`` is provided but
+            ``sum(episode_lengths) != len(token_ids)``, or if
+            ``episode_lengths`` is None but ``len(rewards) != len(token_ids)``.
     """
     # Import grpo functions (avoid circular import at module level)
     from textpolicy.algorithms.grpo import (
