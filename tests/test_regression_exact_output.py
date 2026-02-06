@@ -396,6 +396,81 @@ class TestRegressionPackEpisodes:
 
 
 # ===========================================================================
+# 4b. Batched logprob recomputation with empty-response episode (Issue #27)
+# ===========================================================================
+
+@pytest.mark.unit
+@pytest.mark.regression
+class TestRegressionBatchedLogprobEmptyEpisode:
+    """Lock down the [non-empty, empty, non-empty] round-trip through
+    _pack_episodes → compute_logprobs_batched.
+
+    This is the exact failure path from PR #33 review: _pack_episodes
+    used to drop empty-act rows before stacking, causing a shape
+    mismatch in compute_logprobs_batched (response_tokens had fewer
+    rows than full_sequences). The fix pads all episodes including
+    empty ones and skips them via r_len == 0.
+
+    This test exercises the full round-trip, not just _pack_episodes
+    structure or just the Trainer path individually.
+    """
+
+    @staticmethod
+    def _make_model():
+        model = _TinyLM()
+        mx.eval(model.parameters())
+        return model
+
+    def test_pack_then_batched_logprobs_with_empty_middle_episode(self):
+        """[non-empty, empty, non-empty] round-trip produces correct flat 1D logprobs."""
+        from textpolicy.generation.mlx_generation import (
+            compute_logprobs,
+            compute_logprobs_batched,
+        )
+
+        model = self._make_model()
+
+        ep1 = SimpleNamespace(obs=[[1, 2, 3]], act=[[4, 5]], rew=[1.0], logprob=[-0.5, -0.6])
+        ep2 = SimpleNamespace(obs=[[6, 7]], act=[], rew=[0.0], logprob=[])
+        ep3 = SimpleNamespace(obs=[[8, 9]], act=[[10, 11, 12]], rew=[0.5], logprob=[-0.3, -0.4, -0.7])
+
+        batch = grpo._pack_episodes([ep1, ep2, ep3])
+
+        # Structural: all tensors must have 3 rows (one per episode)
+        assert batch['obs'].shape[0] == 3, f"obs has {batch['obs'].shape[0]} rows, want 3"
+        assert batch['act'].shape[0] == 3, f"act has {batch['act'].shape[0]} rows, want 3"
+        assert len(batch['prompt_lengths']) == 3
+        assert len(batch['episode_lengths']) == 3
+        assert batch['episode_lengths'] == [2, 0, 3]
+
+        # Batched logprobs via the same path Trainer uses
+        batched = compute_logprobs_batched(
+            model, batch['obs'], batch['act'],
+            batch['prompt_lengths'], batch['episode_lengths'],
+        )
+        mx.eval(batched)
+
+        # Must be flat 1D with length = sum of non-zero episode lengths
+        assert batched.ndim == 1
+        assert batched.shape[0] == 5, f"Expected 5 logprobs (2+0+3), got {batched.shape[0]}"
+
+        # Numerical parity: must match sequential per-episode compute_logprobs
+        seq1 = compute_logprobs(model, mx.array([1, 2, 3]), mx.array([4, 5]))
+        seq3 = compute_logprobs(model, mx.array([8, 9]), mx.array([10, 11, 12]))
+        sequential = mx.concatenate([seq1, seq3])
+        mx.eval(sequential)
+
+        assert mx.allclose(batched, sequential, atol=1e-5).item(), (
+            f"Batched {batched.tolist()} != sequential {sequential.tolist()}"
+        )
+
+        # Validity: all logprobs must be finite and non-positive
+        assert not mx.any(mx.isnan(batched)).item(), "NaN in logprobs"
+        assert not mx.any(mx.isinf(batched)).item(), "Inf in logprobs"
+        assert mx.all(batched <= 0).item(), f"Positive logprobs: {batched.tolist()}"
+
+
+# ===========================================================================
 # 5. GSPO
 # ===========================================================================
 
