@@ -70,11 +70,19 @@ class TinyLM(nn.Module):
 def _make_synthetic_batch(
     num_episodes: int, episode_length: int, vocab_size: int = 256
 ) -> Dict[str, Any]:
-    """Build a flat-1D batch that mirrors real rollout data."""
-    total = num_episodes * episode_length
-    # 2D obs/act for the GRPO extraction path
+    """Build a 2D batch that mirrors real rollout data from _pack_episodes.
+
+    The batch includes ``prompt_lengths`` so the Trainer routes through
+    ``compute_logprobs_batched`` (single forward pass) rather than falling
+    back to the sequential per-episode path.
+    """
+    prompt_length = episode_length // 2
+    response_length = episode_length - prompt_length
+    total = num_episodes * response_length
+    # 2D obs/act for the GRPO batched extraction path
+    # obs = full sequence (prompt + response), act = response only
     obs = mx.random.randint(0, vocab_size, shape=(num_episodes, episode_length))
-    act = mx.random.randint(0, vocab_size, shape=(num_episodes, episode_length))
+    act = mx.random.randint(0, vocab_size, shape=(num_episodes, response_length))
     logprob = -mx.abs(mx.random.normal((total,)))
     rewards = mx.random.normal((num_episodes,))
     return {
@@ -82,7 +90,8 @@ def _make_synthetic_batch(
         "act": act,
         "logprob": logprob,
         "rewards": rewards,
-        "episode_lengths": [episode_length] * num_episodes,
+        "episode_lengths": [response_length] * num_episodes,
+        "prompt_lengths": [prompt_length] * num_episodes,
     }
 
 

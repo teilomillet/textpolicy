@@ -11,11 +11,12 @@ Following TextPolicy design principles:
 All functions are pure and composable with our existing trainer system.
 """
 
-# Core MLX-LM generation functions  
+# Core MLX-LM generation functions
 from .mlx_generation import (
     load_model,
     generate_tokens,
     compute_logprobs,
+    compute_logprobs_batched,
     encode,
     decode,
     create_policy,
@@ -41,10 +42,11 @@ from .reload import (
 __all__ = [
     # Core generation functions
     "load_model",
-    "generate_tokens", 
+    "generate_tokens",
     "compute_logprobs",
+    "compute_logprobs_batched",
     "encode",
-    "decode", 
+    "decode",
     "create_policy",
     "compute_reward",
     

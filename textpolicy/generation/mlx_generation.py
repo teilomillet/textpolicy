@@ -370,6 +370,118 @@ def compute_logprobs(
     return selected
 
 
+def compute_logprobs_batched(
+    model: nn.Module,
+    full_sequences: mx.array,
+    response_tokens: mx.array,
+    prompt_lengths: list,
+    response_lengths: list,
+) -> mx.array:
+    """
+    Batched log-probability extraction: single forward pass for N episodes.
+
+    Replaces N sequential ``compute_logprobs`` calls with one batched
+    ``model(full_sequences)`` call, converting O(N) serial model invocations
+    into a single parallel operation.
+
+    Args:
+        model: Causal language model.
+        full_sequences: ``[N, max_seq_len]`` right-padded prompt+response tokens.
+        response_tokens: ``[N, max_resp_len]`` right-padded response-only tokens.
+        prompt_lengths: Per-episode prompt token count (Python list of ints).
+        response_lengths: Per-episode response token count (Python list of ints).
+
+    Returns:
+        Flat 1D unpadded logprobs — ``shape[0] == sum(response_lengths)``.
+
+    Safety notes:
+        - Right-padding is safe for causal models (padded tokens are right of
+          real tokens and cannot influence them via causal attention).
+        - The Python loop over episodes is cheap indexing, not model calls.
+        - No ``.item()`` or ``mx.eval()`` calls — safe inside ``mx.compile``.
+    """
+    if full_sequences.ndim != 2:
+        raise ValueError(
+            f"full_sequences must be 2D [N, max_seq_len], got {full_sequences.ndim}D "
+            f"with shape {full_sequences.shape}."
+        )
+    if response_tokens.ndim != 2:
+        raise ValueError(
+            f"response_tokens must be 2D [N, max_resp_len], got {response_tokens.ndim}D "
+            f"with shape {response_tokens.shape}."
+        )
+
+    n_episodes = full_sequences.shape[0]
+
+    if n_episodes == 0:
+        return mx.array([], dtype=mx.float32)
+
+    # Defensive shape check: all episode-indexed inputs must have N entries.
+    # A mismatch here means _pack_episodes dropped rows (e.g. filtering out
+    # empty episodes before stacking) — catch it early with a clear message.
+    if len(prompt_lengths) != n_episodes:
+        raise ValueError(
+            f"prompt_lengths has {len(prompt_lengths)} entries but "
+            f"full_sequences has {n_episodes} rows. They must match."
+        )
+    if len(response_lengths) != n_episodes:
+        raise ValueError(
+            f"response_lengths has {len(response_lengths)} entries but "
+            f"full_sequences has {n_episodes} rows. They must match."
+        )
+    if response_tokens.shape[0] != n_episodes:
+        raise ValueError(
+            f"response_tokens has {response_tokens.shape[0]} rows but "
+            f"full_sequences has {n_episodes} rows. They must match."
+        )
+    max_r_len = max(response_lengths) if response_lengths else 0
+    if max_r_len > 0 and response_tokens.shape[1] < max_r_len:
+        raise ValueError(
+            f"response_tokens has {response_tokens.shape[1]} columns but "
+            f"max(response_lengths)={max_r_len}. The response_tokens tensor "
+            f"must be wide enough to hold the longest response."
+        )
+
+    # Single batched forward pass: [N, max_seq_len] → [N, max_seq_len, vocab]
+    logits = model(full_sequences)
+
+    # Extract per-episode logprobs (cheap indexing, not model calls)
+    per_episode = []
+    for i in range(n_episodes):
+        p_len = prompt_lengths[i]
+        r_len = response_lengths[i]
+
+        if r_len == 0:
+            continue
+
+        # Guard: p_len == 0 would make the slice index (p_len - 1) wrap to
+        # -1 (the last token), silently corrupting logprobs. A prompt of
+        # length 0 is invalid for causal logprob extraction — you need at
+        # least one token to condition on.
+        if p_len == 0:
+            raise ValueError(
+                f"Episode {i} has prompt_length=0. Causal logprob extraction "
+                f"requires at least 1 prompt token (the model needs context "
+                f"to predict response tokens)."
+            )
+
+        # Prediction logits: same slicing as compute_logprobs
+        # logits at position (p_len-1) predicts the first response token
+        prediction_logits = logits[i, p_len - 1 : p_len - 1 + r_len, :]
+
+        # Log-softmax → select the actual response token at each position
+        log_probs = prediction_logits - mx.logsumexp(
+            prediction_logits, axis=-1, keepdims=True
+        )
+        selected = log_probs[mx.arange(r_len), response_tokens[i, :r_len]]
+        per_episode.append(selected)
+
+    if not per_episode:
+        return mx.array([], dtype=mx.float32)
+
+    return mx.concatenate(per_episode)
+
+
 def encode(tokenizer: Any, text: str) -> mx.array:
     """
     Convert text to MLX token array.

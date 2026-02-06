@@ -327,17 +327,18 @@ class TestRegressionPackEpisodes:
         assert result['logprob'].ndim == 1, f"Expected 1D, got {result['logprob'].ndim}D"
 
     def test_boundary_invariant(self):
-        """Episode lengths sum equals total real action tokens."""
+        """Episode lengths sum equals total real action tokens AND logprob count."""
         result = grpo._pack_episodes(self._make_episodes())
         mx.eval(result['logprob'])
-        # Semantic contract: episode_lengths tracks how many action tokens
-        # each episode contributed. Their sum is the count of real tokens;
-        # the logprob array may be larger due to padding, but the lengths
-        # must always account for exactly the real tokens.
         total_real_tokens = sum(result['episode_lengths'])
         # ep1 has 2 action tokens, ep2 has 3 → 5 real tokens
         assert total_real_tokens == 5, (
             f"episode_lengths sum {total_real_tokens} != expected real tokens 5"
+        )
+        # Unpadded logprobs must exactly match real token count
+        assert result['logprob'].shape[0] == total_real_tokens, (
+            f"logprob.shape[0]={result['logprob'].shape[0]} != "
+            f"sum(episode_lengths)={total_real_tokens}"
         )
 
     def test_empty_episodes(self):
@@ -346,7 +347,180 @@ class TestRegressionPackEpisodes:
         mx.eval(result['rewards'], result['obs'], result['logprob'])
         assert result['rewards'].shape == (0,)
         assert result['episode_lengths'] == []
+        assert result['prompt_lengths'] == []
         assert result['obs'].shape == (0,)
+
+    def test_obs_is_2d(self):
+        """H3: obs output is 2D [N, max_obs_len] after stacking."""
+        result = grpo._pack_episodes(self._make_episodes())
+        mx.eval(result['obs'])
+        assert result['obs'].ndim == 2, f"Expected 2D obs, got {result['obs'].ndim}D"
+        assert result['obs'].shape[0] == 2, "Expected 2 episodes"
+
+    def test_act_is_2d(self):
+        """H3: act output is 2D [N, max_act_len] after stacking."""
+        result = grpo._pack_episodes(self._make_episodes())
+        mx.eval(result['act'])
+        assert result['act'].ndim == 2, f"Expected 2D act, got {result['act'].ndim}D"
+        assert result['act'].shape[0] == 2, "Expected 2 episodes"
+
+    def test_prompt_lengths_present(self):
+        """prompt_lengths tracks per-episode prompt token counts."""
+        result = grpo._pack_episodes(self._make_episodes())
+        assert result['prompt_lengths'] == [3, 2], (
+            f"Expected [3, 2], got {result['prompt_lengths']}"
+        )
+
+    def test_empty_act_episode_preserves_row_alignment(self):
+        """Empty-act episode in the middle must keep obs/act row count == N.
+
+        Regression: filtering out empty-act arrays before stacking caused
+        act.shape[0] < len(episode_lengths), breaking batched logprob
+        extraction.
+        """
+        ep1 = SimpleNamespace(obs=[[1, 2]], act=[[3]], rew=[1.0], logprob=[-0.5])
+        ep2 = SimpleNamespace(obs=[[4, 5]], act=[], rew=[0.0], logprob=[])
+        ep3 = SimpleNamespace(obs=[[6, 7]], act=[[8, 9]], rew=[0.5], logprob=[-0.3, -0.4])
+        result = grpo._pack_episodes([ep1, ep2, ep3])
+        mx.eval(result['obs'], result['act'])
+
+        n_episodes = len(result['episode_lengths'])
+        assert result['obs'].shape[0] == n_episodes, (
+            f"obs rows {result['obs'].shape[0]} != {n_episodes} episodes"
+        )
+        assert result['act'].shape[0] == n_episodes, (
+            f"act rows {result['act'].shape[0]} != {n_episodes} episodes"
+        )
+        assert result['episode_lengths'] == [1, 0, 2]
+        assert result['prompt_lengths'] == [2, 2, 2]
+
+    def test_all_empty_responses_produce_2d_act(self):
+        """All-empty-response batch must produce 2D (N, 0) act, not 1D (0,).
+
+        Regression: mx.array([], dtype=mx.int64) produces shape (0,) which
+        is 1D. The trainer checks actions.ndim == 2 to enter the batched
+        path — falling to the flat 1D path with no action tokens crashes
+        with 'sequence length mismatch'.
+        """
+        ep1 = SimpleNamespace(obs=[[1, 2]], act=[], rew=[0.0], logprob=[])
+        ep2 = SimpleNamespace(obs=[[3, 4]], act=[], rew=[0.0], logprob=[])
+        result = grpo._pack_episodes([ep1, ep2])
+        mx.eval(result['obs'], result['act'])
+
+        assert result['act'].ndim == 2, f"Expected 2D act, got {result['act'].ndim}D"
+        assert result['act'].shape == (2, 0), f"Expected (2, 0), got {result['act'].shape}"
+        assert result['obs'].ndim == 2, f"Expected 2D obs, got {result['obs'].ndim}D"
+        assert result['obs'].shape[0] == 2, "Expected 2 episode rows"
+        assert result['episode_lengths'] == [0, 0]
+        assert result['prompt_lengths'] == [2, 2]
+
+
+# ===========================================================================
+# 4b. Batched logprob recomputation with empty-response episode (Issue #27)
+# ===========================================================================
+
+@pytest.mark.unit
+@pytest.mark.regression
+class TestRegressionBatchedLogprobEmptyEpisode:
+    """Lock down the [non-empty, empty, non-empty] round-trip through
+    _pack_episodes → compute_logprobs_batched.
+
+    This is the exact failure path from PR #33 review: _pack_episodes
+    used to drop empty-act rows before stacking, causing a shape
+    mismatch in compute_logprobs_batched (response_tokens had fewer
+    rows than full_sequences). The fix pads all episodes including
+    empty ones and skips them via r_len == 0.
+
+    This test exercises the full round-trip, not just _pack_episodes
+    structure or just the Trainer path individually.
+    """
+
+    @staticmethod
+    def _make_model():
+        model = _TinyLM()
+        mx.eval(model.parameters())
+        return model
+
+    def test_pack_then_batched_logprobs_with_empty_middle_episode(self):
+        """[non-empty, empty, non-empty] round-trip produces correct flat 1D logprobs."""
+        from textpolicy.generation.mlx_generation import (
+            compute_logprobs,
+            compute_logprobs_batched,
+        )
+
+        model = self._make_model()
+
+        ep1 = SimpleNamespace(obs=[[1, 2, 3]], act=[[4, 5]], rew=[1.0], logprob=[-0.5, -0.6])
+        ep2 = SimpleNamespace(obs=[[6, 7]], act=[], rew=[0.0], logprob=[])
+        ep3 = SimpleNamespace(obs=[[8, 9]], act=[[10, 11, 12]], rew=[0.5], logprob=[-0.3, -0.4, -0.7])
+
+        batch = grpo._pack_episodes([ep1, ep2, ep3])
+
+        # Structural: all tensors must have 3 rows (one per episode)
+        assert batch['obs'].shape[0] == 3, f"obs has {batch['obs'].shape[0]} rows, want 3"
+        assert batch['act'].shape[0] == 3, f"act has {batch['act'].shape[0]} rows, want 3"
+        assert len(batch['prompt_lengths']) == 3
+        assert len(batch['episode_lengths']) == 3
+        assert batch['episode_lengths'] == [2, 0, 3]
+
+        # Batched logprobs via the same path Trainer uses
+        batched = compute_logprobs_batched(
+            model, batch['obs'], batch['act'],
+            batch['prompt_lengths'], batch['episode_lengths'],
+        )
+        mx.eval(batched)
+
+        # Must be flat 1D with length = sum of non-zero episode lengths
+        assert batched.ndim == 1
+        assert batched.shape[0] == 5, f"Expected 5 logprobs (2+0+3), got {batched.shape[0]}"
+
+        # Numerical parity: must match sequential per-episode compute_logprobs
+        seq1 = compute_logprobs(model, mx.array([1, 2, 3]), mx.array([4, 5]))
+        seq3 = compute_logprobs(model, mx.array([8, 9]), mx.array([10, 11, 12]))
+        sequential = mx.concatenate([seq1, seq3])
+        mx.eval(sequential)
+
+        assert mx.allclose(batched, sequential, atol=1e-5).item(), (
+            f"Batched {batched.tolist()} != sequential {sequential.tolist()}"
+        )
+
+        # Validity: all logprobs must be finite and non-positive
+        assert not mx.any(mx.isnan(batched)).item(), "NaN in logprobs"
+        assert not mx.any(mx.isinf(batched)).item(), "Inf in logprobs"
+        assert mx.all(batched <= 0).item(), f"Positive logprobs: {batched.tolist()}"
+
+    def test_all_empty_responses_round_trip(self):
+        """All-empty-response batch must not crash through batched logprob path.
+
+        Regression: when max_act_len == 0, _pack_episodes produced (0,) 1D
+        act tensor, causing the trainer to fall to the flat 1D path and crash
+        with 'sequence length mismatch'. The fix produces (N, 0) 2D so the
+        batched path is entered and all episodes are skipped via r_len == 0.
+        """
+        from textpolicy.generation.mlx_generation import compute_logprobs_batched
+
+        model = self._make_model()
+
+        ep1 = SimpleNamespace(obs=[[1, 2]], act=[], rew=[0.0], logprob=[])
+        ep2 = SimpleNamespace(obs=[[3, 4]], act=[], rew=[0.0], logprob=[])
+        ep3 = SimpleNamespace(obs=[[5, 6]], act=[], rew=[0.0], logprob=[])
+
+        batch = grpo._pack_episodes([ep1, ep2, ep3])
+
+        # Structural: 2D tensors with correct row count
+        assert batch['act'].ndim == 2, f"act must be 2D, got {batch['act'].ndim}D"
+        assert batch['act'].shape == (3, 0)
+        assert batch['episode_lengths'] == [0, 0, 0]
+
+        # Round-trip through compute_logprobs_batched — must not crash
+        batched = compute_logprobs_batched(
+            model, batch['obs'], batch['act'],
+            batch['prompt_lengths'], batch['episode_lengths'],
+        )
+        mx.eval(batched)
+
+        # Must return empty flat 1D (no response tokens to compute)
+        assert batched.shape == (0,), f"Expected empty logprobs, got shape {batched.shape}"
 
 
 # ===========================================================================

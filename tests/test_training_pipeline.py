@@ -295,7 +295,7 @@ class TestAdvantageExpansion:
             'rewards': mx.array([1.0, 0.5]),
             'episode_lengths': [3, 3],  # sum=6, but 7 tokens
         }
-        with pytest.raises(ValueError, match="does not match total_tokens"):
+        with pytest.raises(ValueError, match="does not match sum\\(episode_lengths\\)"):
             trainer._loss_fn(batch_data)
 
 
@@ -343,7 +343,7 @@ class TestExtractGrpoLogprobs2D:
         obs = mx.array([[1, 2, 3, 4], [5, 6, 7, 8], [9, 10, 11, 12]])
         act = mx.array([[1, 2, 3, 4, 5], [6, 7, 8, 9, 10], [11, 12, 13, 14, 15]])
         old_lp = mx.zeros(num_episodes * response_len)
-        ep_lengths = [1] * num_episodes
+        ep_lengths = [response_len] * num_episodes
 
         result = trainer._extract_grpo_logprobs(obs, act, old_lp, ep_lengths)
         mx.eval(result)
@@ -359,7 +359,7 @@ class TestExtractGrpoLogprobs2D:
         obs = mx.array([[1, 2, 3], [7, 8, 9]])
         act = mx.array([[4, 5, 6, 7], [10, 11, 12, 13]])
         old_lp = mx.zeros(8)
-        ep_lengths = [1, 1]
+        ep_lengths = [4, 4]
 
         result = trainer._extract_grpo_logprobs(obs, act, old_lp, ep_lengths)
         mx.eval(result)
@@ -381,7 +381,7 @@ class TestExtractGrpoLogprobs2D:
         obs = mx.array([[1, 2, 3], [10, 11, 12]])
         act = mx.array([[4, 5], [13, 14]])
         old_lp = mx.zeros(4)
-        ep_lengths = [1, 1]
+        ep_lengths = [2, 2]
 
         result = trainer._extract_grpo_logprobs(obs, act, old_lp, ep_lengths)
         mx.eval(result)
@@ -404,7 +404,7 @@ class TestExtractGrpoLogprobs2D:
         obs = mx.array([[1, 2, 3], [7, 8, 9]])
         act = mx.array([[4, 5, 6], [10, 11, 12]])
         old_lp = mx.zeros(6)
-        ep_lengths = [1, 1]
+        ep_lengths = [3, 3]
 
         result = trainer._extract_grpo_logprobs(obs, act, old_lp, ep_lengths)
         mx.eval(result)
@@ -427,7 +427,7 @@ class TestExtractGrpoLogprobs2D:
         obs = mx.array([[1, 2, 3]])
         act = mx.array([[5, 6]])
         old_lp = mx.zeros(2)
-        ep_lengths = [1]
+        ep_lengths = [2]
 
         result = trainer._extract_grpo_logprobs(obs, act, old_lp, ep_lengths)
         mx.eval(result)
@@ -435,6 +435,246 @@ class TestExtractGrpoLogprobs2D:
         assert result.ndim == 1
         assert result.shape[0] == 2
         assert mx.all(result <= 0).item()
+
+
+@pytest.mark.unit
+class TestExtractGrpoLogprobsBatched:
+    """Tests for the batched path in _extract_grpo_logprobs.
+
+    The batched path uses compute_logprobs_batched (single model forward pass)
+    instead of N sequential compute_logprobs calls. It is triggered when
+    prompt_lengths is provided alongside 2D observations.
+
+    Hypotheses:
+        H1: Batched output matches sequential compute_logprobs per episode
+        H2: Single episode (degenerate case)
+        H3: Variable prompt/response lengths with padding
+        H4: Output is flat 1D with shape[0] == sum(episode_lengths)
+        H5: All logprobs are valid (no NaN/Inf, all <= 0)
+    """
+
+    def _make_model(self, vocab_size=16, dim=8):
+        class TinyLM(nn.Module):
+            def __init__(self):
+                super().__init__()
+                self.embed = nn.Embedding(vocab_size, dim)
+                self.head = nn.Linear(dim, vocab_size)
+            def __call__(self, x):
+                return self.head(self.embed(x))
+
+        model = TinyLM()
+        mx.eval(model.parameters())
+        return model
+
+    def _make_trainer(self, model):
+        from textpolicy.training import Trainer
+        from textpolicy.algorithms import grpo
+        return Trainer(
+            model=model,
+            loss_fn=grpo.policy_loss,
+            optimizer=optim.Adam(learning_rate=1e-3),
+            advantage_fn=grpo.compute_advantages,
+            compile_training=False,
+        )
+
+    def test_batched_matches_sequential(self):
+        """H1: Batched output matches sequential compute_logprobs per episode."""
+        from textpolicy.generation.mlx_generation import compute_logprobs
+
+        model = self._make_model()
+        trainer = self._make_trainer(model)
+
+        # 2 episodes: prompt_len=3, response_len=2 (uniform)
+        prompt1 = mx.array([1, 2, 3])
+        resp1 = mx.array([4, 5])
+        prompt2 = mx.array([7, 8, 9])
+        resp2 = mx.array([10, 11])
+
+        # Build 2D obs: full_sequence = prompt + response, right-padded
+        obs = mx.stack([mx.concatenate([prompt1, resp1]),
+                        mx.concatenate([prompt2, resp2])])  # [2, 5]
+        act = mx.stack([resp1, resp2])  # [2, 2]
+        old_lp = mx.zeros(4)
+        ep_lengths = [2, 2]
+        prompt_lengths = [3, 3]
+
+        # Batched path
+        batched = trainer._extract_grpo_logprobs(obs, act, old_lp, ep_lengths, prompt_lengths)
+        mx.eval(batched)
+
+        # Sequential reference
+        seq1 = compute_logprobs(model, prompt1, resp1)
+        seq2 = compute_logprobs(model, prompt2, resp2)
+        sequential = mx.concatenate([seq1, seq2])
+        mx.eval(sequential)
+
+        assert mx.allclose(batched, sequential, atol=1e-5).item(), (
+            f"Batched {batched.tolist()} != sequential {sequential.tolist()}"
+        )
+
+    def test_single_episode(self):
+        """H2: Single episode (degenerate case) produces valid output."""
+        model = self._make_model()
+        trainer = self._make_trainer(model)
+
+        obs = mx.array([[1, 2, 3, 5, 6]])  # [1, 5]
+        act = mx.array([[5, 6]])            # [1, 2]
+        old_lp = mx.zeros(2)
+        ep_lengths = [2]
+        prompt_lengths = [3]
+
+        result = trainer._extract_grpo_logprobs(obs, act, old_lp, ep_lengths, prompt_lengths)
+        mx.eval(result)
+
+        assert result.ndim == 1
+        assert result.shape[0] == 2
+        assert mx.all(result <= 0).item()
+
+    def test_variable_lengths_with_padding(self):
+        """H3: Variable prompt/response lengths with right-padding."""
+        from textpolicy.generation.mlx_generation import compute_logprobs
+
+        model = self._make_model()
+        trainer = self._make_trainer(model)
+
+        # ep1: prompt=3, response=2  → full_seq=5
+        # ep2: prompt=2, response=3  → full_seq=5
+        prompt1 = mx.array([1, 2, 3])
+        resp1 = mx.array([4, 5])
+        prompt2 = mx.array([6, 7])
+        resp2 = mx.array([8, 9, 10])
+
+        full1 = mx.concatenate([prompt1, resp1])     # [5]
+        full2 = mx.concatenate([prompt2, resp2])      # [5]
+
+        obs = mx.stack([full1, full2])  # [2, 5]
+        # act: right-pad shorter response
+        act = mx.stack([mx.pad(resp1, (0, 1)), resp2])  # [2, 3]
+
+        old_lp = mx.zeros(5)
+        ep_lengths = [2, 3]
+        prompt_lengths = [3, 2]
+
+        batched = trainer._extract_grpo_logprobs(obs, act, old_lp, ep_lengths, prompt_lengths)
+        mx.eval(batched)
+
+        # Sequential reference
+        seq1 = compute_logprobs(model, prompt1, resp1)
+        seq2 = compute_logprobs(model, prompt2, resp2)
+        sequential = mx.concatenate([seq1, seq2])
+        mx.eval(sequential)
+
+        assert mx.allclose(batched, sequential, atol=1e-5).item(), (
+            f"Batched {batched.tolist()} != sequential {sequential.tolist()}"
+        )
+
+    def test_output_is_flat_1d(self):
+        """H4: Output is flat 1D with shape[0] == sum(episode_lengths)."""
+        model = self._make_model()
+        trainer = self._make_trainer(model)
+
+        obs = mx.array([[1, 2, 3, 4, 5], [6, 7, 8, 9, 10]])
+        act = mx.array([[4, 5], [9, 10]])
+        old_lp = mx.zeros(4)
+        ep_lengths = [2, 2]
+        prompt_lengths = [3, 3]
+
+        result = trainer._extract_grpo_logprobs(obs, act, old_lp, ep_lengths, prompt_lengths)
+        mx.eval(result)
+
+        assert result.ndim == 1
+        assert result.shape[0] == sum(ep_lengths)
+
+    def test_logprobs_are_valid(self):
+        """H5: All logprobs are valid (no NaN/Inf, all <= 0)."""
+        model = self._make_model()
+        trainer = self._make_trainer(model)
+
+        obs = mx.array([[1, 2, 3, 4, 5], [6, 7, 8, 9, 10]])
+        act = mx.array([[4, 5], [9, 10]])
+        old_lp = mx.zeros(4)
+        ep_lengths = [2, 2]
+        prompt_lengths = [3, 3]
+
+        result = trainer._extract_grpo_logprobs(obs, act, old_lp, ep_lengths, prompt_lengths)
+        mx.eval(result)
+
+        assert not mx.any(mx.isnan(result)).item(), "NaN in batched logprobs"
+        assert not mx.any(mx.isinf(result)).item(), "Inf in batched logprobs"
+        assert mx.all(result <= 0).item(), f"Positive logprobs: {result.tolist()}"
+
+    def test_empty_response_episode_in_middle(self):
+        """Regression: empty-act episode between non-empty ones must not crash.
+
+        Previously, _pack_episodes filtered out empty-act rows before stacking,
+        causing act.shape[0] < len(prompt_lengths). compute_logprobs_batched
+        then indexed out of bounds on the third episode.
+        """
+        from textpolicy.generation.mlx_generation import compute_logprobs
+        from textpolicy.algorithms.grpo import _pack_episodes
+        from types import SimpleNamespace
+
+        model = self._make_model()
+        trainer = self._make_trainer(model)
+
+        ep1 = SimpleNamespace(obs=[[1, 2, 3]], act=[[4, 5]], rew=[1.0], logprob=[-0.5, -0.6])
+        ep2 = SimpleNamespace(obs=[[6, 7]], act=[], rew=[0.0], logprob=[])
+        ep3 = SimpleNamespace(obs=[[8, 9]], act=[[10, 11, 12]], rew=[0.5], logprob=[-0.3, -0.4, -0.7])
+
+        batch = _pack_episodes([ep1, ep2, ep3])
+
+        # act must have same number of rows as obs / episode_lengths
+        assert batch['obs'].shape[0] == batch['act'].shape[0] == 3
+
+        result = trainer._extract_grpo_logprobs(
+            batch['obs'], batch['act'], batch['logprob'],
+            batch['episode_lengths'], batch['prompt_lengths'],
+        )
+        mx.eval(result)
+
+        assert result.ndim == 1
+        assert result.shape[0] == sum(batch['episode_lengths'])  # 2+0+3 = 5
+
+        # Verify against sequential (skip empty ep2)
+        seq1 = compute_logprobs(model, mx.array([1, 2, 3]), mx.array([4, 5]))
+        seq3 = compute_logprobs(model, mx.array([8, 9]), mx.array([10, 11, 12]))
+        sequential = mx.concatenate([seq1, seq3])
+        mx.eval(sequential)
+
+        assert mx.allclose(result, sequential, atol=1e-5).item(), (
+            f"Batched {result.tolist()} != sequential {sequential.tolist()}"
+        )
+
+    def test_all_empty_responses_loss_is_zero_not_nan(self):
+        """All-empty-response batch must produce loss=0.0, not nan.
+
+        Regression: mx.mean([]) returns nan in MLX. When every episode
+        has an empty response, policy_loss received empty arrays and
+        returned nan. The guard in _loss_fn short-circuits to 0.0.
+        """
+        from textpolicy.algorithms import grpo
+        from textpolicy.training import Trainer
+
+        model = self._make_model()
+        trainer = Trainer(
+            model=model,
+            loss_fn=grpo.policy_loss,
+            optimizer=optim.Adam(learning_rate=1e-3),
+            advantage_fn=grpo.compute_advantages,
+            compile_training=False,
+        )
+
+        batch = {
+            'obs': mx.array([[1, 2, 3], [4, 5, 6]], dtype=mx.int64),
+            'act': mx.zeros((2, 0), dtype=mx.int64),
+            'logprob': mx.array([], dtype=mx.float32),
+            'rewards': mx.array([0.0, 0.0]),
+            'episode_lengths': [0, 0],
+            'prompt_lengths': [3, 3],
+        }
+
+        metrics = trainer.train(batch)
+        assert metrics['loss'] == 0.0, f"Expected loss=0.0, got {metrics['loss']}"
 
 
 @pytest.mark.integration
