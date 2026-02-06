@@ -1044,10 +1044,25 @@ def compute_metrics(
 # --- Episode Packing Helper ---
 def _flatten_tokens(items: List[Any]) -> List:
     """Flatten nested token sequences into a flat list."""
+    if items is None:
+        return []
+
+    # Allow passing a bare array/scalar as a single token container.
+    if hasattr(items, 'tolist'):
+        values = items.tolist()
+        return values if isinstance(values, list) else [values]
+
+    if not isinstance(items, list):
+        return [items]
+
     flattened = []
     for item in items:
         if hasattr(item, 'tolist'):  # MLX array
-            flattened.extend(item.tolist())
+            values = item.tolist()
+            if isinstance(values, list):
+                flattened.extend(values)
+            else:
+                flattened.append(values)
         elif isinstance(item, list):  # Python list
             flattened.extend(item)
         else:  # Single token

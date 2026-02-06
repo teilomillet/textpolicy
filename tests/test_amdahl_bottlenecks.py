@@ -218,6 +218,24 @@ class TestPackEpisodesRewards:
         assert result['logprob'].shape == (4,)
         assert np.allclose(result['logprob'].tolist(), [-0.5, -0.4, -0.3, -0.2], atol=1e-6)
 
+    def test_logprobs_flattened_when_dict_logprob_is_direct_array(self):
+        from textpolicy.algorithms.grpo import _pack_episodes
+
+        episodes = [{
+            'obs': [[11, 12]],
+            'act': [[21, 22, 23]],
+            'rew': [1.0],
+            'next_obs': [[0]],
+            'done': [True],
+            'timeout': [False],
+            'logprob': mx.array([-0.7, -0.6, -0.5]),
+        }]
+        result = _pack_episodes(episodes)
+
+        assert result['episode_lengths'] == [3]
+        assert result['logprob'].shape == (3,)
+        assert np.allclose(result['logprob'].tolist(), [-0.7, -0.6, -0.5], atol=1e-6)
+
     def test_empty_episodes(self):
         from textpolicy.algorithms.grpo import _pack_episodes
 

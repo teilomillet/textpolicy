@@ -53,7 +53,9 @@ class RolloutRunner:
             self.strategy = strategy
             
         self.max_steps = max_steps
-        self.buffer = Buffer(max_episodes=10)
+        # Ensure a single collect() call can retain all completed episodes.
+        self._buffer_capacity = max(10, max_steps)
+        self.buffer = Buffer(max_episodes=self._buffer_capacity)
         self.step_count = 0  # Track total steps collected for test compatibility
 
     def _normalize_step_result(self, step_result):
@@ -69,12 +71,39 @@ class RolloutRunner:
                 "Environment.step must return a dict with keys: observation, reward, "
                 "terminated, truncated, info. Tuple returns are not supported."
             )
+
+        required_keys = {"observation", "reward", "terminated", "truncated", "info"}
+        missing = sorted(required_keys - set(step_result.keys()))
+        if missing:
+            raise KeyError(
+                f"Environment.step result is missing required keys: {missing}"
+            )
+
+        # Allow numpy.bool_ when numpy is available, while enforcing boolean semantics.
+        bool_types = (bool,)
+        try:
+            import numpy as np
+            bool_types = (bool, np.bool_)
+        except Exception:
+            pass
+
+        terminated = step_result["terminated"]
+        truncated = step_result["truncated"]
+        info = step_result["info"]
+
+        if not isinstance(terminated, bool_types) or not isinstance(truncated, bool_types):
+            raise TypeError(
+                "Environment.step keys 'terminated' and 'truncated' must be booleans."
+            )
+        if not isinstance(info, dict):
+            raise TypeError("Environment.step key 'info' must be a dict.")
+
         return (
-            step_result.get("observation"),
-            step_result.get("reward"),
-            step_result.get("terminated"),
-            step_result.get("truncated"),
-            step_result.get("info", {}),
+            step_result["observation"],
+            step_result["reward"],
+            bool(terminated),
+            bool(truncated),
+            info,
         )
 
     def collect(self) -> Buffer:
@@ -90,6 +119,10 @@ class RolloutRunner:
         Returns:
             Buffer containing collected episodes
         """
+        # Use a fresh buffer per collect() so repeated calls do not leak or mutate
+        # previously returned buffers.
+        self.buffer = Buffer(max_episodes=self._buffer_capacity)
+
         reset_result = self.env.reset()
         if isinstance(reset_result, tuple):
             obs, _ = reset_result
