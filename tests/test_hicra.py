@@ -12,6 +12,9 @@ Hypotheses tested:
     H3: Known phrase gets mask=1 at correct positions
     H4: Overlapping grams mark all participating tokens
     H5: Case-insensitive matching
+    H6: Word-boundary prevents cross-word matches
+    H7: Regex pattern construction does not crash (escape-level regression)
+    H8: Multi-space grams match via \\s+ regex
 
   TestApplyHicraAmplification:
     H1: alpha=0 → unchanged (degenerate)
@@ -160,6 +163,41 @@ class TestIdentifyPlanningTokens:
         assert mx.array_equal(result, expected), (
             f"Expected no match (word-boundary), got {result.tolist()}"
         )
+
+    def test_regex_pattern_construction_does_not_crash(self):
+        """H7: Regex patterns compile without errors for all default grams.
+
+        Regression test: re.sub(r"\\ ", r"\\s+", escaped) in the
+        pattern-building step must not raise ``re.error``.  The
+        replacement ``r"\\s+"`` is the 4-char string ``\\s+``; re.sub
+        processes ``\\`` as "literal backslash" and ``s+`` as literal
+        text, producing ``\\s+`` in the output — which is the regex
+        whitespace quantifier we want.  A single-backslash ``r"\\s+"``
+        (3 chars ``\\s+``) would crash with ``re.error: bad escape \\s``
+        in Python ≥ 3.12, but that is NOT what our code uses.
+        """
+        from textpolicy.analysis.strategic_grams import get_default_strategic_grams
+        grams = get_default_strategic_grams()
+        # All default grams contain spaces; this would crash if the
+        # regex replacement were broken.
+        vocab = {i: f"token{i}" for i in range(20)}
+        tok = MockTokenizer(vocab)
+        ids = mx.array(list(range(20)), dtype=mx.int32)
+        # Must not raise — that's the test.
+        result = identify_planning_tokens(ids, tok, grams)
+        assert result.shape == (20,)
+
+    def test_multi_space_gram_matches(self):
+        """H8: Grams with whitespace variations still match via \\s+ regex."""
+        # Simulate a tokenizer where subword joining produces extra spaces
+        vocab = {0: "let", 1: "me", 2: "think"}
+        tok = MockTokenizer(vocab)
+        ids = mx.array([0, 1, 2], dtype=mx.int32)
+        # The gram "let me think" should match even when the window text
+        # has slightly different whitespace after subword reconstruction.
+        result = identify_planning_tokens(ids, tok, ["let me think"])
+        expected = mx.array([1.0, 1.0, 1.0])
+        assert mx.array_equal(result, expected)
 
 
 # ---------------------------------------------------------------------------

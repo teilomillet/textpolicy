@@ -93,6 +93,17 @@ def identify_planning_tokens(
 
     # Pre-compile word-boundary regex for each gram so that e.g.
     # "key insight" does not match inside "monkey insight".
+    #
+    # Escape-level note (why r"\\s+" is correct here):
+    #   re.escape("let me") → 'let\\ me'   (backslash-space between words)
+    #   re.sub(r"\\ ", r"\\s+", ...)        (replace backslash-space with \s+)
+    #     - replacement r"\\s+" is the 4-char string: \, \, s, +
+    #     - re.sub processes \\ as "emit literal backslash", then s+ as literal
+    #     - output: \s+  (the regex whitespace-run quantifier)
+    #   Final pattern: \blet\s+me\b
+    #
+    # A single-backslash replacement r"\s+" (3 chars) would crash with
+    # re.error in Python ≥ 3.12, but that is NOT what this code does.
     gram_patterns = []
     for g in strategic_grams:
         escaped = re.escape(g.lower())

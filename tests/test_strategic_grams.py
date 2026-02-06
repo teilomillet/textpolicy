@@ -142,6 +142,38 @@ class TestDocumentFrequency:
         df = compute_document_frequency(docs, ["let me think"])
         assert df["let me think"] == 1.0
 
+    def test_word_boundary_no_substring_match(self):
+        """Grams must match on word boundaries, not as substrings.
+
+        "let me" must NOT match inside "outlet member".
+        """
+        docs = ["outlet member thinking"]
+        df = compute_document_frequency(docs, ["let me"])
+        assert df["let me"] == 0.0, (
+            "Substring match inside 'outlet member' is a false positive"
+        )
+
+    def test_regex_pattern_does_not_crash(self):
+        """Regression: re.sub replacement string must not crash.
+
+        The pattern-building step uses ``re.sub(r"\\\\ ", r"\\\\s+", escaped)``
+        where ``r"\\\\s+"`` is the 4-char string ``\\\\s+``.  In re.sub
+        replacement processing, ``\\\\`` → literal backslash, ``s+`` →
+        literal text, producing the regex quantifier ``\\s+``.
+
+        This would crash with ``re.error: bad escape \\s`` if the
+        replacement were the 3-char ``r"\\s+"`` instead, but our code
+        uses the correct double-backslash form.
+        """
+        # Use all default grams (all multi-word, all contain spaces)
+        grams = get_default_strategic_grams()
+        docs = ["let me think about it and try another approach"]
+        # Must not raise — that's the primary assertion
+        df = compute_document_frequency(docs, grams)
+        # Also verify at least some grams are found
+        found = [g for g in grams if df[g] > 0]
+        assert len(found) > 0, "Expected at least one default gram to match"
+
 
 # ---------------------------------------------------------------------------
 # TestLoadGenerations

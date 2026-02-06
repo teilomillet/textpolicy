@@ -128,8 +128,16 @@ def compute_document_frequency(
     df: Dict[str, float] = {}
     for gram in ngrams:
         gram_lower = gram.lower()
-        # Word-boundary regex: escape the gram, then replace whitespace
-        # runs with \s+ so "let  me" still matches "let me".
+        # Word-boundary regex: escape the gram, then replace the
+        # literal "\ " (backslash-space) that re.escape inserts between
+        # words with \s+ so "let  me" still matches "let me".
+        #
+        # Escape-level note (why r"\\s+" is correct here):
+        #   replacement r"\\s+" is the 4-char string: \, \, s, +
+        #   re.sub processes \\ as "emit literal backslash", then s+
+        #   as literal text → output is \s+ (regex whitespace quantifier).
+        #   A single-backslash r"\s+" (3 chars) would crash with
+        #   re.error in Python ≥ 3.12, but that is NOT what this uses.
         escaped = re.escape(gram_lower)
         escaped = re.sub(r"\\ ", r"\\s+", escaped)
         pattern = re.compile(rf"\b{escaped}\b", re.IGNORECASE)
