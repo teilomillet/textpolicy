@@ -690,7 +690,19 @@ def compute_logprobs_batched(
     if not per_episode:
         return mx.array([], dtype=mx.float32)
 
-    return mx.concatenate(per_episode)
+    result = mx.concatenate(per_episode)
+
+    # Sanitize NaN/Inf — compile-safe (no Python branching on array
+    # values).  Matches the handling in compute_logprobs(_compiled=True)
+    # and _default_get_logprobs so all three extraction paths behave
+    # consistently.
+    result = mx.where(
+        mx.isnan(result) | mx.isinf(result),
+        mx.array(-1e6, dtype=result.dtype),
+        result,
+    )
+
+    return result
 
 
 ##############################################################################
