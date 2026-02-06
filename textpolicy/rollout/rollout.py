@@ -4,6 +4,8 @@ Main rollout coordinator and public interface.
 """
 
 from typing import List, Callable, Any
+import queue
+import time
 from .worker import RolloutWorker
 from .runner import RolloutRunner
 from .aggregator import BufferAggregator
@@ -97,13 +99,33 @@ class RolloutCoordinator:
     
     def _collect_multiprocess(self) -> Buffer:
         """Collect data using multiple worker processes."""
+        # Drop stale queue items so this call returns only fresh rollout data.
+        for worker in self.workers:
+            try:
+                while True:
+                    worker.send_queue.get_nowait()
+            except queue.Empty:
+                pass
+
+        # Return only data collected for this request.
+        self.aggregator.clear()
+
         # Request rollouts from all workers
         for worker in self.workers:
             worker.collect_async()
-        
-        # Wait for and consume results
-        while not self.aggregator.ready(min_episodes=self.num_workers):
-            self.aggregator.consume_all()
+
+        # Wait for and consume exactly one fresh result per worker.
+        pending_workers = set(range(self.num_workers))
+        while pending_workers:
+            progressed = False
+            for wid in tuple(pending_workers):
+                queue_ref = self.aggregator._worker_queues[wid]
+                if queue_ref is not None and not queue_ref.empty():
+                    self.aggregator.consume_from_worker(wid)
+                    pending_workers.remove(wid)
+                    progressed = True
+            if not progressed:
+                time.sleep(0.001)
         
         # Return aggregated buffer
         # Note: In practice, trainer would manage this more carefully

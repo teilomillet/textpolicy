@@ -57,6 +57,62 @@ class _ScalarObsOnlyResetEnv:
         }
 
 
+class _MissingKeysEnv:
+    def reset(self):
+        return 0, {}
+
+    def step(self, action):
+        # Missing required keys: terminated, truncated, info
+        return {
+            "observation": 0,
+            "reward": 1.0,
+        }
+
+
+class _NonBoolTerminatedEnv:
+    def reset(self):
+        return 0, {}
+
+    def step(self, action):
+        return {
+            "observation": 0,
+            "reward": 1.0,
+            "terminated": 1,  # invalid type
+            "truncated": False,
+            "info": {},
+        }
+
+
+class _CounterRewardDoneEnv:
+    def __init__(self):
+        self.reward_counter = 0
+
+    def reset(self):
+        return 0, {}
+
+    def step(self, action):
+        self.reward_counter += 1
+        return {
+            "observation": 0,
+            "reward": float(self.reward_counter),
+            "terminated": True,
+            "truncated": False,
+            "info": {},
+        }
+
+
+def _counter_reward_env_fn():
+    return _CounterRewardDoneEnv()
+
+
+def _counter_policy_fn():
+    def policy(obs, deterministic=False):
+        import mlx.core as mx
+        return mx.array(0), {}
+
+    return policy
+
+
 def _policy(obs, deterministic=False):
     # Return scalar action as MLX array substitute (runner only inspects ndim)
     import mlx.core as mx
@@ -119,6 +175,36 @@ def test_runner_collect_accepts_dict_step():
     assert len(buf.episodes) >= 0  # episodes may be reset; ensure call succeeds
 
 
+def test_runner_collect_rejects_missing_required_step_keys():
+    from textpolicy.rollout.runner import RolloutRunner
+    from textpolicy.rollout.strategy import create_strategy
+
+    runner = RolloutRunner(
+        _MissingKeysEnv(),
+        policy=_policy,
+        strategy=create_strategy("grpo"),
+        max_steps=1,
+    )
+
+    with pytest.raises(KeyError, match="missing required keys"):
+        runner.collect()
+
+
+def test_runner_collect_rejects_non_bool_terminated_truncated():
+    from textpolicy.rollout.runner import RolloutRunner
+    from textpolicy.rollout.strategy import create_strategy
+
+    runner = RolloutRunner(
+        _NonBoolTerminatedEnv(),
+        policy=_policy,
+        strategy=create_strategy("grpo"),
+        max_steps=1,
+    )
+
+    with pytest.raises(TypeError, match="must be booleans"):
+        runner.collect()
+
+
 def test_runner_collect_single_step_uses_single_observation_shape():
     from textpolicy.rollout.runner import RolloutRunner
     from textpolicy.rollout.strategy import create_strategy
@@ -129,6 +215,30 @@ def test_runner_collect_single_step_uses_single_observation_shape():
 
     buf = runner.collect()
     assert len(buf.episodes) == 1
+
+
+def test_runner_collect_repeated_calls_return_fresh_buffer_and_data():
+    from textpolicy.rollout.runner import RolloutRunner
+    from textpolicy.rollout.strategy import create_strategy
+
+    env = _CounterRewardDoneEnv()
+    runner = RolloutRunner(
+        env,
+        policy=_policy,
+        strategy=create_strategy("grpo"),
+        max_steps=3,
+    )
+
+    buf1 = runner.collect()
+    rewards1 = [float(ep.rew[0]) for ep in buf1.episodes]
+
+    buf2 = runner.collect()
+    rewards2 = [float(ep.rew[0]) for ep in buf2.episodes]
+
+    assert buf1 is not buf2
+    assert rewards1 == [1.0, 2.0, 3.0]
+    assert rewards2 == [4.0, 5.0, 6.0]
+    assert [float(ep.rew[0]) for ep in buf1.episodes] == [1.0, 2.0, 3.0]
 
 
 def test_runner_collect_honors_max_steps_and_progresses_observations():
@@ -185,3 +295,27 @@ def test_runner_collect_does_not_drop_episodes_when_max_steps_exceeds_10():
 
     buf = runner.collect()
     assert len(buf.episodes) == max_steps
+
+
+@pytest.mark.integration
+def test_rollout_coordinator_multiprocess_collect_returns_fresh_batches():
+    from textpolicy.rollout.rollout import RolloutCoordinator
+
+    coordinator = RolloutCoordinator(
+        env_fn=_counter_reward_env_fn,
+        policy_fn=_counter_policy_fn,
+        algorithm="grpo",
+        num_workers=1,
+        max_steps=3,
+    )
+    try:
+        batch1 = coordinator.collect()
+        rewards1 = [float(ep.rew[0]) for ep in batch1.episodes]
+
+        batch2 = coordinator.collect()
+        rewards2 = [float(ep.rew[0]) for ep in batch2.episodes]
+    finally:
+        coordinator.close()
+
+    assert rewards1 == [1.0, 2.0, 3.0]
+    assert rewards2 == [4.0, 5.0, 6.0]
