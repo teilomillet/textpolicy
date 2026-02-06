@@ -46,6 +46,32 @@ class TestGTPODegenerateCases:
         assert mx.allclose(weighted, advantages, atol=1e-6), \
             "Uniform entropy should produce unchanged advantages"
 
+    def test_zero_entropy_equals_baseline(self):
+        """H1: All-zero entropy is uniform — should return advantages unchanged.
+
+        Regression test: without the early return, entropy_mean=0 causes
+        entropy_normalized = 0/(0+1e-8) ≈ 0, producing weight = 1-β = 0.9
+        instead of 1.0. Zero entropy means every token is equally confident;
+        there is no signal to redistribute.
+        """
+        advantages = mx.array([0.5, -0.3, 0.2, -0.1, 0.4])
+        zero_entropy = mx.array([0.0, 0.0, 0.0, 0.0, 0.0])
+
+        weighted = grpo.apply_entropy_weighting(advantages, zero_entropy, entropy_weight=0.1)
+
+        assert mx.allclose(weighted, advantages, atol=1e-6), \
+            "All-zero entropy (uniform) should produce unchanged advantages"
+
+    def test_near_zero_entropy_equals_baseline(self):
+        """Entropy values below threshold should also be treated as uniform."""
+        advantages = mx.array([0.5, -0.3, 0.2])
+        tiny_entropy = mx.array([1e-10, 1e-10, 1e-10])
+
+        weighted = grpo.apply_entropy_weighting(advantages, tiny_entropy, entropy_weight=0.5)
+
+        assert mx.allclose(weighted, advantages, atol=1e-6), \
+            "Near-zero uniform entropy should produce unchanged advantages"
+
     def test_beta_zero_equals_baseline(self):
         """H2: When β=0, entropy weighting is disabled."""
         advantages = mx.array([0.5, -0.3, 0.2, -0.1, 0.4])

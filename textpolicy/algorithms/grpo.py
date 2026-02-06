@@ -458,6 +458,13 @@ def apply_entropy_weighting(
 
     # Normalize entropy: H_norm(t) = H(t) / mean(H)
     entropy_mean = mx.mean(token_entropies)
+
+    # If mean entropy is effectively zero, all tokens are equally confident
+    # (or all entropies are zero). No meaningful signal to redistribute —
+    # return advantages unchanged to satisfy the uniform-entropy invariant.
+    if entropy_mean < 1e-7:
+        return advantages
+
     entropy_normalized = token_entropies / (entropy_mean + 1e-8)
 
     # GTPO weight: 1 + β * (H_norm - 1)
