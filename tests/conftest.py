@@ -122,10 +122,6 @@ def pytest_collection_modifyitems(config, items):
         if "reward" in item.nodeid.lower():
             item.add_marker(pytest.mark.reward)
         
-        # Add regression marker only to the dedicated regression harness file
-        if "test_regression_exact_output" in item.nodeid:
-            item.add_marker(pytest.mark.regression)
-
         # Add slow marker to tests that might be slow
         if "training" in item.nodeid.lower() or "integration" in item.nodeid.lower():
             item.add_marker(pytest.mark.slow)

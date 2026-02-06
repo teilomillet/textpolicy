@@ -12,6 +12,13 @@ Design:
     - Trainer tests → structural invariants only (TinyLM has random weights).
     - Tolerance: atol=1e-6 for pure functions, atol=1e-5 for compiled.
 
+Maintenance note:
+    Frozen float constants were captured on Apple Silicon with MLX 0.x /
+    float32. A major MLX version bump or a different hardware backend
+    could shift results beyond atol=1e-6.  If that happens, re-capture
+    the constants with the same script (see Issue #24) rather than
+    loosening tolerances blindly.
+
 Hypotheses per class:
     H1: Exact values match frozen constants
     H2: Compiled variants match non-compiled
@@ -96,6 +103,7 @@ _ADV_GSPO_2 = mx.array([0.5, -0.3], dtype=mx.float32)
 # ===========================================================================
 
 @pytest.mark.unit
+@pytest.mark.regression
 class TestRegressionGRPOAdvantages:
     """Freeze exact output of grpo.compute_advantages."""
 
@@ -138,6 +146,7 @@ class TestRegressionGRPOAdvantages:
 # ===========================================================================
 
 @pytest.mark.unit
+@pytest.mark.regression
 class TestRegressionGRPOPolicyLoss:
     """Freeze exact output of grpo.policy_loss under 3 normalization modes."""
 
@@ -214,6 +223,7 @@ class TestRegressionGRPOPolicyLoss:
 # ===========================================================================
 
 @pytest.mark.unit
+@pytest.mark.regression
 class TestRegressionEntropyWeighting:
     """Freeze exact output of grpo.apply_entropy_weighting."""
 
@@ -289,6 +299,7 @@ class TestRegressionEntropyWeighting:
 # ===========================================================================
 
 @pytest.mark.unit
+@pytest.mark.regression
 class TestRegressionPackEpisodes:
     """Freeze exact output of grpo._pack_episodes."""
 
@@ -343,6 +354,7 @@ class TestRegressionPackEpisodes:
 # ===========================================================================
 
 @pytest.mark.unit
+@pytest.mark.regression
 class TestRegressionGSPO:
     """Freeze exact output of gspo functions."""
 
@@ -425,6 +437,7 @@ class TestRegressionGSPO:
 # ===========================================================================
 
 @pytest.mark.unit
+@pytest.mark.regression
 class TestRegressionExpandAdvantages:
     """Freeze exact output of Trainer._expand_advantages."""
 
@@ -491,6 +504,7 @@ class TestRegressionExpandAdvantages:
 # ===========================================================================
 
 @pytest.mark.unit
+@pytest.mark.regression
 class TestRegressionTrainerLossFn:
     """Structural invariants for Trainer._loss_fn (random weights → no frozen values)."""
 
