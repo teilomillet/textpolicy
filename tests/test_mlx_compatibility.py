@@ -783,3 +783,73 @@ class TestLoRAWithMLX:
         assert callable(create_qlora_setup)
         assert callable(apply_quantization_to_model)
         assert callable(compute_lora_memory_savings)
+
+    def test_apply_quantization_to_model_supports_current_kwarg_names(self, monkeypatch):
+        """Ensure LoRA quantization supports mlx-lm's current group_size/bits kwargs."""
+        from textpolicy.generation.lora import apply_quantization_to_model
+
+        captured = {}
+        quantized_model = object()
+
+        def fake_quantize_model(
+            model, config, group_size=None, bits=None, mode="affine", quant_predicate=None
+        ):
+            captured.update(
+                {
+                    "model": model,
+                    "config": config,
+                    "group_size": group_size,
+                    "bits": bits,
+                    "quant_predicate": quant_predicate,
+                }
+            )
+            return quantized_model, {"ok": True}
+
+        monkeypatch.setattr("mlx_lm.utils.quantize_model", fake_quantize_model)
+
+        model = object()
+        config = {"arch": "dummy"}
+        out = apply_quantization_to_model(model=model, config=config, bits=4, group_size=64)
+        assert out is quantized_model
+        assert captured == {
+            "model": model,
+            "config": config,
+            "group_size": 64,
+            "bits": 4,
+            "quant_predicate": None,
+        }
+
+    def test_apply_quantization_to_model_supports_legacy_kwarg_names(self, monkeypatch):
+        """Ensure LoRA quantization still supports legacy q_group_size/q_bits kwargs."""
+        from textpolicy.generation.lora import apply_quantization_to_model
+
+        captured = {}
+        quantized_model = object()
+
+        def fake_quantize_model(
+            model, config, q_group_size=None, q_bits=None, quant_predicate=None
+        ):
+            captured.update(
+                {
+                    "model": model,
+                    "config": config,
+                    "q_group_size": q_group_size,
+                    "q_bits": q_bits,
+                    "quant_predicate": quant_predicate,
+                }
+            )
+            return quantized_model, {"ok": True}
+
+        monkeypatch.setattr("mlx_lm.utils.quantize_model", fake_quantize_model)
+
+        model = object()
+        config = {"arch": "dummy"}
+        out = apply_quantization_to_model(model=model, config=config, bits=6, group_size=128)
+        assert out is quantized_model
+        assert captured == {
+            "model": model,
+            "config": config,
+            "q_group_size": 128,
+            "q_bits": 6,
+            "quant_predicate": None,
+        }
