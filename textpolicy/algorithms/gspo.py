@@ -11,6 +11,86 @@ import mlx.core as mx
 from typing import List, Dict
 
 
+def _segment_indices(sequence_lengths: List[int]):
+    """
+    Compute segment boundary indices from sequence lengths.
+
+    Returns integer-typed start/end index arrays suitable for cumsum-based
+    gather. Factored out so callers that need segment sums for multiple arrays
+    over the same segmentation (e.g. old_logprobs and new_logprobs) can compute
+    the indices once.
+
+    Args:
+        sequence_lengths: Length of each segment
+
+    Returns:
+        (starts, ends) — both int32 arrays of shape [num_segments],
+        or (None, None) when the input is empty.
+    """
+    if not sequence_lengths:
+        return None, None
+    lengths = mx.array([int(x) for x in sequence_lengths], dtype=mx.int32)
+    ends = mx.cumsum(lengths)
+    starts = mx.concatenate([mx.array([0], dtype=mx.int32), ends[:-1]])
+    return starts, ends
+
+
+def _segment_sums(values: mx.array, sequence_lengths: List[int],
+                  _precomputed=None) -> mx.array:
+    """
+    Compute per-segment sums of a flat 1D array using cumsum indexing.
+
+    Avoids Python loops and GPU-CPU synchronization — all operations stay on device.
+
+    Args:
+        values: Flat 1D array [total_tokens]
+        sequence_lengths: Length of each segment
+        _precomputed: Optional (starts, ends) from _segment_indices to avoid
+            recomputing indices when summing multiple arrays over the same
+            segmentation.
+
+    Returns:
+        Sum of each segment [num_segments]. Empty input returns shape-(0,).
+    """
+    if _precomputed is not None:
+        starts, ends = _precomputed
+    else:
+        starts, ends = _segment_indices(sequence_lengths)
+    if starts is None:
+        return mx.array([], dtype=mx.float32)
+    cs = mx.concatenate([mx.array([0.0]), mx.cumsum(values)])
+    return cs[ends] - cs[starts]
+
+
+def _expand_to_token_level(values: mx.array, sequence_lengths: List[int]) -> mx.array:
+    """
+    Expand episode-level values to token-level via repeat.
+
+    Matches the pattern used in Trainer._expand_advantages (trainer.py:538-550)
+    and grpo.py:569-577. Zero GPU-CPU sync barriers.
+
+    Args:
+        values: Episode-level array [num_episodes]
+        sequence_lengths: Length of each episode
+
+    Returns:
+        Token-level array [total_tokens]. Empty input returns shape-(0,).
+    """
+    if not sequence_lengths:
+        return mx.array([], dtype=values.dtype)
+    # Filter out zero-length episodes (they contribute no tokens)
+    nonzero = [(i, l) for i, l in enumerate(sequence_lengths) if l > 0]
+    if not nonzero:
+        return mx.array([], dtype=values.dtype)
+    indices, lengths_nz = zip(*nonzero)
+    if len(set(lengths_nz)) == 1:
+        return mx.repeat(values[list(indices)], lengths_nz[0])
+    parts = []
+    for i, length in nonzero:
+        parts.append(mx.repeat(values[i:i+1], length))
+    return mx.concatenate(parts)
+
+
 def compute_sequence_importance_weights(
     old_logprobs: mx.array,
     new_logprobs: mx.array,
@@ -19,69 +99,56 @@ def compute_sequence_importance_weights(
 ) -> mx.array:
     """
     Compute sequence-level importance weights for GSPO.
-    
+
     GSPO formula: w^GSPO_{i} = [π_θ(y_i | x) / π_θ_old(y_i | x)]^(1/|y_i|)
-    
+
     This normalizes by sequence length to prevent bias toward shorter/longer sequences.
-    
+
+    Uses vectorized cumsum-based segment sums — zero Python loops, zero GPU-CPU
+    synchronization barriers per sequence.
+
     Args:
-        old_logprobs: Log probabilities from rollout collection [batch_size, seq_len]
-        new_logprobs: Log probabilities from current policy [batch_size, seq_len]  
+        old_logprobs: Log probabilities from rollout collection [total_tokens]
+        new_logprobs: Log probabilities from current policy [total_tokens]
         sequence_lengths: Length of each sequence in the batch
-        
+
     Returns:
-        Sequence-level importance weights [batch_size]
-        
+        Sequence-level importance weights [num_sequences]
+
     Compared to token-level sampling, this reduces variance and matches
     sequence-level reward assignment.
     """
-    batch_size = len(sequence_lengths)
-    sequence_weights = []
-    
-    current_idx = 0
-    for seq_len in sequence_lengths:
-        # Extract logprobs for this sequence
-        seq_old_logprobs = old_logprobs[current_idx:current_idx + seq_len]
-        seq_new_logprobs = new_logprobs[current_idx:current_idx + seq_len]  # type: ignore
-        
-        # Compute sequence-level log probability: sum of token log probs
-        old_seq_logprob = mx.sum(seq_old_logprobs)
-        new_seq_logprob = mx.sum(seq_new_logprobs)
-        
-        # Sequence-level importance ratio: π_new(y|x) / π_old(y|x)
-        log_ratio = new_seq_logprob - old_seq_logprob
-        
-        # GSPO normalization: raise to power 1/|y_i| to prevent length bias
-        # This ensures sequences of different lengths contribute equally
-        normalized_log_ratio = log_ratio / seq_len
-        
-        # Clip in log space to prevent numerical explosion
-        # This is the key missing piece that was causing billion-scale importance weights
-        clipped_log_ratio = mx.clip(
-            normalized_log_ratio,
-            mx.log(mx.array(1 - clip_ratio)),  # log(0.8) ≈ -0.22
-            mx.log(mx.array(1 + clip_ratio))   # log(1.2) ≈ 0.18
-        )
-        
-        # Now safely compute importance weight (will be in range [0.8, 1.2])
-        importance_weight = mx.exp(clipped_log_ratio)
-        
-        # Final check: account for float32 precision
-        # exp(log(1.2)) in float32 may produce 1.2000000476837158; enforce exact bounds
-        importance_weight = mx.clip(importance_weight, 1.0 - clip_ratio, 1.0 + clip_ratio)
-        
-        # Enforce exact bounds using scalar comparisons
-        # Convert to float for comparison to avoid MLX array comparison issues
-        weight_float = float(importance_weight)
-        if weight_float > 1.0 + clip_ratio:
-            importance_weight = mx.array(1.0 + clip_ratio)
-        elif weight_float < 1.0 - clip_ratio:
-            importance_weight = mx.array(1.0 - clip_ratio)
-        
-        sequence_weights.append(importance_weight)
-        current_idx += seq_len
-    
-    return mx.array(sequence_weights)
+    if not sequence_lengths:
+        return mx.array([], dtype=mx.float32)
+
+    lengths = mx.array([int(x) for x in sequence_lengths], dtype=mx.float32)
+
+    # Compute segment indices once, reuse for both old and new logprobs
+    idx = _segment_indices(sequence_lengths)
+    old_sums = _segment_sums(old_logprobs, sequence_lengths, _precomputed=idx)
+    new_sums = _segment_sums(new_logprobs, sequence_lengths, _precomputed=idx)
+
+    # GSPO normalization: raise to power 1/|y_i| to prevent length bias
+    # Guard against zero-length sequences: use length=1 for division to avoid NaN,
+    # then overwrite those entries with weight 1.0 (a zero-token sequence has no
+    # probability mass, so the importance ratio is trivially 1).
+    zero_mask = lengths == 0
+    safe_lengths = mx.where(zero_mask, mx.ones_like(lengths), lengths)
+    log_ratios = (new_sums - old_sums) / safe_lengths
+
+    # Clip in log space to prevent numerical explosion
+    log_lower = mx.log(mx.array(1.0 - clip_ratio))  # log(0.8) ≈ -0.22
+    log_upper = mx.log(mx.array(1.0 + clip_ratio))  # log(1.2) ≈ 0.18
+    clipped_log_ratios = mx.clip(log_ratios, log_lower, log_upper)
+
+    # Exponentiate and enforce exact float32 bounds
+    # exp(log(1.2)) in float32 may produce 1.2000000476837158
+    weights = mx.clip(mx.exp(clipped_log_ratios), 1.0 - clip_ratio, 1.0 + clip_ratio)
+
+    # Zero-length sequences get weight 1.0 (identity)
+    weights = mx.where(zero_mask, mx.ones_like(weights), weights)
+
+    return weights
 
 
 def compute_hybrid_importance_weights(
@@ -115,35 +182,27 @@ def compute_hybrid_importance_weights(
     - Controlled variance through hyperparameter balance
     - Principled combination in log-space
     """
-    # Compute sequence-level log ratios (without exponential)
-    batch_size = len(sequence_lengths)
-    seq_log_ratios = []
-    
-    current_idx = 0
-    for seq_len in sequence_lengths:
-        # Extract logprobs for this sequence
-        seq_old_logprobs = old_logprobs[current_idx:current_idx + seq_len]
-        seq_new_logprobs = new_logprobs[current_idx:current_idx + seq_len]  # type: ignore
-        
-        # Compute sequence-level log probability: sum of token log probs
-        old_seq_logprob = mx.sum(seq_old_logprobs)
-        new_seq_logprob = mx.sum(seq_new_logprobs)
-        
-        # Sequence-level log ratio with GSPO normalization (prevent length bias)
-        log_ratio = new_seq_logprob - old_seq_logprob
-        normalized_seq_log_ratio = log_ratio / seq_len
-        
-        seq_log_ratios.append(normalized_seq_log_ratio)
-        current_idx += seq_len
-    
-    # Expand sequence-level log ratios to token level
-    token_seq_log_ratios = []
-    for i, seq_len in enumerate(sequence_lengths):
-        # Use stop gradient to prevent certain gradient flows
-        seq_log_ratio_sg = mx.stop_gradient(seq_log_ratios[i])
-        token_seq_log_ratios.extend([seq_log_ratio_sg] * seq_len)
-    
-    token_seq_log_ratios = mx.array(token_seq_log_ratios)
+    if not sequence_lengths:
+        return mx.array([], dtype=mx.float32)
+
+    # Compute segment indices once, reuse for both old and new logprobs
+    lengths = mx.array([int(x) for x in sequence_lengths], dtype=mx.float32)
+    idx = _segment_indices(sequence_lengths)
+    old_sums = _segment_sums(old_logprobs, sequence_lengths, _precomputed=idx)
+    new_sums = _segment_sums(new_logprobs, sequence_lengths, _precomputed=idx)
+
+    # Guard against zero-length sequences (same rationale as sequence weights)
+    zero_mask = lengths == 0
+    safe_lengths = mx.where(zero_mask, mx.ones_like(lengths), lengths)
+
+    # Sequence-level log ratio with GSPO normalization (prevent length bias)
+    seq_log_ratios = (new_sums - old_sums) / safe_lengths
+    seq_log_ratios = mx.where(zero_mask, mx.zeros_like(seq_log_ratios), seq_log_ratios)
+
+    # Expand sequence-level log ratios to token level with stop_gradient
+    token_seq_log_ratios = _expand_to_token_level(
+        mx.stop_gradient(seq_log_ratios), sequence_lengths
+    )
     
     # Compute token-level log ratios (with stop gradient on old logprobs)
     old_logprobs_sg = mx.stop_gradient(old_logprobs)
@@ -212,30 +271,24 @@ def gspo_policy_loss(
         importance_weights = compute_hybrid_importance_weights(
             old_logprobs, new_logprobs, sequence_lengths, alpha=alpha, beta=beta
         )
-        
+
         # Expand advantages to token level
-        token_advantages = []
-        for i, seq_len in enumerate(sequence_lengths):
-            token_advantages.extend([advantages[i]] * seq_len)
-        token_advantages = mx.array(token_advantages)
-        
+        token_advantages = _expand_to_token_level(advantages, sequence_lengths)
+
         # Apply PPO clipping to hybrid weights
         clipped_weights = mx.clip(importance_weights, 1 - clip_ratio, 1 + clip_ratio)
-        
+
         # Compute surrogate loss at token level
         surr1 = importance_weights * token_advantages
         surr2 = clipped_weights * token_advantages
         loss = -mx.mean(mx.minimum(surr1, surr2))
-        
+
     elif variant == "token":
         # Standard GRPO: token-level importance sampling (for comparison)
         ratio = mx.exp(new_logprobs - old_logprobs)
-        
+
         # Expand advantages to token level
-        token_advantages = []
-        for i, seq_len in enumerate(sequence_lengths):
-            token_advantages.extend([advantages[i]] * seq_len)
-        token_advantages = mx.array(token_advantages)
+        token_advantages = _expand_to_token_level(advantages, sequence_lengths)
         
         # Apply PPO clipping
         clipped_ratio = mx.clip(ratio, 1 - clip_ratio, 1 + clip_ratio)
@@ -442,80 +495,63 @@ def compute_gspo_metrics(
     - Gradient variance estimates
     - Length bias indicators
     """
-    # Standard advantage metrics
-    metrics = {
-        'mean_advantage': mx.mean(advantages).item(),
-        'std_advantage': mx.std(advantages).item(),
-        'min_advantage': mx.min(advantages).item(),
-        'max_advantage': mx.max(advantages).item()
-    }
-    
+    # Collect all lazy scalars, then evaluate once to minimize GPU-CPU sync barriers.
+    # Each .item() call can force a separate mx.eval(); batching them into a single
+    # mx.eval() reduces M individual syncs to 1.
+    scalars = {}
+
+    # Standard advantage metrics (always computed)
+    scalars['mean_advantage'] = mx.mean(advantages)
+    scalars['std_advantage'] = mx.std(advantages)
+    scalars['min_advantage'] = mx.min(advantages)
+    scalars['max_advantage'] = mx.max(advantages)
+
     if variant == "sequence":
-        # Sequence-level importance weights
         seq_weights = compute_sequence_importance_weights(
             old_logprobs, new_logprobs, sequence_lengths, clip_ratio
         )
-        
-        # Sequence weight statistics
-        metrics.update({
-            'mean_seq_weight': mx.mean(seq_weights).item(),
-            'std_seq_weight': mx.std(seq_weights).item(),
-            'max_seq_weight': mx.max(seq_weights).item(),
-            'min_seq_weight': mx.min(seq_weights).item()
-        })
-        
-        # Clipping statistics at sequence level
+        scalars['mean_seq_weight'] = mx.mean(seq_weights)
+        scalars['std_seq_weight'] = mx.std(seq_weights)
+        scalars['max_seq_weight'] = mx.max(seq_weights)
+        scalars['min_seq_weight'] = mx.min(seq_weights)
         clipped = (seq_weights < (1 - clip_ratio)) | (seq_weights > (1 + clip_ratio))
-        metrics['seq_clip_fraction'] = mx.mean(clipped.astype(mx.float32)).item()
-        
+        scalars['seq_clip_fraction'] = mx.mean(clipped.astype(mx.float32))
+
     elif variant == "hybrid":
-        # Hybrid importance weights  
         hybrid_weights = compute_hybrid_importance_weights(
             old_logprobs, new_logprobs, sequence_lengths
         )
-        
-        # Hybrid weight statistics
-        metrics.update({
-            'mean_hybrid_weight': mx.mean(hybrid_weights).item(),
-            'std_hybrid_weight': mx.std(hybrid_weights).item(),
-            'max_hybrid_weight': mx.max(hybrid_weights).item(),
-            'min_hybrid_weight': mx.min(hybrid_weights).item()
-        })
-        
-        # Clipping statistics at token level
+        scalars['mean_hybrid_weight'] = mx.mean(hybrid_weights)
+        scalars['std_hybrid_weight'] = mx.std(hybrid_weights)
+        scalars['max_hybrid_weight'] = mx.max(hybrid_weights)
+        scalars['min_hybrid_weight'] = mx.min(hybrid_weights)
         clipped = (hybrid_weights < (1 - clip_ratio)) | (hybrid_weights > (1 + clip_ratio))
-        metrics['hybrid_clip_fraction'] = mx.mean(clipped.astype(mx.float32)).item()
-        
+        scalars['hybrid_clip_fraction'] = mx.mean(clipped.astype(mx.float32))
+
     else:  # token-level (standard GRPO)
-        # Token-level importance ratios
         ratio = mx.exp(new_logprobs - old_logprobs)
-        
-        metrics.update({
-            'mean_token_ratio': mx.mean(ratio).item(),
-            'std_token_ratio': mx.std(ratio).item(),
-            'max_token_ratio': mx.max(ratio).item(),
-            'min_token_ratio': mx.min(ratio).item()
-        })
-        
-        # Clipping statistics at token level
+        scalars['mean_token_ratio'] = mx.mean(ratio)
+        scalars['std_token_ratio'] = mx.std(ratio)
+        scalars['max_token_ratio'] = mx.max(ratio)
+        scalars['min_token_ratio'] = mx.min(ratio)
         clipped = (ratio < (1 - clip_ratio)) | (ratio > (1 + clip_ratio))
-        metrics['token_clip_fraction'] = mx.mean(clipped.astype(mx.float32)).item()
-    
+        scalars['token_clip_fraction'] = mx.mean(clipped.astype(mx.float32))
+
     # Length bias analysis
     if len(sequence_lengths) > 1:
         length_array = mx.array(sequence_lengths, dtype=mx.float32)
-        metrics.update({
-            'mean_seq_length': mx.mean(length_array).item(),
-            'std_seq_length': mx.std(length_array).item(),
-            'min_seq_length': mx.min(length_array).item(),
-            'max_seq_length': mx.max(length_array).item()
-        })
-    
+        scalars['mean_seq_length'] = mx.mean(length_array)
+        scalars['std_seq_length'] = mx.std(length_array)
+        scalars['min_seq_length'] = mx.min(length_array)
+        scalars['max_seq_length'] = mx.max(length_array)
+
     # KL divergence approximation
-    kl_div = mx.mean(old_logprobs - new_logprobs)
-    metrics['kl_divergence'] = kl_div.item()
-    
-    return metrics
+    scalars['kl_divergence'] = mx.mean(old_logprobs - new_logprobs)
+
+    # Single mx.eval() for all lazy scalars — one GPU-CPU sync instead of many
+    mx.eval(*scalars.values())
+
+    return {k: v.item() for k, v in scalars.items()}
 
 
 # Algorithm-specific data selectors for GSPO
