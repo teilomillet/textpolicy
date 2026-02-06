@@ -360,6 +360,136 @@ class TestBatchedRollout:
 
 
 @pytest.mark.unit
+class TestGreedyDeterminismAndParity:
+    """H7: Greedy decode is deterministic and invariant to batch composition.
+
+    These tests verify the core Amdahl optimisation correctness guarantee:
+    left-padding and attention masking must not alter model output for any
+    individual prompt.
+    """
+
+    def test_greedy_deterministic(self):
+        """Running greedy decode twice on the same prompt yields identical tokens."""
+        model = _TinyLM()
+        tok = _DummyTokenizer()
+        prompt = [mx.array([3, 4, 5], dtype=mx.int32)]
+
+        r1 = batch_generate_tokens(model, tok, prompt, max_tokens=5, temperature=0.0)
+        r2 = batch_generate_tokens(model, tok, prompt, max_tokens=5, temperature=0.0)
+
+        assert mx.array_equal(r1[0][0], r2[0][0]), (
+            "Greedy decode should be deterministic across calls"
+        )
+
+    def test_single_vs_batch_parity(self):
+        """A prompt produces the same greedy tokens whether alone or in a batch.
+
+        This is THE key invariant for batched generation: left-padding and
+        attention masking must not change the output for any individual prompt.
+        """
+        model = _TinyLM()
+        tok = _DummyTokenizer()
+        prompt_a = mx.array([3, 4, 5], dtype=mx.int32)
+        prompt_b = mx.array([6, 7, 8, 9], dtype=mx.int32)
+
+        # Prompt A alone (batch of 1)
+        solo = batch_generate_tokens(
+            model, tok, [prompt_a], max_tokens=5, temperature=0.0
+        )
+        solo_tokens = solo[0][0]
+
+        # Prompt A in a batch with B (batch of 2 — B has different length)
+        batched = batch_generate_tokens(
+            model, tok, [prompt_a, prompt_b], max_tokens=5, temperature=0.0
+        )
+        batched_tokens = batched[0][0]
+
+        assert mx.array_equal(solo_tokens, batched_tokens), (
+            f"Prompt A should produce identical greedy tokens whether batched alone "
+            f"or with other prompts.\n"
+            f"  Solo:    {solo_tokens.tolist()}\n"
+            f"  Batched: {batched_tokens.tolist()}"
+        )
+
+    def test_single_vs_triple_batch_parity(self):
+        """Same prompt in batch of 1 vs batch of 3 (with variable lengths)."""
+        model = _TinyLM()
+        tok = _DummyTokenizer()
+        target = mx.array([10, 11, 12], dtype=mx.int32)
+
+        solo = batch_generate_tokens(
+            model, tok, [target], max_tokens=4, temperature=0.0
+        )
+        trio = batch_generate_tokens(
+            model, tok, [
+                target,
+                mx.array([1], dtype=mx.int32),
+                mx.array([5, 6, 7, 8, 9], dtype=mx.int32),
+            ],
+            max_tokens=4, temperature=0.0,
+        )
+
+        assert mx.array_equal(solo[0][0], trio[0][0]), (
+            "Target prompt should produce identical tokens regardless of batch size"
+        )
+
+    def test_logprobs_match_across_batch_sizes(self):
+        """Logprobs for a prompt should be identical solo vs batched."""
+        model = _TinyLM()
+        tok = _DummyTokenizer()
+        prompt = mx.array([3, 4, 5], dtype=mx.int32)
+
+        solo = batch_generate_tokens(
+            model, tok, [prompt], max_tokens=4, temperature=0.0
+        )
+        duo = batch_generate_tokens(
+            model, tok, [prompt, mx.array([7, 8], dtype=mx.int32)],
+            max_tokens=4, temperature=0.0,
+        )
+
+        solo_lp = solo[0][1]["logprob"]
+        duo_lp = duo[0][1]["logprob"]
+        assert mx.allclose(solo_lp, duo_lp, atol=1e-5).item(), (
+            f"Logprobs should match.\n"
+            f"  Solo:    {solo_lp.tolist()}\n"
+            f"  Batched: {duo_lp.tolist()}"
+        )
+
+
+@pytest.mark.unit
+class TestMaskValidationEdgeCases:
+    """H8: Mask creation rejects invalid inputs with clear errors."""
+
+    def test_prefill_mask_zero_max_len(self):
+        with pytest.raises(ValueError, match="positive"):
+            _create_batched_prefill_mask([1], max_prompt_len=0)
+
+    def test_prefill_mask_empty_list(self):
+        with pytest.raises(ValueError, match="non-empty"):
+            _create_batched_prefill_mask([], max_prompt_len=5)
+
+    def test_prefill_mask_zero_prompt_length(self):
+        with pytest.raises(ValueError, match=">= 1"):
+            _create_batched_prefill_mask([0], max_prompt_len=5)
+
+    def test_decode_mask_negative_offset(self):
+        with pytest.raises(ValueError, match=">= 0"):
+            _create_batched_decode_mask([1], max_prompt_len=5, decode_offset=-1)
+
+    def test_decode_mask_zero_max_len(self):
+        with pytest.raises(ValueError, match="positive"):
+            _create_batched_decode_mask([1], max_prompt_len=0, decode_offset=0)
+
+    def test_decode_mask_empty_list(self):
+        with pytest.raises(ValueError, match="non-empty"):
+            _create_batched_decode_mask([], max_prompt_len=5, decode_offset=0)
+
+    def test_decode_mask_zero_prompt_length(self):
+        with pytest.raises(ValueError, match=">= 1"):
+            _create_batched_decode_mask([0], max_prompt_len=5, decode_offset=0)
+
+
+@pytest.mark.unit
 def test_rollout_coordinator_batch_size_routes_to_batched_path():
     model = _TinyLM()
     tok = _DummyTokenizer()

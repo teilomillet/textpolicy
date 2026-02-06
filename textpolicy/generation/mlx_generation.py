@@ -428,6 +428,131 @@ def compute_logprobs(
     return selected
 
 
+def compute_prompt_reuse_stats(
+    full_sequences: mx.array,
+    prompt_lengths: List[int],
+    response_lengths: Optional[List[int]] = None,
+) -> Dict[str, float]:
+    """Quantify repeated-prompt opportunity in a batched workload.
+
+    The returned metrics are designed for issue #29 triage:
+    they estimate how much prompt-side work could be removed if identical
+    prompts were prefetched once and reused.
+
+    Args:
+        full_sequences: 2D tensor ``[N, max_seq_len]`` containing right-padded
+            prompt+response tokens.
+        prompt_lengths: Prompt token count for each episode.
+        response_lengths: Optional response token count for each episode.
+
+    Returns:
+        Dict with repeat-rate and upper-bound token-savings metrics.
+    """
+    if full_sequences.ndim != 2:
+        raise ValueError(
+            f"full_sequences must be 2D [N, max_seq_len], got {full_sequences.ndim}D "
+            f"with shape {full_sequences.shape}."
+        )
+
+    n_episodes = int(full_sequences.shape[0])
+    if len(prompt_lengths) != n_episodes:
+        raise ValueError(
+            f"prompt_lengths has {len(prompt_lengths)} entries but "
+            f"full_sequences has {n_episodes} rows. They must match."
+        )
+    if any(p <= 0 for p in prompt_lengths):
+        raise ValueError("All prompt_lengths must be >= 1.")
+
+    max_seq_len = int(full_sequences.shape[1])
+    if any(p > max_seq_len for p in prompt_lengths):
+        raise ValueError(
+            f"At least one prompt length exceeds sequence width {max_seq_len}."
+        )
+
+    if response_lengths is not None:
+        if len(response_lengths) != n_episodes:
+            raise ValueError(
+                f"response_lengths has {len(response_lengths)} entries but "
+                f"full_sequences has {n_episodes} rows. They must match."
+            )
+        if any(r < 0 for r in response_lengths):
+            raise ValueError("All response_lengths must be >= 0.")
+
+    if n_episodes == 0:
+        result: Dict[str, float] = {
+            "num_episodes": 0.0,
+            "unique_prompts": 0.0,
+            "repeated_prompt_groups": 0.0,
+            "duplicated_episodes": 0.0,
+            "repeat_rate": 0.0,
+            "max_group_size": 0.0,
+            "mean_group_size": 0.0,
+            "total_prompt_tokens": 0.0,
+            "duplicated_prompt_tokens": 0.0,
+            "prompt_token_reduction_upper_bound": 0.0,
+        }
+        if response_lengths is not None:
+            result["total_response_tokens"] = 0.0
+            result["total_tokens"] = 0.0
+            result["end_to_end_token_reduction_upper_bound"] = 0.0
+        return result
+
+    # Group episodes by the exact unpadded prompt token tuple.
+    prompt_counts: Dict[Tuple[int, ...], int] = {}
+    prompt_token_lengths: Dict[Tuple[int, ...], int] = {}
+    for i, p_len in enumerate(prompt_lengths):
+        prompt_key = tuple(full_sequences[i, :p_len].tolist())
+        prompt_counts[prompt_key] = prompt_counts.get(prompt_key, 0) + 1
+        prompt_token_lengths[prompt_key] = p_len
+
+    unique_prompts = len(prompt_counts)
+    duplicated_episodes = n_episodes - unique_prompts
+    repeated_prompt_groups = sum(1 for c in prompt_counts.values() if c > 1)
+    max_group_size = max(prompt_counts.values())
+    mean_group_size = n_episodes / unique_prompts
+
+    total_prompt_tokens = int(sum(prompt_lengths))
+    duplicated_prompt_tokens = int(
+        sum(
+            (count - 1) * prompt_token_lengths[prompt_key]
+            for prompt_key, count in prompt_counts.items()
+            if count > 1
+        )
+    )
+    prompt_token_reduction_upper_bound = (
+        duplicated_prompt_tokens / total_prompt_tokens
+        if total_prompt_tokens > 0
+        else 0.0
+    )
+
+    result = {
+        "num_episodes": float(n_episodes),
+        "unique_prompts": float(unique_prompts),
+        "repeated_prompt_groups": float(repeated_prompt_groups),
+        "duplicated_episodes": float(duplicated_episodes),
+        "repeat_rate": duplicated_episodes / n_episodes,
+        "max_group_size": float(max_group_size),
+        "mean_group_size": float(mean_group_size),
+        "total_prompt_tokens": float(total_prompt_tokens),
+        "duplicated_prompt_tokens": float(duplicated_prompt_tokens),
+        "prompt_token_reduction_upper_bound": float(prompt_token_reduction_upper_bound),
+    }
+
+    if response_lengths is not None:
+        total_response_tokens = int(sum(response_lengths))
+        total_tokens = total_prompt_tokens + total_response_tokens
+        end_to_end_token_reduction_upper_bound = (
+            duplicated_prompt_tokens / total_tokens if total_tokens > 0 else 0.0
+        )
+        result["total_response_tokens"] = float(total_response_tokens)
+        result["total_tokens"] = float(total_tokens)
+        result["end_to_end_token_reduction_upper_bound"] = float(
+            end_to_end_token_reduction_upper_bound
+        )
+
+    return result
+
+
 def compute_logprobs_batched(
     model: nn.Module,
     full_sequences: mx.array,
