@@ -885,3 +885,154 @@ class TestBatchedLogprobRecomputation:
 
         assert n_sequential == n_episodes, f"Sequential should be {n_episodes} calls, got {n_sequential}"
         assert n_batched == 1, f"Batched should be 1 call, got {n_batched}"
+
+
+# ---------------------------------------------------------------------------
+# 10. On-policy buffer management (Issue #35)
+# ---------------------------------------------------------------------------
+
+@pytest.mark.unit
+class TestOnPolicyBufferManagement:
+    """Verify that on_policy=True prevents unbounded buffer growth.
+
+    Issue #35: Without bounding the buffer, training time grows exponentially
+    because the Trainer does a forward pass over ALL buffered episodes.  For
+    on-policy algorithms (GRPO, GTPO), the buffer should be cleared after each
+    train() call so only the latest rollouts are used.
+    """
+
+    def _make_trainer(self, buffer, on_policy=False):
+        """Create a minimal Trainer with a linked buffer."""
+        import mlx.optimizers as optim
+        from textpolicy.training.trainer import Trainer
+
+        model = nn.Linear(4, 4)
+        optimizer = optim.Adam(learning_rate=0.01)
+        return Trainer(
+            model=model,
+            advantage_fn=lambda r: r - mx.mean(r),
+            loss_fn=lambda o, n, a: mx.mean(n),
+            optimizer=optimizer,
+            compile_training=False,
+            buffer=buffer,
+            data_selector_fn=lambda buf: self._make_batch(),
+            # Bypass default logprob extraction — Linear(4,4) can't
+            # produce valid sequence logits; this test is about buffer
+            # management, not logprob correctness.
+            get_logprobs_fn=lambda model_out, acts: -mx.ones(acts.shape),
+            on_policy=on_policy,
+        )
+
+    @staticmethod
+    def _make_batch():
+        """Create a minimal batch compatible with Linear(4,4)."""
+        return {
+            'obs': mx.random.normal((4,)),
+            'act': mx.array([1, 2, 3]),
+            'logprob': mx.array([-1.0, -1.0, -1.0]),
+            'rewards': mx.array([1.0, 0.5]),
+            'episode_lengths': [2, 1],
+        }
+
+    @staticmethod
+    def _add_episode(buffer, reward=1.0):
+        """Add a single complete episode to the buffer."""
+        buffer.add(
+            obs=mx.array([1, 2]),
+            act=mx.array([3]),
+            rew=reward,
+            next_obs=mx.array([4, 5]),
+            done=True,
+            logprob=mx.array([-0.5]),
+        )
+
+    def test_on_policy_clears_buffer_after_train(self):
+        """H1: on_policy=True clears the linked buffer after train()."""
+        from textpolicy.buffer import Buffer
+
+        buf = Buffer(max_episodes=100)
+        self._add_episode(buf)
+        self._add_episode(buf)
+        assert buf.episode_count == 2
+
+        trainer = self._make_trainer(buf, on_policy=True)
+        trainer.train()  # uses linked buffer automatically
+
+        assert buf.episode_count == 0, (
+            f"Expected empty buffer after on_policy train(), got {buf.episode_count}"
+        )
+
+    def test_default_preserves_buffer(self):
+        """H2: on_policy=False (default) does not clear the buffer."""
+        from textpolicy.buffer import Buffer
+
+        buf = Buffer(max_episodes=100)
+        self._add_episode(buf)
+        self._add_episode(buf)
+
+        trainer = self._make_trainer(buf, on_policy=False)
+        trainer.train()
+
+        assert buf.episode_count == 2, (
+            f"Default (off-policy) should preserve buffer, got {buf.episode_count}"
+        )
+
+    def test_manual_rollout_data_does_not_clear_buffer(self):
+        """H3: Passing explicit rollout_data should never clear the buffer,
+        even when on_policy=True."""
+        from textpolicy.buffer import Buffer
+
+        buf = Buffer(max_episodes=100)
+        self._add_episode(buf)
+        self._add_episode(buf)
+
+        trainer = self._make_trainer(buf, on_policy=True)
+        trainer.train(rollout_data=self._make_batch())  # manual mode
+
+        assert buf.episode_count == 2, (
+            f"Manual rollout_data should not clear buffer, got {buf.episode_count}"
+        )
+
+    def test_on_policy_buffer_stays_empty_across_steps(self):
+        """H4: Multiple train() calls with on_policy=True keep buffer empty."""
+        from textpolicy.buffer import Buffer
+
+        buf = Buffer(max_episodes=100)
+        trainer = self._make_trainer(buf, on_policy=True)
+
+        for step in range(5):
+            # Simulate rollout: add fresh episodes before each train()
+            self._add_episode(buf, reward=float(step))
+            self._add_episode(buf, reward=float(step) + 0.5)
+            assert buf.episode_count == 2, f"Step {step}: expected 2 episodes before train()"
+
+            trainer.train()
+
+            assert buf.episode_count == 0, (
+                f"Step {step}: expected empty buffer after train(), "
+                f"got {buf.episode_count}"
+            )
+
+    def test_buffer_growth_warning(self, caplog):
+        """H5: A warning is logged when buffer grows and on_policy=False."""
+        import logging
+        from textpolicy.buffer import Buffer
+
+        buf = Buffer(max_episodes=100)
+        trainer = self._make_trainer(buf, on_policy=False)
+
+        # Step 0: add 2 episodes, train
+        self._add_episode(buf)
+        self._add_episode(buf)
+        with caplog.at_level(logging.WARNING, logger="textpolicy.training.trainer"):
+            trainer.train()
+
+        # Step 1: add 2 more (buffer grows from 2 → 4), train
+        self._add_episode(buf)
+        self._add_episode(buf)
+        with caplog.at_level(logging.WARNING, logger="textpolicy.training.trainer"):
+            trainer.train()
+
+        assert any("Buffer grew" in record.message for record in caplog.records), (
+            f"Expected buffer growth warning, got: {[r.message for r in caplog.records]}"
+        )
