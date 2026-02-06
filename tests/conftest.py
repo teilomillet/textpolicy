@@ -106,6 +106,9 @@ def pytest_configure(config):
     config.addinivalue_line(
         "markers", "slow: Tests that take a long time to run"
     )
+    config.addinivalue_line(
+        "markers", "regression: Exact-output regression tests for optimization safety"
+    )
 
 
 def pytest_collection_modifyitems(config, items):
