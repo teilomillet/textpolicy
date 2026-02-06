@@ -146,6 +146,21 @@ class TestIdentifyPlanningTokens:
         expected = mx.array([0.0, 0.0])
         assert mx.array_equal(result, expected)
 
+    def test_no_cross_word_boundary_match(self):
+        """H6: Gram must match on word boundaries, not inside words.
+
+        "key insight" should NOT match when the window text is
+        "monkey insight" (where "key" is a suffix of "monkey").
+        """
+        vocab = {0: "monkey", 1: "insight", 2: "here"}
+        tok = MockTokenizer(vocab)
+        ids = mx.array([0, 1, 2], dtype=mx.int32)
+        result = identify_planning_tokens(ids, tok, ["key insight"])
+        expected = mx.array([0.0, 0.0, 0.0])
+        assert mx.array_equal(result, expected), (
+            f"Expected no match (word-boundary), got {result.tolist()}"
+        )
+
 
 # ---------------------------------------------------------------------------
 # TestApplyHicraAmplification
@@ -349,6 +364,20 @@ class TestHicraComposition:
             compute_advantages_hicra(
                 rewards, token_ids, tok, ["a b"],
                 episode_lengths=episode_lengths,
+            )
+
+    def test_episode_level_without_lengths_raises(self):
+        """H4: Episode-level rewards without episode_lengths gives clear error."""
+        vocab = {0: "a", 1: "b", 2: "c", 3: "d", 4: "e"}
+        tok = MockTokenizer(vocab)
+        # 2 episode rewards but 5 token IDs — needs episode_lengths
+        with pytest.raises(ValueError, match="Without episode_lengths"):
+            compute_advantages_hicra(
+                rewards=[1.0, 0.0],
+                token_ids=mx.array([0, 1, 2, 3, 4], dtype=mx.int32),
+                tokenizer=tok,
+                strategic_grams=["a b"],
+                episode_lengths=None,
             )
 
     def test_gtpo_then_hicra_composition(self):

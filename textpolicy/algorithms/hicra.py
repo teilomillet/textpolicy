@@ -28,6 +28,7 @@ References:
 
 from __future__ import annotations
 
+import re
 from typing import List, Optional, Union
 
 try:
@@ -90,8 +91,13 @@ def identify_planning_tokens(
     # Build a Python mask (faster than repeated mx.array updates)
     mask = [0] * n_tokens
 
-    # Lowercase all grams once
-    grams_lower = [g.lower() for g in strategic_grams]
+    # Pre-compile word-boundary regex for each gram so that e.g.
+    # "key insight" does not match inside "monkey insight".
+    gram_patterns = []
+    for g in strategic_grams:
+        escaped = re.escape(g.lower())
+        escaped = re.sub(r"\\ ", r"\\s+", escaped)
+        gram_patterns.append(re.compile(rf"\b{escaped}\b", re.IGNORECASE))
 
     # Sliding window: for each start position, expand the window up to
     # max_window tokens.  When a match is found, mark only the tokens in
@@ -112,10 +118,9 @@ def identify_planning_tokens(
                 else:
                     window_text = cleaned
 
-            window_lower = window_text.lower()
             matched = False
-            for gram in grams_lower:
-                if gram in window_lower:
+            for pattern in gram_patterns:
+                if pattern.search(window_text):
                     # Mark only the tokens in this window span
                     for idx in range(start, end + 1):
                         mask[idx] = 1
@@ -251,6 +256,17 @@ def compute_advantages_hicra(
                 parts.append(mx.repeat(base_advantages[i : i + 1], length))
             expanded = mx.concatenate(parts)
     else:
+        # No episode_lengths → assume rewards are already token-level.
+        # Validate that the counts actually line up.
+        n_adv = base_advantages.shape[0]
+        n_tok = token_ids.shape[0] if token_ids.ndim > 0 else 0
+        if n_adv != n_tok:
+            raise ValueError(
+                f"Without episode_lengths, rewards must be token-level "
+                f"aligned. Got {n_adv} advantages but {n_tok} token_ids. "
+                f"Provide episode_lengths to expand episode-level "
+                f"advantages to token-level."
+            )
         expanded = base_advantages
 
     # Step 3: Optional GTPO entropy weighting (applied first)
