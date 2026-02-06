@@ -195,6 +195,25 @@ def run_full_pipeline(args: argparse.Namespace) -> Dict[str, Any]:
     mx.random.seed(args.seed)
     model, tokenizer = load_model(args.model)
 
+    # Optional LoRA setup — freeze base, keep only adapters trainable.
+    if args.lora:
+        from textpolicy.generation.lora import create_lora_setup
+
+        model, memory_stats = create_lora_setup(
+            model,
+            lora_config={
+                "lora_layers": args.lora_layers,
+                "lora_rank": args.lora_rank,
+            },
+            auto_reload=False,
+        )
+        from mlx.utils import tree_flatten
+
+        n_trainable = sum(p.size for _, p in tree_flatten(model.trainable_parameters()))
+        n_total = sum(p.size for _, p in tree_flatten(model.parameters()))
+        print(f"LoRA: {n_trainable:,} trainable / {n_total:,} total "
+              f"({n_trainable / n_total * 100:.3f}%)")
+
     optimizer = optim.Adam(learning_rate=1e-5)
     trainer = Trainer(
         model=model,
@@ -294,7 +313,8 @@ def run_full_pipeline(args: argparse.Namespace) -> Dict[str, Any]:
             all_metrics.append(m)
             prompt_reuse_samples.append(prompt_reuse)
 
-    result = _aggregate(all_metrics, "full_pipeline", args, prompt_reuse_samples)
+    mode = "full_pipeline_lora" if args.lora else "full_pipeline"
+    result = _aggregate(all_metrics, mode, args, prompt_reuse_samples)
     # Add outer-loop timing
     for phase, times in outer_times.items():
         if times:
@@ -303,6 +323,14 @@ def run_full_pipeline(args: argparse.Namespace) -> Dict[str, Any]:
                 "min_s": min(times),
                 "max_s": max(times),
             }
+    if args.lora:
+        result["lora"] = {
+            "rank": args.lora_rank,
+            "layers": args.lora_layers,
+            "trainable_params": n_trainable,
+            "total_params": n_total,
+            "trainable_pct": n_trainable / n_total * 100,
+        }
     return result
 
 
@@ -457,6 +485,12 @@ def main():
     parser.add_argument("--model", type=str, default=None,
                         help="HuggingFace model ID for full-pipeline mode "
                              "(e.g. Qwen/Qwen3-0.6B). Omit for synthetic mode.")
+    parser.add_argument("--lora", action="store_true",
+                        help="Apply LoRA adapters (full-pipeline mode only).")
+    parser.add_argument("--lora-rank", type=int, default=8,
+                        help="LoRA rank (default: 8)")
+    parser.add_argument("--lora-layers", type=int, default=8,
+                        help="Number of layers to apply LoRA to (default: 8)")
     parser.add_argument("--output-dir", type=str, default="artefacts/perf",
                         help="Directory for JSON output (default: artefacts/perf)")
     args = parser.parse_args()

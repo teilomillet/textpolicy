@@ -93,86 +93,75 @@ def apply_lora(
 
 def freeze_base(model: nn.Module) -> nn.Module:
     """
-    Pure function to freeze base model parameters for LoRA training.
-    
-    Only LoRA adapter parameters will be trainable, dramatically reducing
-    memory usage during training.
-    
+    Freeze base model parameters, keeping only LoRA adapter weights trainable.
+
+    After ``model.freeze()`` every parameter (including LoRA) is frozen.
+    This function walks the module tree via ``apply_to_modules`` and calls
+    ``module.unfreeze(keys=["lora_a", "lora_b"])`` on every LoRA module,
+    restoring gradient flow through the adapters.
+
     Args:
-        model: Model with LoRA adapters
-        
+        model: Model with LoRA adapters already applied.
+
     Returns:
-        Model with frozen base parameters
+        The same model with base weights frozen and LoRA weights trainable.
     """
-    # Freeze the entire model first
+    # 1. Freeze everything
     model.freeze()
-    
-    # Unfreeze only LoRA parameters using MLX's trainable_parameters
-    try:
-        # Try to set LoRA parameters as trainable
-        trainable_params = 0
-        total_params = 0
-        
-        # Use MLX's parameter handling
-        if hasattr(model, 'trainable_parameters'):
-            # This should handle LoRA parameters automatically
-            lora_params = model.trainable_parameters()
-            trainable_params = sum(p.size for p in lora_params.values())
-        
-        if hasattr(model, 'parameters'):
-            total_params = sum(p.size for p in model.parameters())
-        
-        # Fallback counting if the above doesn't work
-        if trainable_params == 0 and total_params > 0:
-            # Estimate LoRA parameters (rough heuristic)
-            trainable_params = int(total_params * 0.05)  # Assume ~5% for LoRA
-            
-    except Exception:
-        # Fallback estimates
-        trainable_params = 1000000  # 1M parameters
-        total_params = 20000000     # 20M parameters
-    
-    print(f"Frozen base model: {trainable_params:,} trainable / {total_params:,} total parameters")
-    print(f"  Memory reduction: {(1 - trainable_params/total_params)*100:.1f}%")
-    
+
+    # 2. Walk the module tree and unfreeze LoRA adapter weights.
+    #    We detect LoRA modules by checking for the ``lora_a`` attribute
+    #    (works with any LoRALinear implementation).
+    lora_module_count = 0
+
+    def _unfreeze_lora(_path: str, module: nn.Module) -> nn.Module:
+        nonlocal lora_module_count
+        if hasattr(module, "lora_a"):
+            module.unfreeze(keys=["lora_a", "lora_b"])
+            lora_module_count += 1
+        return module
+
+    model.apply_to_modules(_unfreeze_lora)
+
+    # 3. Count actual trainable vs total parameters for reporting.
+    from mlx.utils import tree_flatten
+    trainable_params = sum(p.size for _, p in tree_flatten(model.trainable_parameters()))
+    total_params = sum(p.size for _, p in tree_flatten(model.parameters()))
+
+    if total_params > 0:
+        pct = trainable_params / total_params * 100
+    else:
+        pct = 0.0
+
+    print(
+        f"Frozen base model: {trainable_params:,} trainable / "
+        f"{total_params:,} total parameters ({pct:.2f}%)"
+    )
+    print(f"  LoRA modules unfrozen: {lora_module_count}")
+
     return model
 
 
 def extract_params(model: nn.Module) -> Dict[str, mx.array]:
     """
-    Pure function to extract only LoRA parameters for saving.
-    
-    This allows saving only the adapter weights instead of the full model,
-    dramatically reducing checkpoint sizes.
-    
+    Extract only LoRA adapter parameters from a model for saving.
+
+    Uses ``tree_flatten`` on trainable parameters and filters for names
+    containing ``lora`` or ``adapter``.  Returns an empty dict when no
+    LoRA parameters are found (never returns dummy data).
+
     Args:
-        model: Model with LoRA adapters
-        
+        model: Model with LoRA adapters.
+
     Returns:
-        Dictionary of LoRA parameter arrays
+        Flat dictionary mapping dotted parameter names to ``mx.array`` values.
     """
-    lora_params = {}
-    
-    try:
-        # Try to use MLX's trainable_parameters for LoRA
-        if hasattr(model, 'trainable_parameters'):
-            trainable = model.trainable_parameters()
-            # Filter for LoRA parameters
-            for name, param in trainable.items():
-                if 'lora' in name.lower() or 'adapter' in name.lower():
-                    lora_params[name] = param
-        
-        # Fallback: create dummy parameters for testing
-        if not lora_params:
-            lora_params = {
-                'lora_a': mx.random.normal((8, 128)),
-                'lora_b': mx.random.normal((128, 8))
-            }
-    
-    except Exception:
-        # Final fallback
-        lora_params = {}
-    
+    from mlx.utils import tree_flatten
+
+    lora_params: Dict[str, mx.array] = {}
+    for name, param in tree_flatten(model.trainable_parameters()):
+        if "lora" in name.lower() or "adapter" in name.lower():
+            lora_params[name] = param
     return lora_params
 
 
