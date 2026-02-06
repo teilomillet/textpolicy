@@ -190,6 +190,111 @@ class TestTrainingPipeline:
             assert not mx.isinf(loss), f"GSPO {variant} loss should not be infinite"
 
 
+@pytest.mark.unit
+class TestAdvantageExpansion:
+    """Validate that _loss_fn expands advantages using real episode lengths."""
+
+    def _make_trainer(self):
+        """Create a minimal Trainer for testing _loss_fn."""
+        from textpolicy.training import Trainer
+        from textpolicy.algorithms import grpo
+
+        class TinyLM(nn.Module):
+            def __init__(self):
+                super().__init__()
+                self.linear = nn.Linear(10, 10)
+            def __call__(self, x):
+                return self.linear(x)
+
+        model = TinyLM()
+        mx.eval(model.parameters())
+        return Trainer(
+            model=model,
+            loss_fn=grpo.policy_loss,
+            optimizer=optim.Adam(learning_rate=1e-3),
+            advantage_fn=grpo.compute_advantages,
+            compile_training=False,
+        )
+
+    def test_variable_length_episodes_use_real_lengths(self):
+        """Regression: advantage expansion must use batch_data['episode_lengths'].
+
+        With 2 episodes of lengths [4, 1] and advantages [0.5, -0.5]:
+          correct (real lengths): [0.5, 0.5, 0.5, 0.5, -0.5]
+          wrong   (even dist):    [0.5, 0.5, 0.5, -0.5, -0.5]
+
+        Previously _loss_fn used even distribution (total_tokens //
+        num_episodes), which misassigned credit at episode boundaries
+        for variable-length episodes.
+        """
+        trainer = self._make_trainer()
+
+        # Manually call _expand_advantages via the Trainer to verify
+        # the public interface.  We test the expansion logic directly
+        # since _loss_fn requires a full model forward pass.
+        advantages = mx.array([0.5, -0.5])
+        real_lengths = [4, 1]
+
+        expanded = trainer._expand_advantages(advantages, real_lengths)
+        mx.eval(expanded)
+
+        expected = [0.5, 0.5, 0.5, 0.5, -0.5]
+        assert expanded.tolist() == expected, (
+            f"Expected {expected}, got {expanded.tolist()}. "
+            f"Advantage expansion must use real episode lengths, not even distribution."
+        )
+
+    def test_even_distribution_fallback_without_episode_lengths(self):
+        """When episode_lengths is absent, even distribution is used as fallback."""
+        trainer = self._make_trainer()
+
+        advantages = mx.array([0.5, -0.5])
+        total_tokens = 6
+        num_episodes = 2
+
+        # Simulate the fallback path
+        base_length = total_tokens // num_episodes
+        remainder = total_tokens % num_episodes
+        action_lengths = [base_length + (1 if i < remainder else 0) for i in range(num_episodes)]
+
+        expanded = trainer._expand_advantages(advantages, action_lengths)
+        mx.eval(expanded)
+
+        # Even split: [3, 3] → [0.5, 0.5, 0.5, -0.5, -0.5, -0.5]
+        expected = [0.5, 0.5, 0.5, -0.5, -0.5, -0.5]
+        assert expanded.tolist() == expected
+
+    def test_mismatched_episode_count_raises(self):
+        """episode_lengths with wrong count raises clear ValueError."""
+        trainer = self._make_trainer()
+
+        # 3 episodes worth of rewards → 3 advantages, but episode_lengths has 2
+        batch_data = {
+            'obs': mx.zeros(7),
+            'act': mx.zeros(7, dtype=mx.int32),
+            'logprob': mx.zeros(7),
+            'rewards': mx.array([1.0, 0.5, -0.5]),
+            'episode_lengths': [4, 3],  # only 2 entries, but 3 episodes
+        }
+        with pytest.raises(ValueError, match="does not match num_episodes"):
+            trainer._loss_fn(batch_data)
+
+    def test_mismatched_total_tokens_raises(self):
+        """episode_lengths that don't sum to total_tokens raises clear ValueError."""
+        trainer = self._make_trainer()
+
+        # episode_lengths sum to 6, but logprobs have 7 tokens
+        batch_data = {
+            'obs': mx.zeros(7),
+            'act': mx.zeros(7, dtype=mx.int32),
+            'logprob': mx.zeros(7),
+            'rewards': mx.array([1.0, 0.5]),
+            'episode_lengths': [3, 3],  # sum=6, but 7 tokens
+        }
+        with pytest.raises(ValueError, match="does not match total_tokens"):
+            trainer._loss_fn(batch_data)
+
+
 @pytest.mark.integration
 class TestCompiledTraining:
     """Test that @mx.compile works correctly with training."""

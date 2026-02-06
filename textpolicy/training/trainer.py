@@ -362,6 +362,20 @@ class Trainer:
                 remainder = total_tokens % num_episodes
                 action_lengths = [base_length + (1 if i < remainder else 0) for i in range(num_episodes)]
 
+            # Validate episode_lengths consistency before expanding.
+            if len(action_lengths) != num_episodes:
+                raise ValueError(
+                    f"len(episode_lengths)={len(action_lengths)} does not match "
+                    f"num_episodes={num_episodes}. batch_data['episode_lengths'] "
+                    f"must have one entry per episode."
+                )
+            if sum(action_lengths) != total_tokens:
+                raise ValueError(
+                    f"sum(episode_lengths)={sum(action_lengths)} does not match "
+                    f"total_tokens={total_tokens}. Episode lengths must sum to "
+                    f"the total number of tokens in the batch."
+                )
+
             advantages = self._expand_advantages(advantages, action_lengths)
 
             if getattr(self, '_debug_logging', False):
