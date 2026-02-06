@@ -382,7 +382,14 @@ class Trainer:
 
         # Apply optional advantage transform (e.g. HICRA planning token amplification)
         if self.advantage_transform_fn is not None:
+            expected_shape = advantages.shape
             advantages = self.advantage_transform_fn(advantages, batch_data)
+            if advantages.shape != expected_shape:
+                raise ValueError(
+                    f"advantage_transform_fn changed shape from {expected_shape} "
+                    f"to {advantages.shape}. The transform must return advantages "
+                    f"with the same shape as its input."
+                )
 
         # Compute loss using algorithm-specific function
         loss = self.loss_fn(old_logprobs, new_logprobs, advantages)
