@@ -333,19 +333,32 @@ def apply_quantization_to_model(
     """
     try:
         from mlx_lm.utils import quantize_model
+        import inspect
         
         print(f"Applying real {bits}-bit quantization...")
         print(f"  Group size: {group_size}")
         print(f"  Expected memory reduction: ~{8/bits:.1f}x")
-        
-        # Apply quantization using MLX-LM
-        quantized_model, updated_config = quantize_model(
-            model=model,
-            config=config,
-            q_group_size=group_size,
-            q_bits=bits,
-            quant_predicate=None  # Quantize all eligible layers
-        )
+
+        # MLX-LM changed quantize_model kwargs:
+        # old: q_group_size/q_bits, new: group_size/bits.
+        quantize_params = set(inspect.signature(quantize_model).parameters.keys())
+        quantize_kwargs = {
+            "model": model,
+            "config": config,
+            "quant_predicate": None,  # Quantize all eligible layers
+        }
+        if {"q_group_size", "q_bits"}.issubset(quantize_params):
+            quantize_kwargs["q_group_size"] = group_size
+            quantize_kwargs["q_bits"] = bits
+        elif {"group_size", "bits"}.issubset(quantize_params):
+            quantize_kwargs["group_size"] = group_size
+            quantize_kwargs["bits"] = bits
+        else:
+            raise TypeError(
+                f"Unsupported quantize_model signature: {sorted(quantize_params)}"
+            )
+
+        quantized_model, updated_config = quantize_model(**quantize_kwargs)
         
         print("Real quantization applied successfully")
         return quantized_model

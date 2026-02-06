@@ -13,6 +13,7 @@ Key functions:
 """
 
 from __future__ import annotations
+import importlib
 from typing import Dict, List, Optional, Tuple, Any, Callable
 import mlx.core as mx
 import mlx.nn as nn
@@ -630,6 +631,29 @@ def _create_batched_decode_mask(
     )
 
 
+def _make_prompt_cache_if_available(model: nn.Module) -> Optional[Any]:
+    """Best-effort prompt-cache construction across mlx_lm module layouts."""
+    if not HAS_MLX_LM:
+        return None
+
+    for module_name in ("mlx_lm.cache", "mlx_lm.cache_prompt"):
+        try:
+            cache_module = importlib.import_module(module_name)
+        except Exception:
+            continue
+
+        make_prompt_cache = getattr(cache_module, "make_prompt_cache", None)
+        if not callable(make_prompt_cache):
+            continue
+
+        try:
+            return make_prompt_cache(model)
+        except Exception:
+            return None
+
+    return None
+
+
 def _model_forward_with_optional_mask_and_cache(
     model: nn.Module,
     input_tokens: mx.array,
@@ -734,18 +758,7 @@ def batch_generate_tokens(
     prompt_batch = mx.stack(padded_rows)  # [B, max_prompt_len]
 
     # 2) Create prompt cache when available.
-    cache_obj: Optional[Any] = None
-    if HAS_MLX_LM:
-        try:
-            try:
-                from mlx_lm import cache as mlx_cache
-            except Exception:
-                # Newer mlx-lm versions expose cache helpers via cache_prompt.
-                from mlx_lm import cache_prompt as mlx_cache
-
-            cache_obj = mlx_cache.make_prompt_cache(model)
-        except Exception:
-            cache_obj = None
+    cache_obj = _make_prompt_cache_if_available(model)
 
     # 3) Prefill pass: one model call for all prompts.
     prefill_mask = _create_batched_prefill_mask(prompt_lengths, max_prompt_len)

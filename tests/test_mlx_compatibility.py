@@ -111,12 +111,21 @@ class TestMLXLMAPIs:
         import inspect
 
         sig = inspect.signature(quantize_model)
-        params = list(sig.parameters.keys())
+        params = set(sig.parameters.keys())
 
-        # These params are used in lora.py:342-348
-        expected = ['model', 'config', 'q_group_size', 'q_bits', 'quant_predicate']
-        for p in expected:
+        # Core params required by our compatibility wrapper.
+        for p in ("model", "config", "quant_predicate"):
             assert p in params, f"Expected param '{p}' not found in quantize_model"
+
+        # MLX-LM supports one of these naming conventions:
+        # - legacy: q_group_size/q_bits
+        # - current: group_size/bits
+        has_legacy = {"q_group_size", "q_bits"}.issubset(params)
+        has_current = {"group_size", "bits"}.issubset(params)
+        assert has_legacy or has_current, (
+            "Expected either legacy (q_group_size/q_bits) or current "
+            "(group_size/bits) quantize_model parameters."
+        )
 
 
 @pytest.mark.unit

@@ -4,12 +4,14 @@ Tests for batched text generation across episodes (Issue #26).
 
 from __future__ import annotations
 
+import types
 from typing import Any, Dict, List, Tuple
 
 import mlx.core as mx
 import mlx.nn as nn
 import pytest
 
+import textpolicy.generation.mlx_generation as mlx_generation
 from textpolicy.generation.mlx_generation import (
     _create_batched_decode_mask,
     _create_batched_prefill_mask,
@@ -83,6 +85,54 @@ class _NeverEOSModel:
             logits,
         )
         return mx.broadcast_to(logits, (bsz, seq_len, self.vocab_size))
+
+
+@pytest.mark.unit
+class TestPromptCacheConstruction:
+    def test_uses_legacy_cache_module_layout(self, monkeypatch):
+        model = object()
+        monkeypatch.setattr(mlx_generation, "HAS_MLX_LM", True)
+
+        def fake_import_module(name: str):
+            if name == "mlx_lm.cache":
+                return types.SimpleNamespace(
+                    make_prompt_cache=lambda incoming_model: {
+                        "layout": "cache",
+                        "model": incoming_model,
+                    }
+                )
+            raise ImportError(name)
+
+        monkeypatch.setattr(mlx_generation.importlib, "import_module", fake_import_module)
+
+        cache_obj = mlx_generation._make_prompt_cache_if_available(model)
+        assert cache_obj["layout"] == "cache"
+        assert cache_obj["model"] is model
+
+    def test_falls_back_to_cache_prompt_layout(self, monkeypatch):
+        model = object()
+        monkeypatch.setattr(mlx_generation, "HAS_MLX_LM", True)
+        import_calls: List[str] = []
+
+        def fake_import_module(name: str):
+            import_calls.append(name)
+            if name == "mlx_lm.cache":
+                raise ImportError(name)
+            if name == "mlx_lm.cache_prompt":
+                return types.SimpleNamespace(
+                    make_prompt_cache=lambda incoming_model: {
+                        "layout": "cache_prompt",
+                        "model": incoming_model,
+                    }
+                )
+            raise ImportError(name)
+
+        monkeypatch.setattr(mlx_generation.importlib, "import_module", fake_import_module)
+
+        cache_obj = mlx_generation._make_prompt_cache_if_available(model)
+        assert cache_obj["layout"] == "cache_prompt"
+        assert cache_obj["model"] is model
+        assert import_calls[:2] == ["mlx_lm.cache", "mlx_lm.cache_prompt"]
 
 
 @pytest.mark.unit
