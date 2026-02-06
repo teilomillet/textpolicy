@@ -52,7 +52,7 @@ class Trainer:
         get_logprobs_fn: Optional[Callable] = None,
         metrics_fn: Optional[Callable] = None,
         max_grad_norm: Optional[float] = 0.5,
-        compile_training: bool = True,
+        compile_training: Union[bool, str] = "auto",
         buffer: Optional[Buffer] = None,
         data_selector_fn: Optional[Callable] = None,
         auto_save_lora: Optional[str] = None,
@@ -72,7 +72,10 @@ class Trainer:
             get_logprobs_fn: Function to extract logprobs from model output
             metrics_fn: Function to compute training metrics
             max_grad_norm: Maximum gradient norm for clipping (None disables)
-            compile_training: Whether to compile training step with @mx.compile
+            compile_training: Controls ``mx.compile`` for the training step.
+                ``"auto"`` (default) compiles when model has ≥ 1M parameters
+                (compilation overhead is only amortized for larger models).
+                ``True`` always compiles.  ``False`` never compiles.
             buffer: Optional linked buffer for automatic data selection
             data_selector_fn: Algorithm-specific function to select data from buffer
             auto_save_lora: Optional path to auto-save LoRA adapters after training
@@ -120,8 +123,32 @@ class Trainer:
         self.auto_save_lora = auto_save_lora or self._detect_auto_reload_lora(model)
         self._has_lora = self._detect_lora_model(model)
         
-        # Create compiled loss function for maximum performance
-        if compile_training:
+        # Resolve compile_training: "auto" checks model param count.
+        # Compilation amortises tracing overhead over many ops, so it only
+        # helps for models above ~1M parameters.  TinyLM (50K) is 4x slower
+        # compiled; Qwen3-0.6B (596M) is 16% faster.
+        _AUTO_COMPILE_PARAM_THRESHOLD = 1_000_000
+
+        if compile_training == "auto":
+            from mlx.utils import tree_flatten
+
+            n_params = sum(p.size for _, p in tree_flatten(model.parameters()))
+            should_compile = n_params >= _AUTO_COMPILE_PARAM_THRESHOLD
+            logger.info(
+                "compile_training='auto': %s params → %s",
+                f"{n_params:,}",
+                "compiling" if should_compile else "skipping (below threshold)",
+            )
+        elif isinstance(compile_training, bool):
+            should_compile = compile_training
+        else:
+            raise ValueError(
+                f"compile_training must be True, False, or 'auto', "
+                f"got {compile_training!r}"
+            )
+
+        self._compiled = should_compile
+        if should_compile:
             self.loss_and_grad_fn = mx.compile(nn.value_and_grad(model, self._loss_fn))
         else:
             self.loss_and_grad_fn = nn.value_and_grad(model, self._loss_fn)
@@ -273,10 +300,17 @@ class Trainer:
         else:
             raise ValueError(f"Unsupported actions dimension: {actions.ndim}")
         
-        # VALIDATION: Check for reasonable values
-        if mx.any(mx.isnan(action_log_probs)) or mx.any(mx.isinf(action_log_probs)):
-            raise ValueError("NaN or Inf values in computed logprobs")
-        
+        # Replace NaN/Inf with large negative logprobs instead of branching.
+        # Python ``if`` on ``mx.any(...)`` calls ``bool(mx.array)`` which
+        # triggers ``.item()`` — illegal inside ``mx.compile`` traced
+        # functions.  ``mx.where`` keeps everything on the computation graph.
+        sentinel = mx.array(mx.finfo(action_log_probs.dtype).min, dtype=action_log_probs.dtype)
+        action_log_probs = mx.where(
+            mx.isnan(action_log_probs) | mx.isinf(action_log_probs),
+            sentinel,
+            action_log_probs,
+        )
+
         return action_log_probs
     
     def _default_data_selector(self, buffer: Buffer) -> Dict[str, mx.array]:
@@ -348,7 +382,10 @@ class Trainer:
                 )
 
             prompt_lengths = batch_data.get('prompt_lengths')
-            new_logprobs = self._extract_grpo_logprobs(observations, actions, old_logprobs, episode_lengths, prompt_lengths)
+            new_logprobs = self._extract_grpo_logprobs(
+                observations, actions, old_logprobs, episode_lengths,
+                prompt_lengths, _compiled=self._compiled,
+            )
         else:
             # Fallback for non-GRPO data or custom pipelines
             if observations.ndim == 1:
@@ -439,6 +476,8 @@ class Trainer:
         old_logprobs: mx.array,
         episode_lengths: List[int],
         prompt_lengths: Optional[List[int]] = None,
+        *,
+        _compiled: bool = False,
     ) -> mx.array:
         """
         Compute per-episode logprobs under the current model.
@@ -461,6 +500,9 @@ class Trainer:
             episode_lengths: Per-episode response token counts.
             prompt_lengths: Per-episode prompt token counts. When provided
                 with 2D observations, enables the batched path.
+            _compiled: When True, use compile-safe validation in Path 2.
+                Callers inside ``mx.compile`` must pass True; callers
+                outside (e.g. metrics) should pass False for eager checks.
 
         Returns:
             Flat 1D log probabilities matching ``old_logprobs`` shape.
@@ -493,7 +535,8 @@ class Trainer:
                 per_episode = []
                 for i in range(num_episodes):
                     ep_logprobs = compute_logprobs(
-                        self.model, observations[i], actions[i]
+                        self.model, observations[i], actions[i],
+                        _compiled=_compiled,
                     )
                     per_episode.append(ep_logprobs)
                 new_logprobs = mx.concatenate(per_episode)
@@ -652,7 +695,12 @@ class Trainer:
             if 'episode_lengths' in batch_data:
                 episode_lengths = batch_data['episode_lengths']
                 prompt_lengths = batch_data.get('prompt_lengths')
-                new_logprobs = self._extract_grpo_logprobs(observations, actions, batch_data['logprob'], episode_lengths, prompt_lengths)
+                # Metrics run outside mx.compile → use eager validation
+                # (_compiled=False) so mx.any() barriers are preserved.
+                new_logprobs = self._extract_grpo_logprobs(
+                    observations, actions, batch_data['logprob'],
+                    episode_lengths, prompt_lengths, _compiled=False,
+                )
             else:
                 # Fallback: add batch dimension if needed and call model
                 if observations.ndim == 1:

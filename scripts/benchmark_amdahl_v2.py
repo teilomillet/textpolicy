@@ -215,12 +215,13 @@ def run_full_pipeline(args: argparse.Namespace) -> Dict[str, Any]:
               f"({n_trainable / n_total * 100:.3f}%)")
 
     optimizer = optim.Adam(learning_rate=1e-5)
+    compile_flag = args.compile if hasattr(args, "compile") else False
     trainer = Trainer(
         model=model,
         advantage_fn=grpo.compute_advantages,
         loss_fn=grpo.policy_loss,
         optimizer=optimizer,
-        compile_training=False,
+        compile_training=compile_flag,
         profile=True,
     )
 
@@ -283,7 +284,10 @@ def run_full_pipeline(args: argparse.Namespace) -> Dict[str, Any]:
             buffer.add_episode_from_dict(ep.to_dict())
         t_buffer = time.perf_counter() - t0
 
-        batch_data = trainer._prepare_batch_from_buffer(buffer)
+        # Use the GRPO data pipeline (_pack_episodes) which produces 2D
+        # obs/act with prompt_lengths — required for the batched logprob
+        # extraction path that is mx.compile-safe.
+        batch_data = grpo._pack_episodes(buffer.episodes)
         if "prompt_lengths" in batch_data and batch_data["obs"].ndim == 2:
             prompt_reuse = compute_prompt_reuse_stats(
                 batch_data["obs"],
@@ -291,8 +295,6 @@ def run_full_pipeline(args: argparse.Namespace) -> Dict[str, Any]:
                 batch_data["episode_lengths"],
             )
         else:
-            # _prepare_batch_from_buffer produces flat 1D obs without
-            # prompt_lengths.  Skip prompt reuse stats in this path.
             prompt_reuse = {
                 "num_episodes": float(len(batch_data["episode_lengths"])),
                 "repeat_rate": 0.0,
@@ -491,6 +493,10 @@ def main():
                         help="LoRA rank (default: 8)")
     parser.add_argument("--lora-layers", type=int, default=8,
                         help="Number of layers to apply LoRA to (default: 8)")
+    parser.add_argument("--compile", action="store_true",
+                        help="Enable mx.compile for the training step "
+                             "(full-pipeline mode with --model only; "
+                             "ignored in synthetic mode).")
     parser.add_argument("--output-dir", type=str, default="artefacts/perf",
                         help="Directory for JSON output (default: artefacts/perf)")
     args = parser.parse_args()
