@@ -106,6 +106,9 @@ def pytest_configure(config):
     config.addinivalue_line(
         "markers", "slow: Tests that take a long time to run"
     )
+    config.addinivalue_line(
+        "markers", "regression: Exact-output regression tests for optimization safety"
+    )
 
 
 def pytest_collection_modifyitems(config, items):
@@ -119,6 +122,10 @@ def pytest_collection_modifyitems(config, items):
         if "reward" in item.nodeid.lower():
             item.add_marker(pytest.mark.reward)
         
+        # Add regression marker to regression tests
+        if "regression" in item.nodeid.lower():
+            item.add_marker(pytest.mark.regression)
+
         # Add slow marker to tests that might be slow
         if "training" in item.nodeid.lower() or "integration" in item.nodeid.lower():
             item.add_marker(pytest.mark.slow)
