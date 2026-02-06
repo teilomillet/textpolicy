@@ -7,7 +7,7 @@ include = ["textpolicy*"]
 
 [project]
 name = "textpolicy"
-version = "0.1.6"
+version = "0.1.7"
 description = "Reinforcement learning for text generation on MLX (Apple Silicon): GRPO/GSPO, environments, rollout, rewards, LoRA/QLoRA"
 readme = "README.md"
 requires-python = ">=3.12"
