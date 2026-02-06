@@ -84,6 +84,15 @@ class TestTimerFix:
         timer = Timer()
         assert timer.format_breakdown("total") == {}
 
+    @pytest.mark.unit
+    def test_reset_clears_running_timers(self):
+        """H6: reset() clears active starts and prevents KeyError on stop."""
+        timer = Timer()
+        timer.start("phase")
+        timer.reset()
+        with pytest.raises(RuntimeError, match="was not started"):
+            timer.stop("phase")
+
 
 # ---------------------------------------------------------------------------
 # Trainer profiling tests
@@ -238,3 +247,24 @@ class TestTrainerProfiling:
                 assert v >= 0.0, f"{k} has negative value: {v}"
             if k.startswith("timing/") and k.endswith("_pct"):
                 assert 0.0 <= v <= 100.0 + 1e-6, f"{k} out of range: {v}"
+
+    @pytest.mark.unit
+    def test_profiled_timer_does_not_accumulate_unbounded_history(self):
+        """Trainer should reset timing history per step."""
+        model = _make_tiny_model()
+        trainer = Trainer(
+            model=model,
+            advantage_fn=_simple_advantage,
+            loss_fn=_simple_loss,
+            optimizer=optim.Adam(learning_rate=1e-4),
+            compile_training=False,
+            profile=True,
+        )
+
+        batch = _make_batch()
+        trainer.train(batch)
+        assert trainer._timer is not None
+        assert trainer._timer.get_stats("total")["count"] == 1
+
+        trainer.train(batch)
+        assert trainer._timer.get_stats("total")["count"] == 1

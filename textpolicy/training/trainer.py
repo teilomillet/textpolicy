@@ -503,6 +503,8 @@ class Trainer:
         timer = self._timer  # local alias — None when profiling is off
 
         if timer is not None:
+            # Keep timings per-step to avoid unbounded growth across long runs.
+            timer.reset()
             timer.start("total")
 
         # ── Phase: data_selection ──────────────────────────────────────
@@ -522,7 +524,8 @@ class Trainer:
             batch_data = rollout_data
 
         if timer is not None:
-            mx.eval(batch_data['obs'])  # force pending work before barrier
+            if 'obs' in batch_data:
+                mx.eval(batch_data['obs'])  # force pending work before barrier
             timer.stop("data_selection")
 
         # ── Phase: loss_and_grad ───────────────────────────────────────
@@ -741,6 +744,11 @@ class Trainer:
     def reset_metrics(self):
         """Reset training metrics."""
         self.metrics.reset()
+
+    def reset_timer(self):
+        """Reset profiling timer history. No-op when profiling is disabled."""
+        if self._timer is not None:
+            self._timer.reset()
     
     def link_buffer(self, buffer: Buffer, data_selector_fn: Optional[Callable] = None):
         """

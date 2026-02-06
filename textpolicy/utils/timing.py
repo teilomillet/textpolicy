@@ -141,8 +141,10 @@ class Timer:
         """
         if name is None:
             self.times.clear()
+            self._starts.clear()
         elif name in self.times:
             self.times[name].clear()
+        self._starts.pop(name, None)
             
     def __str__(self) -> str:
         """String representation of all timer statistics."""

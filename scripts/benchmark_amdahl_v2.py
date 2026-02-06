@@ -131,14 +131,14 @@ def run_synthetic(args: argparse.Namespace) -> Dict[str, Any]:
     # Warmup
     for _ in range(args.warmup):
         trainer.train(batch)
-        trainer._timer.reset()  # type: ignore[union-attr]
+        trainer.reset_timer()
 
     # Measured steps
     all_metrics: List[Dict[str, float]] = []
     for _ in range(args.steps):
         m = trainer.train(batch)
         all_metrics.append(m)
-        trainer._timer.reset()  # type: ignore[union-attr]
+        trainer.reset_timer()
 
     return _aggregate(all_metrics, "synthetic", args)
 
@@ -213,7 +213,7 @@ def run_full_pipeline(args: argparse.Namespace) -> Dict[str, Any]:
         m = trainer.train(buffer)
         t_training = time.perf_counter() - t0
 
-        trainer._timer.reset()  # type: ignore[union-attr]
+        trainer.reset_timer()
 
         if step >= args.warmup:
             outer_times["rollout"].append(t_rollout)
