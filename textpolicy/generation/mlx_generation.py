@@ -409,9 +409,9 @@ def compute_logprobs(
 
     Raises on dimension mismatch or invalid (nan/inf/positive) values when
     ``_compiled=False`` (the default).  When ``_compiled=True``, NaN/Inf
-    values are replaced with ``-1e6`` using compile-safe ``mx.where``
-    instead — Python branching on ``mx.any(...)`` is illegal inside
-    ``mx.compile`` traced functions.
+    values are replaced with ``finfo(dtype).min`` using compile-safe
+    ``mx.where`` instead — Python branching on ``mx.any(...)`` is illegal
+    inside ``mx.compile`` traced functions.
 
     Args:
         _compiled: When True, skip ``mx.any``-based validation (uses
