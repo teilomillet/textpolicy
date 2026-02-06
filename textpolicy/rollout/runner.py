@@ -3,7 +3,7 @@
 Core rollout collection engine.
 """
 
-from typing import Callable, Dict, Optional, Tuple
+from typing import Callable, Dict, List, Optional, Tuple, Any
 import mlx.core as mx # type: ignore
 from textpolicy.buffer import Buffer
 from .base import RolloutStrategy, DEFAULT_MAX_STEPS
@@ -291,4 +291,74 @@ class RolloutRunner:
             'total_steps': total_steps,
             'avg_episode_length': avg_episode_length,
             'avg_episode_reward': avg_episode_reward
-        } 
+        }
+
+    def collect_batched(
+        self,
+        batched_policy_fn: Callable[[List[mx.array]], List[Tuple[mx.array, Dict[str, Any]]]],
+        batch_size: int,
+    ) -> Buffer:
+        """
+        Collect rollouts using batched generation across episodes.
+
+        This path is designed for single-turn text environments where each
+        ``env.step`` terminates the episode. It keeps the same buffer format as
+        ``collect()`` while amortizing decode overhead across multiple prompts.
+        """
+        if batch_size <= 0:
+            raise ValueError(f"batch_size must be positive, got {batch_size}")
+
+        self.buffer = Buffer(max_episodes=self._buffer_capacity)
+        steps_remaining = self.max_steps
+
+        while steps_remaining > 0:
+            this_batch = min(batch_size, steps_remaining)
+
+            # Reset per episode to get prompt observations.
+            obs_batch: List[Any] = []
+            for _ in range(this_batch):
+                reset_result = self.env.reset()
+                if isinstance(reset_result, tuple):
+                    obs, _ = reset_result
+                else:
+                    obs = reset_result
+                obs_batch.append(obs)
+
+            prompt_obs_list = [mx.array(obs) for obs in obs_batch]
+            results = batched_policy_fn(prompt_obs_list)
+            if len(results) != this_batch:
+                raise ValueError(
+                    "batched_policy_fn must return one output per prompt. "
+                    f"Expected {this_batch}, got {len(results)}."
+                )
+
+            for i in range(this_batch):
+                response_tokens, extra = results[i]
+                if response_tokens.ndim == 0:
+                    action = response_tokens.item()
+                else:
+                    action = response_tokens.tolist()
+
+                step_result = self.env.step(action)
+                next_obs, reward, done, trunc, info = self._normalize_step_result(step_result)
+
+                if not (done or trunc):
+                    raise ValueError(
+                        "collect_batched requires single-turn episodes "
+                        "(env.step must terminate or truncate each episode)."
+                    )
+
+                self.strategy.store_transition(
+                    buffer=self.buffer,
+                    obs=obs_batch[i],
+                    act=action,
+                    rew=reward,
+                    next_obs=next_obs,
+                    done=done,
+                    timeout=trunc,
+                    **extra,
+                )
+
+            steps_remaining -= this_batch
+
+        return self.buffer

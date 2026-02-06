@@ -65,6 +65,7 @@ class BaselineConfig:
 
     # Rollout
     episodes_per_step: int = 8
+    batch_size: int = 1  # >1 enables batched generation across episodes
 
     # Output
     output_dir: str = "results/countdown_baseline"
@@ -204,6 +205,7 @@ def run_baseline(config: BaselineConfig) -> None:
         num_workers=0,
         max_steps=config.episodes_per_step,
         max_episodes=config.episodes_per_step,
+        batch_size=config.batch_size,
     )
 
     # 8. Create buffer + trainer
@@ -301,6 +303,10 @@ if __name__ == "__main__":
     parser.add_argument("--lora-layers", type=int, default=8, help="LoRA layers")
     parser.add_argument("--temperature", type=float, default=0.7, help="Temperature")
     parser.add_argument("--seed", type=int, default=42, help="Dataset seed")
+    parser.add_argument(
+        "--batch-size", type=int, default=1,
+        help="Batched generation across episodes (1 = sequential)"
+    )
     args = parser.parse_args()
 
     config = BaselineConfig(
@@ -314,5 +320,6 @@ if __name__ == "__main__":
         lora_layers=args.lora_layers,
         temperature=args.temperature,
         dataset_seed=args.seed,
+        batch_size=args.batch_size,
     )
     run_baseline(config)

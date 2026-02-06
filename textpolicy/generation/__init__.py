@@ -15,11 +15,13 @@ All functions are pure and composable with our existing trainer system.
 from .mlx_generation import (
     load_model,
     generate_tokens,
+    batch_generate_tokens,
     compute_logprobs,
     compute_logprobs_batched,
     encode,
     decode,
     create_policy,
+    create_batched_policy,
     compute_reward,
 )
 
@@ -43,11 +45,13 @@ __all__ = [
     # Core generation functions
     "load_model",
     "generate_tokens",
+    "batch_generate_tokens",
     "compute_logprobs",
     "compute_logprobs_batched",
     "encode",
     "decode",
     "create_policy",
+    "create_batched_policy",
     "compute_reward",
     
     # LoRA functions

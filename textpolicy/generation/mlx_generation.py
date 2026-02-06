@@ -13,7 +13,8 @@ Key functions:
 """
 
 from __future__ import annotations
-from typing import Dict, Optional, Tuple, Any, Callable
+import importlib
+from typing import Dict, List, Optional, Tuple, Any, Callable
 import mlx.core as mx
 import mlx.nn as nn
 try:
@@ -135,6 +136,63 @@ def _extract_response_tokens(
         return mx.array(resp) if resp else mx.array([])
     except Exception:
         return mx.array([])
+
+
+def _maybe_apply_chat_template(tokenizer: Any, prompt_tokens: mx.array) -> mx.array:
+    """Apply chat template to a prompt when tokenizer support is available."""
+    processed_tokens = prompt_tokens
+
+    try:
+        if hasattr(tokenizer, "decode"):
+            raw_prompt = tokenizer.decode(prompt_tokens.tolist())
+        else:
+            raw_prompt = str(prompt_tokens.tolist())
+
+        needs_formatting = (
+            hasattr(tokenizer, "apply_chat_template")
+            and not any(
+                marker in raw_prompt
+                for marker in ["<|im_start|>", "<|endoftext|>", "<|assistant|>"]
+            )
+        )
+
+        if needs_formatting:
+            messages = [{"role": "user", "content": raw_prompt.strip()}]
+            formatted_prompt = tokenizer.apply_chat_template(
+                messages,
+                tokenize=False,
+                add_generation_prompt=True,
+            )
+            if hasattr(tokenizer, "encode"):
+                processed_tokens = mx.array(tokenizer.encode(formatted_prompt))
+            if hasattr(tokenizer, "verbose") and tokenizer.verbose:
+                print(f"Applied chat template: '{formatted_prompt[:100]}...'")
+    except Exception:
+        # Keep raw prompt tokens on any formatting failure.
+        pass
+
+    return processed_tokens
+
+
+def _resolve_pad_token_id(tokenizer: Any) -> int:
+    """Resolve pad token id with robust fallback."""
+    pad_token_id = getattr(tokenizer, "pad_token_id", None)
+    if pad_token_id is None:
+        pad_token_id = getattr(tokenizer, "eos_token_id", None)
+    if pad_token_id is None:
+        pad_token_id = 0
+    return int(pad_token_id)
+
+
+def _resolve_eos_token_ids(tokenizer: Any) -> List[int]:
+    """Resolve EOS token ids as a Python list."""
+    eos_token_ids = getattr(tokenizer, "eos_token_ids", None)
+    if eos_token_ids is not None:
+        return [int(t) for t in eos_token_ids]
+    eos_token_id = getattr(tokenizer, "eos_token_id", None)
+    if eos_token_id is not None:
+        return [int(eos_token_id)]
+    return []
 
 
 def load_model(
@@ -482,6 +540,387 @@ def compute_logprobs_batched(
     return mx.concatenate(per_episode)
 
 
+##############################################################################
+# Batched generation — mask helpers and core decode loop
+##############################################################################
+
+
+def _create_batched_prefill_mask(
+    prompt_lengths: List[int],
+    max_prompt_len: int,
+) -> mx.array:
+    """Create a combined causal + left-padding mask for batched prefill.
+
+    Left-padding places each prompt at the *right* of the ``max_prompt_len``
+    window so that the last prompt token always sits at column
+    ``max_prompt_len - 1``.  Padding positions (to the left) must be masked
+    out so attention never reads them.
+
+    Args:
+        prompt_lengths: Per-sequence prompt token counts (Python list).
+        max_prompt_len: Width of the padded prompt tensor.
+
+    Returns:
+        Bool mask of shape ``[B, 1, max_prompt_len, max_prompt_len]``.
+        ``True`` = attend, ``False`` = block.
+    """
+    if max_prompt_len <= 0:
+        raise ValueError("max_prompt_len must be positive")
+    if len(prompt_lengths) == 0:
+        raise ValueError("prompt_lengths must be non-empty")
+    if any(p <= 0 for p in prompt_lengths):
+        raise ValueError("All prompt lengths must be >= 1")
+
+    batch_size = len(prompt_lengths)
+    positions = mx.arange(max_prompt_len, dtype=mx.int32)
+
+    # Causal mask shared across batch: [1, 1, L, L]
+    causal = positions[:, None] >= positions[None, :]
+    causal = causal.reshape(1, 1, max_prompt_len, max_prompt_len)
+
+    # Per-sequence key validity mask: [B, 1, 1, L]
+    pad_offsets = mx.array(
+        [max_prompt_len - pl for pl in prompt_lengths],
+        dtype=mx.int32,
+    )
+    key_valid = positions.reshape(1, 1, 1, max_prompt_len) >= pad_offsets.reshape(
+        batch_size, 1, 1, 1
+    )
+    return mx.logical_and(causal, key_valid)
+
+
+def _create_batched_decode_mask(
+    prompt_lengths: List[int],
+    max_prompt_len: int,
+    decode_offset: int,
+) -> mx.array:
+    """Create a decode-step mask that blocks left-padding KV positions.
+
+    During autoregressive decoding the query length is 1 (the newly generated
+    token).  The KV length equals ``max_prompt_len + decode_offset`` (all
+    cached positions).  We only need to block positions ``k < pad_offset_i``
+    which correspond to left-padding tokens.
+
+    Args:
+        prompt_lengths: Per-sequence prompt token counts.
+        max_prompt_len: Width of the original padded prompt.
+        decode_offset: Number of decode steps completed so far (0-indexed).
+
+    Returns:
+        Bool mask ``[B, 1, 1, kv_len]`` — ``True`` = attend.
+    """
+    if max_prompt_len <= 0:
+        raise ValueError("max_prompt_len must be positive")
+    if decode_offset < 0:
+        raise ValueError("decode_offset must be >= 0")
+    if len(prompt_lengths) == 0:
+        raise ValueError("prompt_lengths must be non-empty")
+    if any(p <= 0 for p in prompt_lengths):
+        raise ValueError("All prompt lengths must be >= 1")
+
+    batch_size = len(prompt_lengths)
+    kv_len = max_prompt_len + decode_offset
+
+    positions = mx.arange(kv_len, dtype=mx.int32)
+    pad_offsets = mx.array(
+        [max_prompt_len - pl for pl in prompt_lengths],
+        dtype=mx.int32,
+    )
+    return positions.reshape(1, 1, 1, kv_len) >= pad_offsets.reshape(
+        batch_size, 1, 1, 1
+    )
+
+
+def _make_prompt_cache_if_available(model: nn.Module) -> Optional[Any]:
+    """Best-effort prompt-cache construction across mlx_lm module layouts."""
+    if not HAS_MLX_LM:
+        return None
+
+    for module_name in ("mlx_lm.cache", "mlx_lm.cache_prompt"):
+        try:
+            cache_module = importlib.import_module(module_name)
+        except Exception:
+            continue
+
+        make_prompt_cache = getattr(cache_module, "make_prompt_cache", None)
+        if not callable(make_prompt_cache):
+            continue
+
+        try:
+            return make_prompt_cache(model)
+        except Exception:
+            return None
+
+    return None
+
+
+def _model_forward_with_optional_mask_and_cache(
+    model: nn.Module,
+    input_tokens: mx.array,
+    *,
+    mask: Optional[mx.array] = None,
+    cache_obj: Optional[Any] = None,
+) -> Tuple[mx.array, bool]:
+    """Forward model with best-effort support for (mask, cache) kwargs."""
+    if cache_obj is not None and mask is not None:
+        try:
+            return model(input_tokens, mask=mask, cache=cache_obj), True
+        except TypeError:
+            pass
+    if cache_obj is not None:
+        try:
+            return model(input_tokens, cache=cache_obj), True
+        except TypeError:
+            pass
+    if mask is not None:
+        try:
+            return model(input_tokens, mask=mask), False
+        except TypeError:
+            pass
+    return model(input_tokens), False
+
+
+def batch_generate_tokens(
+    model: nn.Module,
+    tokenizer: Any,
+    prompt_token_lists: List[mx.array],
+    max_tokens: int = 50,
+    temperature: float = 0.7,
+    top_p: float = 0.9,
+) -> List[Tuple[mx.array, Dict[str, mx.array]]]:
+    """Generate responses for multiple prompts in a single batched pass.
+
+    This bypasses ``stream_generate`` and operates on the model directly,
+    amortising weight-load cost across all sequences in the batch — the key
+    optimisation for memory-bandwidth-bound Apple Silicon inference.
+
+    Algorithm
+    ---------
+    1. Left-pad all prompts to ``[N, max_prompt_len]`` with ``pad_token_id``.
+    2. Single prefill forward pass with a combined causal + padding mask.
+    3. Autoregressive decode loop (up to ``max_tokens`` steps): one forward
+       pass per step for all sequences, with per-sequence EOS tracking.
+    4. Return per-sequence ``(response_tokens, {'logprob': logprobs})``.
+
+    Logprob convention: computed from *unscaled* logits (before temperature),
+    matching the existing ``_simple_generate`` pattern.
+
+    Args:
+        model: Causal language model.
+        tokenizer: Tokenizer with ``eos_token_id`` and ``pad_token_id``.
+        prompt_token_lists: List of N token-ID lists (variable length).
+        max_tokens: Maximum new tokens to generate per sequence.
+        temperature: Sampling temperature (>0).
+        top_p: Nucleus sampling threshold.
+
+    Returns:
+        List of N ``(response_tokens, {'logprob': logprobs})`` tuples.
+        ``response_tokens`` includes EOS tokens when sampled; no tokens are
+        emitted after EOS for a finished sequence.
+    """
+    if max_tokens <= 0:
+        return [
+            (mx.array([], dtype=mx.int32), {"logprob": mx.array([], dtype=mx.float32)})
+            for _ in prompt_token_lists
+        ]
+
+    prompts = [mx.array(p, dtype=mx.int32) for p in prompt_token_lists]
+    if len(prompts) == 0:
+        return []
+    for i, prompt in enumerate(prompts):
+        if prompt.ndim != 1:
+            raise ValueError(
+                f"Prompt at index {i} must be 1D tokens, got shape {prompt.shape}."
+            )
+        if prompt.shape[0] == 0:
+            raise ValueError(
+                f"Prompt at index {i} is empty. Batched generation requires at least 1 token."
+            )
+
+    batch_size = len(prompts)
+    pad_id = _resolve_pad_token_id(tokenizer)
+    eos_ids = set(_resolve_eos_token_ids(tokenizer))
+
+    # 1) Left-pad prompts for prefill.
+    prompt_lengths = [int(p.shape[0]) for p in prompts]
+    max_prompt_len = max(prompt_lengths)
+    padded_rows: List[mx.array] = []
+    prompt_token_lists_py = [p.tolist() for p in prompts]
+    for prompt in prompts:
+        pad_count = max_prompt_len - int(prompt.shape[0])
+        if pad_count > 0:
+            row = mx.concatenate(
+                [mx.full((pad_count,), pad_id, dtype=mx.int32), prompt]
+            )
+        else:
+            row = prompt
+        padded_rows.append(row)
+    prompt_batch = mx.stack(padded_rows)  # [B, max_prompt_len]
+
+    # 2) Create prompt cache when available.
+    cache_obj = _make_prompt_cache_if_available(model)
+
+    # 3) Prefill pass: one model call for all prompts.
+    prefill_mask = _create_batched_prefill_mask(prompt_lengths, max_prompt_len)
+    prefill_logits, used_cache = _model_forward_with_optional_mask_and_cache(
+        model,
+        prompt_batch,
+        mask=prefill_mask,
+        cache_obj=cache_obj,
+    )
+    next_logits = prefill_logits[:, max_prompt_len - 1, :]  # [B, vocab]
+
+    # 4) Decode loop (with per-sequence EOS tracking).
+    sampler = _make_eos_safe_sampler(temperature, top_p) if temperature > 0 else None
+    finished = [False] * batch_size
+    per_seq_tokens: List[List[int]] = [[] for _ in range(batch_size)]
+    per_seq_logprobs: List[List[float]] = [[] for _ in range(batch_size)]
+    arange_batch = mx.arange(batch_size)
+
+    for decode_step in range(max_tokens):
+        # Logprobs from unscaled logits (matches _simple_generate convention).
+        log_probs = next_logits - mx.logsumexp(next_logits, axis=-1, keepdims=True)
+
+        if temperature <= 0:
+            sampled = mx.argmax(log_probs, axis=-1)
+        elif sampler is not None:
+            sampled = sampler(log_probs)
+        else:
+            scaled_logits = next_logits / temperature
+            probs = mx.softmax(scaled_logits, axis=-1)
+            sampled = mx.random.categorical(mx.log(probs))
+
+        selected_logprobs = log_probs[arange_batch, sampled]
+        sampled_list = sampled.tolist()
+        logprob_list = selected_logprobs.tolist()
+
+        for i in range(batch_size):
+            if finished[i]:
+                continue
+            tok = int(sampled_list[i])
+            per_seq_tokens[i].append(tok)
+            per_seq_logprobs[i].append(float(logprob_list[i]))
+            if tok in eos_ids:
+                finished[i] = True
+
+        if all(finished):
+            break
+        if decode_step == max_tokens - 1:
+            break
+
+        # 5) Next-step logits.
+        if used_cache:
+            # Cache-backed one-token decode.
+            feed_tokens = [
+                pad_id if finished[i] else int(sampled_list[i])
+                for i in range(batch_size)
+            ]
+            tokens_batch = mx.array(feed_tokens, dtype=mx.int32).reshape(batch_size, 1)
+            decode_mask = _create_batched_decode_mask(
+                prompt_lengths,
+                max_prompt_len,
+                decode_offset=decode_step + 1,
+            )
+            step_logits, _ = _model_forward_with_optional_mask_and_cache(
+                model,
+                tokens_batch,
+                mask=decode_mask,
+                cache_obj=cache_obj,
+            )
+            next_logits = step_logits[:, -1, :]
+        else:
+            # Fallback for tiny models that do not implement cache:
+            # rebuild full sequences and do one batched full forward.
+            for i in range(batch_size):
+                if not finished[i]:
+                    prompt_token_lists_py[i].append(int(sampled_list[i]))
+
+            max_len = max(len(seq) for seq in prompt_token_lists_py)
+            rows: List[mx.array] = []
+            lengths: List[int] = []
+            for seq in prompt_token_lists_py:
+                seq_arr = mx.array(seq, dtype=mx.int32)
+                lengths.append(len(seq))
+                pad_len = max_len - len(seq)
+                if pad_len > 0:
+                    seq_arr = mx.concatenate(
+                        [seq_arr, mx.full((pad_len,), pad_id, dtype=mx.int32)]
+                    )
+                rows.append(seq_arr)
+
+            full_batch = mx.stack(rows)
+            full_logits, _ = _model_forward_with_optional_mask_and_cache(
+                model,
+                full_batch,
+                mask=None,
+                cache_obj=None,
+            )
+            next_logits = full_logits[arange_batch, mx.array(lengths, dtype=mx.int32) - 1, :]
+
+    # 6) Package results.
+    results: List[Tuple[mx.array, Dict[str, mx.array]]] = []
+    for tokens, logprobs in zip(per_seq_tokens, per_seq_logprobs):
+        response_tokens = mx.array(tokens, dtype=mx.int32) if tokens else mx.array([], dtype=mx.int32)
+        response_logprobs = mx.array(logprobs, dtype=mx.float32) if logprobs else mx.array([], dtype=mx.float32)
+        results.append((response_tokens, {"logprob": response_logprobs}))
+    return results
+
+
+def create_batched_policy(
+    model: nn.Module,
+    tokenizer: Any,
+    generation_params: Optional[Dict[str, Any]] = None,
+) -> Callable[[List[mx.array]], List[Tuple[mx.array, Dict[str, Any]]]]:
+    """Create a batched policy function for RL rollout collection.
+
+    This is the batched counterpart of :func:`create_policy`.  Instead of
+    processing one prompt at a time, it accepts a list of prompt token arrays
+    and generates all responses in a single batched forward pass.
+
+    Chat-template application follows the same logic as ``create_policy``
+    (lines 558-600): decode → detect if formatting needed → apply template →
+    re-encode.
+
+    Args:
+        model: Causal language model.
+        tokenizer: Tokenizer with chat template support.
+        generation_params: Generation parameters (max_tokens, temperature, …).
+
+    Returns:
+        Function ``(List[mx.array]) -> List[(response_tokens, info)]``.
+    """
+    params = generation_params or {}
+    max_tokens = params.get("max_tokens", 50)
+    temperature = params.get("temperature", 0.8)
+    top_p = params.get("top_p", 0.95)
+
+    def batched_policy_fn(
+        prompt_tokens_list: List[mx.array],
+        deterministic: bool = False,
+    ) -> List[Tuple[mx.array, Dict[str, Any]]]:
+        """Generate responses for all prompts in one batched decode call."""
+        processed = [
+            _maybe_apply_chat_template(tokenizer, mx.array(pt, dtype=mx.int32))
+            for pt in prompt_tokens_list
+        ]
+        temp = 0.0 if deterministic else temperature
+        return batch_generate_tokens(
+            model=model,
+            tokenizer=tokenizer,
+            prompt_token_lists=processed,
+            max_tokens=max_tokens,
+            temperature=temp,
+            top_p=top_p,
+        )
+
+    # Attach metadata so rollout coordination can derive batched policy automatically.
+    setattr(batched_policy_fn, "_tp_model", model)
+    setattr(batched_policy_fn, "_tp_tokenizer", tokenizer)
+    setattr(batched_policy_fn, "_tp_generation_params", dict(params))
+    setattr(batched_policy_fn, "_tp_is_batched", True)
+    return batched_policy_fn
+
+
 def encode(tokenizer: Any, text: str) -> mx.array:
     """
     Convert text to MLX token array.
@@ -554,50 +993,10 @@ def create_policy(
         Returns:
             (response_tokens, generation_info): Response and metadata for training
         """
-        # Auto-apply chat template for instruction models
-        processed_tokens = prompt_tokens
-        
-        try:
-            # Decode tokens to check if chat template is needed
-            if hasattr(tokenizer, 'decode'):
-                raw_prompt = tokenizer.decode(prompt_tokens.tolist())
-            else:
-                # Fallback for tokenizers without decode method
-                raw_prompt = str(prompt_tokens.tolist())
-            
-            # Let the tokenizer decide if chat template is needed
-            # This works for ANY instruction model (Qwen, Llama, Mistral, etc.)
-            needs_formatting = (
-                hasattr(tokenizer, 'apply_chat_template') and
-                # Only apply if not already formatted (avoid double-formatting)
-                not any(marker in raw_prompt for marker in ['<|im_start|>', '<|endoftext|>', '<|assistant|>'])
-            )
-            
-            if needs_formatting:
-                # Convert to messages format and apply chat template
-                # This uses the tokenizer's built-in knowledge of its own chat format
-                messages = [{"role": "user", "content": raw_prompt.strip()}]
-                formatted_prompt = tokenizer.apply_chat_template(
-                    messages,
-                    tokenize=False,
-                    add_generation_prompt=True  # Adds <|im_start|>assistant\n for response generation
-                )
-                
-                # Re-encode with proper formatting for EOS generation
-                if hasattr(tokenizer, 'encode'):
-                    processed_tokens = mx.array(tokenizer.encode(formatted_prompt))
-                else:
-                    # Fallback if tokenizer doesn't have encode method
-                    processed_tokens = prompt_tokens
-                
-                # Debug logging (only in verbose mode to avoid noise)
-                if hasattr(tokenizer, 'verbose') and tokenizer.verbose:
-                    print(f"Applied chat template: '{formatted_prompt[:100]}...'")  # Show first 100 chars for debugging
-            
-        except Exception:
-            # Fallback to original tokens if formatting fails
-            # This ensures robustness and backward compatibility
-            pass
+        processed_tokens = _maybe_apply_chat_template(
+            tokenizer,
+            mx.array(prompt_tokens, dtype=mx.int32),
+        )
         
         # Generate response with processed tokens
         temp = 0.0 if deterministic else temperature
@@ -610,6 +1009,11 @@ def create_policy(
             top_p=top_p
         )
     
+    # Attach metadata so rollout coordination can derive batched policy automatically.
+    setattr(policy_fn, "_tp_model", model)
+    setattr(policy_fn, "_tp_tokenizer", tokenizer)
+    setattr(policy_fn, "_tp_generation_params", dict(params))
+    setattr(policy_fn, "_tp_is_batched", False)
     return policy_fn
 
 
