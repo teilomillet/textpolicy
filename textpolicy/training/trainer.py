@@ -656,12 +656,24 @@ class Trainer:
         all_acts = []
         all_logprobs = []
 
-        for episode in episodes:
+        for i, episode in enumerate(episodes):
             # Support both Episode objects (attribute access) and dicts
             rew = episode.rew if hasattr(episode, 'rew') else episode['rew']
             obs = episode.obs if hasattr(episode, 'obs') else episode['obs']
             act = episode.act if hasattr(episode, 'act') else episode['act']
-            logprob = episode.logprob if hasattr(episode, 'logprob') else episode['logprob']
+            if hasattr(episode, 'logprob'):
+                logprob = episode.logprob
+            elif isinstance(episode, dict):
+                logprob = episode.get('logprob')
+            else:
+                logprob = None
+
+            if logprob is None:
+                raise ValueError(
+                    "Episode index "
+                    f"{i} is missing logprob. Training requires logprob values "
+                    "from rollout collection."
+                )
 
             pending_sums.append(mx.sum(mx.array(rew)))
             episode_lengths.append(len(obs))

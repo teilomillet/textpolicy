@@ -12,6 +12,7 @@ import mlx.core as mx
 import mlx.nn as nn
 import mlx.optimizers as optim
 
+from textpolicy.buffer import Buffer
 from textpolicy.utils.timing import Timer
 from textpolicy.training.trainer import Trainer
 from textpolicy.algorithms import grpo
@@ -268,3 +269,30 @@ class TestTrainerProfiling:
 
         trainer.train(batch)
         assert trainer._timer.get_stats("total")["count"] == 1
+
+    @pytest.mark.unit
+    def test_buffer_without_logprob_raises_clear_error(self):
+        """Training from a buffer with missing logprob should fail clearly."""
+        model = _make_tiny_model()
+        trainer = Trainer(
+            model=model,
+            advantage_fn=_simple_advantage,
+            loss_fn=_simple_loss,
+            optimizer=optim.Adam(learning_rate=1e-4),
+            get_logprobs_fn=_dummy_get_logprobs,
+            compile_training=False,
+        )
+
+        buf = Buffer(max_episodes=10)
+        # Complete one episode without logprob values.
+        for j in range(3):
+            buf.add(
+                obs=mx.array([1.0] * _DIM),
+                act=mx.array([0], dtype=mx.int32),
+                rew=1.0,
+                next_obs=mx.array([1.0] * _DIM),
+                done=(j == 2),
+            )
+
+        with pytest.raises(ValueError, match="missing logprob"):
+            trainer.train(buf)

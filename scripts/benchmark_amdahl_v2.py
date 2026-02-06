@@ -25,7 +25,6 @@ from __future__ import annotations
 
 import argparse
 import json
-import os
 import time
 from datetime import datetime, timezone
 from pathlib import Path
@@ -89,7 +88,7 @@ def _make_synthetic_batch(
 
 def _format_table(rows: List[List[str]], header: List[str]) -> str:
     """Render a simple markdown table."""
-    widths = [max(len(h), *(len(r[i]) for r in rows)) for i, h in enumerate(header)]
+    widths = [max(len(h), *(len(r[i]) for r in rows), 0) for i, h in enumerate(header)]
     sep = "| " + " | ".join("-" * w for w in widths) + " |"
     def _row(cols: List[str]) -> str:
         return "| " + " | ".join(c.ljust(w) for c, w in zip(cols, widths)) + " |"
