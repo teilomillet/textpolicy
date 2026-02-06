@@ -33,7 +33,12 @@ from typing import List, Optional, Union
 try:
     import mlx.core as mx  # type: ignore
 except ImportError:
-    mx = None  # type: ignore
+    # Unlike grpo.py, this module has no @mx.compile decorators that
+    # need a dummy at import time.  Raise immediately so the error
+    # message is clear instead of a confusing AttributeError later.
+    raise ImportError(
+        "MLX is required for HICRA. Install it with: pip install mlx"
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -59,8 +64,11 @@ def identify_planning_tokens(
         tokenizer: HuggingFace-compatible tokenizer with
                    ``convert_ids_to_tokens()``.
         strategic_grams: List of multi-word phrases to search for.
-        max_window: Maximum sliding window size (should be >= the longest
-                    gram's word count).
+        max_window: Maximum sliding window size in tokens.  Automatically
+                    raised to at least the longest gram's word count so
+                    that no gram is silently missed.  Each word may span
+                    multiple subword tokens, so the default (5) gives
+                    headroom for 3-word grams split into up to 5 tokens.
 
     Returns:
         Binary mask [total_tokens] as float32 mx.array (0.0 or 1.0).
@@ -68,6 +76,12 @@ def identify_planning_tokens(
     n_tokens = token_ids.shape[0] if token_ids.ndim > 0 else 0
     if n_tokens == 0 or not strategic_grams:
         return mx.zeros((n_tokens,), dtype=mx.float32)
+
+    # Ensure window is large enough for the longest gram.  Each word in
+    # a gram may map to multiple subword tokens, so we use the word count
+    # as a floor (the caller's explicit max_window adds headroom).
+    max_gram_words = max(len(g.split()) for g in strategic_grams)
+    max_window = max(max_window, max_gram_words)
 
     # Decode token IDs to string fragments
     ids_list = token_ids.tolist()

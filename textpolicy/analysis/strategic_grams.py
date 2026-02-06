@@ -107,8 +107,10 @@ def compute_document_frequency(
     """
     Compute the document frequency of each *ngram* across *completions*.
 
-    Document frequency = fraction of completions that contain the n-gram
-    (case-insensitive substring match).
+    Uses word-boundary-aware matching (``\\b`` regex anchors) so that
+    e.g. ``"let me"`` does **not** match inside ``"outlet member"``.
+    Whitespace in the n-gram is normalized to ``\\s+`` to tolerate
+    multi-space or tab-separated text.
 
     Args:
         completions: List of completion texts (the "documents").
@@ -126,7 +128,12 @@ def compute_document_frequency(
     df: Dict[str, float] = {}
     for gram in ngrams:
         gram_lower = gram.lower()
-        count = sum(1 for doc in lowered_docs if gram_lower in doc)
+        # Word-boundary regex: escape the gram, then replace whitespace
+        # runs with \s+ so "let  me" still matches "let me".
+        escaped = re.escape(gram_lower)
+        escaped = re.sub(r"\\ ", r"\\s+", escaped)
+        pattern = re.compile(rf"\b{escaped}\b", re.IGNORECASE)
+        count = sum(1 for doc in lowered_docs if pattern.search(doc))
         df[gram] = count / num_docs
     return df
 
@@ -184,6 +191,7 @@ def mine_strategic_grams(
     min_completions: int = 10,
     n_clusters: int = 10,
     top_per_cluster: int = 3,
+    embedding_model: str = "all-MiniLM-L6-v2",
 ) -> Dict[str, Any]:
     """
     Full mining pipeline: load → extract → embed → cluster → filter.
@@ -205,6 +213,8 @@ def mine_strategic_grams(
         min_completions: Fall back to defaults if fewer generations.
         n_clusters: Number of KMeans clusters.
         top_per_cluster: How many n-grams to pick per cluster.
+        embedding_model: SentenceTransformer model name for n-gram
+                        embeddings (default ``"all-MiniLM-L6-v2"``).
 
     Returns:
         Dict with keys:
@@ -264,7 +274,7 @@ def mine_strategic_grams(
         }
 
     # Embed and cluster
-    model = SentenceTransformer("all-MiniLM-L6-v2")
+    model = SentenceTransformer(embedding_model)
     embeddings = model.encode(filtered, show_progress_bar=False)
 
     actual_clusters = min(n_clusters, len(filtered))
