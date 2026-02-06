@@ -16,6 +16,10 @@ from .grpo import (
     entropy_bonus,
     select_all_data,
     select_recent_data,
+    # GTPO: Entropy-weighted credit assignment
+    compute_token_entropy,
+    apply_entropy_weighting,
+    compute_advantages_gtpo,
     # Compiled versions
     compute_advantages_compiled,
     policy_loss_compiled,
@@ -53,6 +57,10 @@ __all__ = [
     "entropy_bonus",
     "select_all_data",
     "select_recent_data",
+    # GTPO: Entropy-weighted credit assignment
+    "compute_token_entropy",
+    "apply_entropy_weighting",
+    "compute_advantages_gtpo",
     # GRPO compiled versions
     "compute_advantages_compiled",
     "policy_loss_compiled",
