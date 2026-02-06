@@ -53,4 +53,5 @@ textpolicy = "textpolicy.cli:main"
 
 [project.optional-dependencies]
 external = ["aiohttp>=3.8.0", "pydantic>=2.0.0"]
+mining = ["sentence-transformers>=2.0", "scikit-learn>=1.0"]
 dev = ["pytest>=7.0.0", "black>=22.0.0", "ruff>=0.1.0"]
