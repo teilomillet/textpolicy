@@ -17,6 +17,7 @@ import mlx.nn as nn # type: ignore
 import mlx.optimizers as optim # type: ignore
 from textpolicy.buffer import Buffer
 from textpolicy.rollout import RolloutCoordinator
+from textpolicy.utils.timing import Timer
 from .metrics import TrainingMetrics
 
 
@@ -54,7 +55,8 @@ class Trainer:
         data_selector_fn: Optional[Callable] = None,
         auto_save_lora: Optional[str] = None,
         metrics_interval: int = 10,
-        advantage_transform_fn: Optional[Callable] = None
+        advantage_transform_fn: Optional[Callable] = None,
+        profile: bool = False
     ):
         """
         Initialize unified trainer with composable algorithm functions.
@@ -79,6 +81,10 @@ class Trainer:
                 advantages after expansion. Signature:
                 ``(advantages: mx.array, batch_data: Dict) -> mx.array``.
                 Used by HICRA to amplify planning tokens. None means no-op.
+            profile: When True, insert ``mx.eval()`` barriers between training
+                phases and record per-phase wall-clock times in the metrics dict
+                returned by ``train()``.  Zero cost when False (single boolean
+                check per phase).
         """
         self.model = model
         self.advantage_fn = advantage_fn
@@ -90,6 +96,10 @@ class Trainer:
         self.metrics_interval = max(1, metrics_interval)
 
         self.advantage_transform_fn = advantage_transform_fn
+
+        # Profiling: Timer is only allocated when profile=True.
+        # When _timer is None every phase-timing check is a single ``if``.
+        self._timer: Optional[Timer] = Timer() if profile else None
 
         # Buffer management
         self.buffer = buffer
@@ -471,22 +481,34 @@ class Trainer:
     def train(self, rollout_data: Optional[Union[Buffer, Dict[str, Any]]] = None) -> Dict[str, float]:
         """
         Train the model on complete rollout sequences (full token generations).
-        
+
         Trains on complete generated sequences rather than single environment interactions. Use either:
         1. Automatic mode: Uses linked buffer with algorithm-specific data selection
         2. Manual mode: Takes provided rollout data
-        
+
+        When ``profile=True`` was passed at construction, ``mx.eval()`` barriers
+        are inserted between phases and wall-clock times are recorded under
+        ``timing/*`` keys in the returned metrics dict.
+
         Args:
             rollout_data: Optional data to train on. If None, uses linked buffer
                          with algorithm-specific data selection strategy.
-            
+
         Returns:
             Training metrics dictionary
-            
+
         Raises:
             ValueError: If no rollout_data provided and no buffer linked
         """
-        # Data selection strategy
+        timer = self._timer  # local alias — None when profiling is off
+
+        if timer is not None:
+            timer.start("total")
+
+        # ── Phase: data_selection ──────────────────────────────────────
+        if timer is not None:
+            timer.start("data_selection")
+
         if rollout_data is None:
             # Automatic mode: use linked buffer with algorithm-specific selection
             if self.buffer is None:
@@ -498,19 +520,47 @@ class Trainer:
         else:
             # Manual mode with preprocessed data
             batch_data = rollout_data
-        
-        # Compute loss and gradients using compiled function
+
+        if timer is not None:
+            mx.eval(batch_data['obs'])  # force pending work before barrier
+            timer.stop("data_selection")
+
+        # ── Phase: loss_and_grad ───────────────────────────────────────
+        if timer is not None:
+            timer.start("loss_and_grad")
+
         loss, grads = self.loss_and_grad_fn(batch_data)
-        
-        # Apply gradient clipping if specified
+
+        if timer is not None:
+            mx.eval(loss)
+            timer.stop("loss_and_grad")
+
+        # ── Phase: grad_clip ───────────────────────────────────────────
+        if timer is not None:
+            timer.start("grad_clip")
+
         if self.max_grad_norm is not None:
             grads = self._clip_gradients(grads, self.max_grad_norm)
-        
-        # Update model parameters
+
+        if timer is not None:
+            timer.stop("grad_clip")
+
+        # ── Phase: optimizer_update ────────────────────────────────────
+        if timer is not None:
+            timer.start("optimizer_update")
+
         self.optimizer.update(self.model, grads)
-        
-        # Compute metrics if function provided
-        metrics = {'loss': loss.item(), 'step': self._step_count}
+
+        if timer is not None:
+            # Force parameter materialization before stopping the timer
+            mx.eval(self.model.parameters())
+            timer.stop("optimizer_update")
+
+        # ── Phase: metrics ─────────────────────────────────────────────
+        if timer is not None:
+            timer.start("metrics")
+
+        metrics: Dict[str, float] = {'loss': loss.item(), 'step': self._step_count}
         if self.metrics_fn is not None and self._step_count % self.metrics_interval == 0:
             # Compute new logprobs using the same pipeline as training to ensure consistency
             # This properly handles GRPO data structure with format conversion
@@ -539,14 +589,34 @@ class Trainer:
                 self.advantage_fn(batch_data['rewards'])
             )
             metrics.update(algorithm_metrics)
-        
-        # Update training state
+
+        if timer is not None:
+            timer.stop("metrics")
+
+        # ── Phase: state_update ────────────────────────────────────────
+        if timer is not None:
+            timer.start("state_update")
+
         self._step_count += 1
         self.metrics.update(metrics)
-        
+
         # Auto-save LoRA adapters if enabled (invisible to user)
         self._save_lora_if_enabled()
-        
+
+        if timer is not None:
+            timer.stop("state_update")
+
+        # ── End total ──────────────────────────────────────────────────
+        if timer is not None:
+            timer.stop("total")
+            # Append timing data to metrics with timing/ prefix
+            breakdown = timer.format_breakdown("total")
+            total_stats = timer.get_stats("total")
+            metrics["timing/total_s"] = total_stats["mean"]
+            for phase, info in breakdown.items():
+                metrics[f"timing/{phase}_s"] = info["seconds"]
+                metrics[f"timing/{phase}_pct"] = info["percent"]
+
         return metrics
     
     def _prepare_batch_from_buffer(self, buffer: Buffer) -> Dict[str, mx.array]:
