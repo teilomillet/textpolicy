@@ -853,3 +853,48 @@ class TestLoRAWithMLX:
             "q_bits": 6,
             "quant_predicate": None,
         }
+
+    def test_freeze_base_unfreezes_lora_params(self):
+        """freeze_base must freeze base weights but keep LoRA adapters trainable.
+
+        Regression test: previously freeze_base() called model.freeze() without
+        unfreezing LoRA params, which killed gradient flow entirely.
+        """
+        try:
+            from mlx_lm.lora import LoRALinear
+        except ImportError:
+            from mlx_lm.tuner.lora import LoRALinear
+
+        from textpolicy.generation.lora import freeze_base
+        from mlx.utils import tree_flatten
+
+        class _TinyLoRAModel(nn.Module):
+            def __init__(self):
+                super().__init__()
+                self.base = nn.Linear(32, 32)
+                self.lora = LoRALinear.from_base(nn.Linear(32, 32), r=4, scale=1.0)
+
+            def __call__(self, x):
+                return self.lora(self.base(x))
+
+        model = _TinyLoRAModel()
+        model = freeze_base(model)
+
+        # Only LoRA params should be trainable
+        trainable = tree_flatten(model.trainable_parameters())
+        trainable_names = {name for name, _ in trainable}
+        assert trainable_names == {"lora.lora_a", "lora.lora_b"}
+
+        # Base params must be frozen (not in trainable set)
+        all_names = {name for name, _ in tree_flatten(model.parameters())}
+        frozen_names = all_names - trainable_names
+        assert "base.weight" in frozen_names
+
+        # Gradient flow must work
+        def loss_fn(m, x):
+            return m(x).sum()
+
+        loss, grads = nn.value_and_grad(model, loss_fn)(model, mx.random.normal((1, 32)))
+        mx.eval(loss, grads)
+        grad_names = {name for name, _ in tree_flatten(grads)}
+        assert "lora.lora_a" in grad_names or "lora.lora_b" in grad_names
