@@ -112,7 +112,7 @@ def pytest_collection_modifyitems(config, items):
     """Modify test collection to add markers based on test names/paths."""
     for item in items:
         # Add algorithm marker to algorithm tests
-        if "gspo" in item.nodeid.lower() or "grpo" in item.nodeid.lower():
+        if "gspo" in item.nodeid.lower() or "grpo" in item.nodeid.lower() or "hicra" in item.nodeid.lower():
             item.add_marker(pytest.mark.algorithm)
         
         # Add reward marker to reward tests  

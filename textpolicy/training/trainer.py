@@ -53,7 +53,8 @@ class Trainer:
         buffer: Optional[Buffer] = None,
         data_selector_fn: Optional[Callable] = None,
         auto_save_lora: Optional[str] = None,
-        metrics_interval: int = 10
+        metrics_interval: int = 10,
+        advantage_transform_fn: Optional[Callable] = None
     ):
         """
         Initialize unified trainer with composable algorithm functions.
@@ -74,6 +75,10 @@ class Trainer:
                 avoids a duplicate model forward pass on non-metric steps.
                 Default 10 balances insight and throughput; set to 1 for
                 every-step metrics when needed.
+            advantage_transform_fn: Optional function to transform token-level
+                advantages after expansion. Signature:
+                ``(advantages: mx.array, batch_data: Dict) -> mx.array``.
+                Used by HICRA to amplify planning tokens. None means no-op.
         """
         self.model = model
         self.advantage_fn = advantage_fn
@@ -83,6 +88,8 @@ class Trainer:
         self.metrics_fn = metrics_fn
         self.max_grad_norm = max_grad_norm
         self.metrics_interval = max(1, metrics_interval)
+
+        self.advantage_transform_fn = advantage_transform_fn
 
         # Buffer management
         self.buffer = buffer
@@ -367,12 +374,16 @@ class Trainer:
                 )
             
             advantages = self._expand_advantages(advantages, action_lengths)
-            
+
             if getattr(self, '_debug_logging', False):
                 logging.getLogger(__name__).debug(
                     "Expansion successful: final shape = %d tokens", advantages.shape[0]
                 )
-        
+
+        # Apply optional advantage transform (e.g. HICRA planning token amplification)
+        if self.advantage_transform_fn is not None:
+            advantages = self.advantage_transform_fn(advantages, batch_data)
+
         # Compute loss using algorithm-specific function
         loss = self.loss_fn(old_logprobs, new_logprobs, advantages)
         

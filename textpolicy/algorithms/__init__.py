@@ -4,6 +4,7 @@ Reinforcement learning algorithms for MLX and Apple Silicon.
 
 GRPO: group-relative advantages with PPO-style clipping.
 GSPO: sequence-level importance sampling (sequence, token, and hybrid variants).
+HICRA: planning token amplification via strategic gram matching.
 """
 
 from .grpo import (
@@ -47,6 +48,12 @@ from .gspo import (
     select_gspo_data
 )
 
+from .hicra import (
+    identify_planning_tokens,
+    apply_hicra_amplification,
+    compute_advantages_hicra,
+)
+
 __all__ = [
     # GRPO core functions
     "compute_advantages",
@@ -84,4 +91,8 @@ __all__ = [
     "compute_metrics_hybrid",
     "compute_metrics_token",
     "select_gspo_data",
+    # HICRA: Planning token amplification (Issue #11)
+    "identify_planning_tokens",
+    "apply_hicra_amplification",
+    "compute_advantages_hicra",
 ]
