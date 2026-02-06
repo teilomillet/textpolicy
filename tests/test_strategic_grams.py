@@ -153,26 +153,46 @@ class TestDocumentFrequency:
             "Substring match inside 'outlet member' is a false positive"
         )
 
-    def test_regex_pattern_does_not_crash(self):
-        """Regression: re.sub replacement string must not crash.
+    def test_regex_replacement_escape_levels(self):
+        """Regression: re.sub(r"\\\\ ", r"\\\\s+", ...) does NOT crash.
 
-        The pattern-building step uses ``re.sub(r"\\\\ ", r"\\\\s+", escaped)``
-        where ``r"\\\\s+"`` is the 4-char string ``\\\\s+``.  In re.sub
-        replacement processing, ``\\\\`` → literal backslash, ``s+`` →
-        literal text, producing the regex quantifier ``\\s+``.
+        A reviewer claimed that the ``re.sub`` replacement string
+        ``r"\\\\s+"`` causes ``re.error: bad escape \\s``.  This is
+        false — the confusion is about Python raw-string escape levels:
 
-        This would crash with ``re.error: bad escape \\s`` if the
-        replacement were the 3-char ``r"\\s+"`` instead, but our code
-        uses the correct double-backslash form.
+          r"\\\\s+"  is 4 chars:  \\, \\, s, +
+          re.sub sees \\\\  → emit literal backslash
+                   then s+ → literal text
+          Result: \\s+  (the regex whitespace quantifier)
+
+        A *single*-backslash ``"\\s+"`` (3 chars) WOULD crash (tested
+        below), but that is NOT what the code uses.
+
+        This test proves both sides of the claim:
+          1. Our actual code works on every default gram.
+          2. The mistaken single-backslash form really does crash.
         """
-        # Use all default grams (all multi-word, all contain spaces)
+        import re
+
+        # --- Part 1: Our code does NOT crash ---
         grams = get_default_strategic_grams()
         docs = ["let me think about it and try another approach"]
         # Must not raise — that's the primary assertion
         df = compute_document_frequency(docs, grams)
-        # Also verify at least some grams are found
         found = [g for g in grams if df[g] > 0]
         assert len(found) > 0, "Expected at least one default gram to match"
+
+        # --- Part 2: Verify the exact pattern construction works ---
+        escaped = re.escape("let me think")       # 'let\\ me\\ think'
+        result = re.sub(r"\\ ", r"\\s+", escaped)  # 'let\\s+me\\s+think'
+        pattern = re.compile(rf"\b{result}\b", re.IGNORECASE)
+        assert pattern.search("wait let me think about it") is not None
+        assert pattern.search("outlet methinks") is None  # word boundary
+
+        # --- Part 3: The WRONG form (single backslash) really crashes ---
+        wrong_replacement = "\x5cs+"  # \s+ via hex escape to avoid SyntaxWarning
+        with pytest.raises(re.error, match="bad escape"):
+            re.sub(r"\\ ", wrong_replacement, escaped)
 
 
 # ---------------------------------------------------------------------------

@@ -164,28 +164,43 @@ class TestIdentifyPlanningTokens:
             f"Expected no match (word-boundary), got {result.tolist()}"
         )
 
-    def test_regex_pattern_construction_does_not_crash(self):
-        """H7: Regex patterns compile without errors for all default grams.
+    def test_regex_replacement_escape_levels(self):
+        """H7: re.sub(r"\\\\ ", r"\\\\s+", ...) does NOT crash.
 
-        Regression test: re.sub(r"\\ ", r"\\s+", escaped) in the
-        pattern-building step must not raise ``re.error``.  The
-        replacement ``r"\\s+"`` is the 4-char string ``\\s+``; re.sub
-        processes ``\\`` as "literal backslash" and ``s+`` as literal
-        text, producing ``\\s+`` in the output — which is the regex
-        whitespace quantifier we want.  A single-backslash ``r"\\s+"``
-        (3 chars ``\\s+``) would crash with ``re.error: bad escape \\s``
-        in Python ≥ 3.12, but that is NOT what our code uses.
+        A reviewer claimed that identify_planning_tokens crashes with
+        ``re.error: bad escape \\s``.  This is false — the confusion
+        is about Python raw-string escape levels:
+
+          r"\\\\s+"  is 4 chars:  \\, \\, s, +
+          re.sub sees \\\\  → emit literal backslash
+                   then s+ → literal text
+          Result: \\s+  (the regex whitespace quantifier)
+
+        A *single*-backslash ``"\\s+"`` (3 chars) WOULD crash, but
+        that is NOT what the code uses.
+
+        This test proves both sides:
+          1. identify_planning_tokens works on every default gram.
+          2. The mistaken single-backslash form really does crash.
         """
+        import re
         from textpolicy.analysis.strategic_grams import get_default_strategic_grams
+
+        # --- Part 1: Our code does NOT crash ---
         grams = get_default_strategic_grams()
         # All default grams contain spaces; this would crash if the
         # regex replacement were broken.
         vocab = {i: f"token{i}" for i in range(20)}
         tok = MockTokenizer(vocab)
         ids = mx.array(list(range(20)), dtype=mx.int32)
-        # Must not raise — that's the test.
         result = identify_planning_tokens(ids, tok, grams)
         assert result.shape == (20,)
+
+        # --- Part 2: The WRONG form (single backslash) really crashes ---
+        escaped = re.escape("let me think")
+        wrong_replacement = "\x5cs+"  # \s+ via hex escape to avoid SyntaxWarning
+        with pytest.raises(re.error, match="bad escape"):
+            re.sub(r"\\ ", wrong_replacement, escaped)
 
     def test_multi_space_gram_matches(self):
         """H8: Grams with whitespace variations still match via \\s+ regex."""
