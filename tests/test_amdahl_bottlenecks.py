@@ -1038,18 +1038,24 @@ class TestOnPolicyBufferManagement:
             )
 
     def test_buffer_growth_warning_immediate(self, caplog):
-        """H6: Warning fires on first detected growth, not a hardcoded step."""
+        """H6: Warning fires on first detected growth, not before."""
         import logging
         from textpolicy.buffer import Buffer
 
         buf = Buffer(max_episodes=100)
         trainer = self._make_trainer(buf, on_policy=False)
 
-        # Step 0: add 2 episodes, train
+        # Step 0: add 2 episodes, train — no growth yet (baseline)
         self._add_episode(buf)
         self._add_episode(buf)
         with caplog.at_level(logging.WARNING, logger="textpolicy.training.trainer"):
             trainer.train()
+
+        # No warning should fire on the first step (no prior baseline to compare)
+        assert not any("Buffer grew" in r.message for r in caplog.records), (
+            "Warning should not fire on first step (no growth yet)"
+        )
+        caplog.clear()
 
         # Step 1: add 2 more (buffer grows from 2 → 4), train
         self._add_episode(buf)
@@ -1057,8 +1063,9 @@ class TestOnPolicyBufferManagement:
         with caplog.at_level(logging.WARNING, logger="textpolicy.training.trainer"):
             trainer.train()
 
-        assert any("Buffer grew" in record.message for record in caplog.records), (
-            f"Expected buffer growth warning, got: {[r.message for r in caplog.records]}"
+        warnings = [r for r in caplog.records if "Buffer grew" in r.message]
+        assert len(warnings) == 1, (
+            f"Expected exactly 1 warning on first growth, got {len(warnings)}"
         )
 
     def test_buffer_growth_warning_late_start(self, caplog):
