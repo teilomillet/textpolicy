@@ -5,7 +5,6 @@ These tests verify that the complete training pipeline works correctly,
 including gradient computation and parameter updates.
 """
 
-import math
 import pytest
 import mlx.core as mx
 import mlx.nn as nn
