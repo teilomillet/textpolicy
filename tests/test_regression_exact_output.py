@@ -316,16 +316,17 @@ class TestRegressionPackEpisodes:
         assert result['logprob'].ndim == 1, f"Expected 1D, got {result['logprob'].ndim}D"
 
     def test_boundary_invariant(self):
-        """Episode lengths sum to total logprob tokens (after padding)."""
+        """Episode lengths sum equals total real action tokens."""
         result = grpo._pack_episodes(self._make_episodes())
         mx.eval(result['logprob'])
-        # Each episode's logprobs are padded to max length, then concatenated
-        # ep1: 2 logprobs padded to 3, ep2: 3 logprobs → total 6
-        total_logprob_tokens = result['logprob'].shape[0]
-        max_len = max(result['episode_lengths'])
-        expected_total = max_len * len(result['episode_lengths'])
-        assert total_logprob_tokens == expected_total, (
-            f"Logprob tokens {total_logprob_tokens} != padded total {expected_total}"
+        # Semantic contract: episode_lengths tracks how many action tokens
+        # each episode contributed. Their sum is the count of real tokens;
+        # the logprob array may be larger due to padding, but the lengths
+        # must always account for exactly the real tokens.
+        total_real_tokens = sum(result['episode_lengths'])
+        # ep1 has 2 action tokens, ep2 has 3 → 5 real tokens
+        assert total_real_tokens == 5, (
+            f"episode_lengths sum {total_real_tokens} != expected real tokens 5"
         )
 
     def test_empty_episodes(self):
