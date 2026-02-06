@@ -265,11 +265,20 @@ def run_full_pipeline(args: argparse.Namespace) -> Dict[str, Any]:
         t_buffer = time.perf_counter() - t0
 
         batch_data = trainer._prepare_batch_from_buffer(buffer)
-        prompt_reuse = compute_prompt_reuse_stats(
-            batch_data["obs"],
-            batch_data["prompt_lengths"],
-            batch_data["episode_lengths"],
-        )
+        if "prompt_lengths" in batch_data and batch_data["obs"].ndim == 2:
+            prompt_reuse = compute_prompt_reuse_stats(
+                batch_data["obs"],
+                batch_data["prompt_lengths"],
+                batch_data["episode_lengths"],
+            )
+        else:
+            # _prepare_batch_from_buffer produces flat 1D obs without
+            # prompt_lengths.  Skip prompt reuse stats in this path.
+            prompt_reuse = {
+                "num_episodes": float(len(batch_data["episode_lengths"])),
+                "repeat_rate": 0.0,
+                "prompt_token_reduction_upper_bound": 0.0,
+            }
 
         # Training
         t0 = time.perf_counter()
