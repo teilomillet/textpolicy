@@ -416,10 +416,17 @@ def apply_entropy_weighting(
     low-entropy tokens (routine execution) get dampened advantages.
 
     Formula:
-        A_GTPO(t) = A(t) * (1 + β * (H_norm(t) - 1))
+        w(t) = max(0, 1 + β * (H_norm(t) - 1))
+        A_GTPO(t) = A(t) * w(t)
 
-    Where H_norm(t) = H(t) / mean(H), so the mean weight is exactly 1.0
-    (entropy weighting redistributes signal, does not change its total scale).
+    Where H_norm(t) = H(t) / mean(H).
+
+    This is a simplified proxy inspired by GTPO (arxiv 2508.04349).
+    The actual GTPO paper uses additive reward shaping with sum-normalized
+    entropy (H_{i,t} / Σ_k H_{k,t}), which is bounded in [0, 1] by
+    construction. Our mean-ratio normalization (H / mean(H)) is unbounded,
+    so we clamp weights to non-negative to match the paper's structural
+    guarantee that entropy weights never flip advantage signs.
 
     Args:
         advantages: Token-level advantages [total_tokens].
@@ -428,12 +435,15 @@ def apply_entropy_weighting(
                         Same length as advantages.
         entropy_weight: β parameter controlling weighting strength.
                        0.0 disables weighting (returns advantages unchanged).
-                       Default 0.1 per GTPO paper.
+                       Default 0.1 per GTPO paper (α₂ = 0.1).
 
     Returns:
         Entropy-weighted advantages [total_tokens].
 
     Notes:
+        - Weights are clamped to [0, ∞) so advantage signs are never flipped.
+          Tokens with very low entropy relative to the mean get weight → 0,
+          meaning they contribute no gradient signal (fully suppressed).
         - Entropy weights are detached from gradient via mx.stop_gradient
           to prevent the model from gaming entropy.
         - When entropy_weight=0, returns advantages unchanged.
@@ -454,10 +464,15 @@ def apply_entropy_weighting(
     # When H_norm = 1 (average entropy), weight = 1 (no change)
     # When H_norm > 1 (high entropy), weight > 1 (amplified)
     # When H_norm < 1 (low entropy), weight < 1 (dampened)
+    #
+    # Clamp to non-negative: the actual GTPO paper (Eq. 3) normalizes
+    # entropy as H/ΣH which is always in [0,1]. Our H/mean(H) proxy
+    # can produce negative weights with large β, which would flip
+    # advantage signs — semantically wrong. Clamping to 0 means
+    # very-low-entropy tokens are fully suppressed (no gradient signal).
+    raw_weights = 1.0 + entropy_weight * (entropy_normalized - 1.0)
     # CRITICAL: Detach from gradient to prevent gaming
-    entropy_weights = mx.stop_gradient(
-        1.0 + entropy_weight * (entropy_normalized - 1.0)
-    )
+    entropy_weights = mx.stop_gradient(mx.maximum(raw_weights, 0.0))
 
     return advantages * entropy_weights
 

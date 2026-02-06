@@ -236,12 +236,57 @@ class TestEntropyWeighting:
             adv = float(advantages[i])
             w = float(weighted[i])
             if adv > 0:
-                assert w > 0, f"Token {i}: positive advantage should stay positive"
+                assert w >= 0, f"Token {i}: positive advantage should stay non-negative"
             elif adv < 0:
-                assert w < 0, f"Token {i}: negative advantage should stay negative"
+                assert w <= 0, f"Token {i}: negative advantage should stay non-positive"
+
+    def test_weighting_preserves_sign_large_beta(self):
+        """Sign preservation must hold even with large β values.
+
+        Regression test: without weight clamping, β=1.5 with entropies
+        [5.0, 1.0, 3.0, 0.5] (mean=2.375) produces a negative weight
+        for token 3: 1 + 1.5*(0.21-1) = -0.185, flipping its advantage.
+        The actual GTPO paper (Eq. 3) uses H/ΣH normalization bounded in
+        [0,1], so negative weights are impossible. Our clamp matches this.
+        """
+        advantages = mx.array([0.5, -0.3, 0.2, -0.1])
+        entropies = mx.array([5.0, 1.0, 3.0, 0.5])  # mean=2.375, token 3 H_norm=0.21
+
+        for beta in [1.0, 1.5, 2.0, 5.0, 10.0]:
+            weighted = grpo.apply_entropy_weighting(advantages, entropies, entropy_weight=beta)
+
+            for i in range(4):
+                adv = float(advantages[i])
+                w = float(weighted[i])
+                if adv > 0:
+                    assert w >= 0, \
+                        f"β={beta}, token {i}: positive advantage flipped to {w}"
+                elif adv < 0:
+                    assert w <= 0, \
+                        f"β={beta}, token {i}: negative advantage flipped to {w}"
+
+    def test_large_beta_clamps_to_zero_not_negative(self):
+        """With very large β, low-entropy tokens should get weight=0, not negative.
+
+        The GTPO paper normalizes entropy as H_{i,t}/Σ_k H_{k,t}, which is
+        structurally bounded in [0,1]. Our H/mean(H) proxy can exceed this
+        range, so we clamp to 0 — fully suppressing gradient for very
+        confident tokens rather than flipping the learning signal.
+        """
+        advantages = mx.array([1.0, 1.0])
+        # Token 1 has entropy far below mean → unclamped weight would be negative
+        entropies = mx.array([5.0, 0.5])  # mean=2.75, H_norm_1 = 0.18
+
+        weighted = grpo.apply_entropy_weighting(advantages, entropies, entropy_weight=2.0)
+        # Token 1: unclamped weight = 1 + 2.0*(0.18-1) = -0.64 → clamped to 0
+        assert float(weighted[1]) == 0.0, \
+            f"Very-low-entropy token should be clamped to 0, got {float(weighted[1])}"
+        # Token 0 should still be amplified
+        assert float(weighted[0]) > float(advantages[0]), \
+            "High-entropy token should still be amplified"
 
     def test_weighting_mean_preserving(self):
-        """Mean of weights should be approximately 1.0 (redistributes, doesn't scale)."""
+        """Mean of unclamped weights should be approximately 1.0 (redistributes, doesn't scale)."""
         entropies = mx.array([1.0, 2.0, 3.0, 4.0, 5.0])
 
         entropy_mean = mx.mean(entropies)
