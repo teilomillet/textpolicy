@@ -187,14 +187,21 @@ def run_full_pipeline(args: argparse.Namespace) -> Dict[str, Any]:
 
     def policy_fn(obs: mx.array, deterministic: bool = False):
         logits = model(obs[None])
+        # Compute logprobs — required by _prepare_batch_from_buffer downstream.
+        log_probs = logits - mx.logsumexp(logits, axis=-1, keepdims=True)
         tokens = mx.argmax(logits[0, -1:], axis=-1)
-        return tokens, {}
+        token_logprob = log_probs[0, -1, tokens[0]]
+        return tokens, {"logprob": token_logprob}
 
     strategy = create_strategy("grpo")
     runner = RolloutRunner(env, policy=policy_fn, strategy=strategy, max_steps=args.episodes)
 
     all_metrics: List[Dict[str, float]] = []
     for step in range(args.warmup + args.steps):
+        # Clear the runner's persistent buffer so episodes don't accumulate
+        # across iterations — each step should measure a fixed-size workload.
+        runner.buffer.clear()
+
         # Rollout
         t0 = time.perf_counter()
         rollout_buffer = runner.collect()
@@ -262,12 +269,14 @@ def _aggregate(
     return summary
 
 
-def _print_summary(result: Dict[str, Any]) -> None:
-    """Print a markdown summary table to stdout."""
+def _build_summary_md(result: Dict[str, Any]) -> str:
+    """Build a markdown summary string from benchmark results."""
+    lines: List[str] = []
     mode = result["mode"]
-    print(f"\n## Amdahl Benchmark — {mode}")
-    print(f"Episodes: {result['episodes']}, length: {result['episode_length']}, "
-          f"steps: {result['steps']} (warmup: {result['warmup']})\n")
+    lines.append(f"## Amdahl Benchmark — {mode}")
+    lines.append(f"Episodes: {result['episodes']}, length: {result['episode_length']}, "
+                 f"steps: {result['steps']} (warmup: {result['warmup']})")
+    lines.append("")
 
     # Inner phases (Trainer)
     rows = []
@@ -284,17 +293,26 @@ def _print_summary(result: Dict[str, Any]) -> None:
         rows.append(["**total**", f"{total_s:.5f}", "100.0%"])
 
     if rows:
-        print(_format_table(rows, ["Phase", "Mean (s)", "% of total"]))
+        lines.append(_format_table(rows, ["Phase", "Mean (s)", "% of total"]))
 
     # Outer phases (full pipeline only)
     if result.get("outer_phases"):
-        print("\n### Outer loop phases\n")
+        lines.append("")
+        lines.append("### Outer loop phases")
+        lines.append("")
         rows = []
         for phase, stats in result["outer_phases"].items():
             rows.append([phase, f"{stats['mean_s']:.5f}", f"{stats['min_s']:.5f}", f"{stats['max_s']:.5f}"])
-        print(_format_table(rows, ["Phase", "Mean (s)", "Min (s)", "Max (s)"]))
+        lines.append(_format_table(rows, ["Phase", "Mean (s)", "Min (s)", "Max (s)"]))
 
+    lines.append("")
+    return "\n".join(lines)
+
+
+def _print_summary(result: Dict[str, Any]) -> None:
+    """Print a markdown summary table to stdout."""
     print()
+    print(_build_summary_md(result))
 
 
 # ---------------------------------------------------------------------------
@@ -331,8 +349,14 @@ def main():
 
     _print_summary(result)
 
-    path = _save_json(result, args.output_dir, mode)
-    print(f"Results saved to: {path}")
+    json_path = _save_json(result, args.output_dir, mode)
+
+    # Write markdown summary alongside the JSON
+    md_path = Path(json_path).with_suffix(".md")
+    md_path.write_text(_build_summary_md(result))
+
+    print(f"Results saved to: {json_path}")
+    print(f"Summary saved to: {md_path}")
 
 
 if __name__ == "__main__":

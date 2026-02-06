@@ -524,8 +524,9 @@ class Trainer:
             batch_data = rollout_data
 
         if timer is not None:
-            if 'obs' in batch_data:
-                mx.eval(batch_data['obs'])  # force pending work before barrier
+            # Eval all array values in the batch to flush pending work from
+            # data selection (obs, act, logprob, rewards may all be lazy).
+            mx.eval(*[v for v in batch_data.values() if isinstance(v, mx.array)])
             timer.stop("data_selection")
 
         # ── Phase: loss_and_grad ───────────────────────────────────────
@@ -546,6 +547,9 @@ class Trainer:
             grads = self._clip_gradients(grads, self.max_grad_norm)
 
         if timer is not None:
+            # Force clipped gradients to materialize so their cost isn't
+            # attributed to optimizer_update.
+            mx.eval(grads)
             timer.stop("grad_clip")
 
         # ── Phase: optimizer_update ────────────────────────────────────
