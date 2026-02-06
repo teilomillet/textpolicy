@@ -394,6 +394,26 @@ class TestRegressionPackEpisodes:
         assert result['episode_lengths'] == [1, 0, 2]
         assert result['prompt_lengths'] == [2, 2, 2]
 
+    def test_all_empty_responses_produce_2d_act(self):
+        """All-empty-response batch must produce 2D (N, 0) act, not 1D (0,).
+
+        Regression: mx.array([], dtype=mx.int64) produces shape (0,) which
+        is 1D. The trainer checks actions.ndim == 2 to enter the batched
+        path — falling to the flat 1D path with no action tokens crashes
+        with 'sequence length mismatch'.
+        """
+        ep1 = SimpleNamespace(obs=[[1, 2]], act=[], rew=[0.0], logprob=[])
+        ep2 = SimpleNamespace(obs=[[3, 4]], act=[], rew=[0.0], logprob=[])
+        result = grpo._pack_episodes([ep1, ep2])
+        mx.eval(result['obs'], result['act'])
+
+        assert result['act'].ndim == 2, f"Expected 2D act, got {result['act'].ndim}D"
+        assert result['act'].shape == (2, 0), f"Expected (2, 0), got {result['act'].shape}"
+        assert result['obs'].ndim == 2, f"Expected 2D obs, got {result['obs'].ndim}D"
+        assert result['obs'].shape[0] == 2, "Expected 2 episode rows"
+        assert result['episode_lengths'] == [0, 0]
+        assert result['prompt_lengths'] == [2, 2]
+
 
 # ===========================================================================
 # 4b. Batched logprob recomputation with empty-response episode (Issue #27)
@@ -468,6 +488,39 @@ class TestRegressionBatchedLogprobEmptyEpisode:
         assert not mx.any(mx.isnan(batched)).item(), "NaN in logprobs"
         assert not mx.any(mx.isinf(batched)).item(), "Inf in logprobs"
         assert mx.all(batched <= 0).item(), f"Positive logprobs: {batched.tolist()}"
+
+    def test_all_empty_responses_round_trip(self):
+        """All-empty-response batch must not crash through batched logprob path.
+
+        Regression: when max_act_len == 0, _pack_episodes produced (0,) 1D
+        act tensor, causing the trainer to fall to the flat 1D path and crash
+        with 'sequence length mismatch'. The fix produces (N, 0) 2D so the
+        batched path is entered and all episodes are skipped via r_len == 0.
+        """
+        from textpolicy.generation.mlx_generation import compute_logprobs_batched
+
+        model = self._make_model()
+
+        ep1 = SimpleNamespace(obs=[[1, 2]], act=[], rew=[0.0], logprob=[])
+        ep2 = SimpleNamespace(obs=[[3, 4]], act=[], rew=[0.0], logprob=[])
+        ep3 = SimpleNamespace(obs=[[5, 6]], act=[], rew=[0.0], logprob=[])
+
+        batch = grpo._pack_episodes([ep1, ep2, ep3])
+
+        # Structural: 2D tensors with correct row count
+        assert batch['act'].ndim == 2, f"act must be 2D, got {batch['act'].ndim}D"
+        assert batch['act'].shape == (3, 0)
+        assert batch['episode_lengths'] == [0, 0, 0]
+
+        # Round-trip through compute_logprobs_batched — must not crash
+        batched = compute_logprobs_batched(
+            model, batch['obs'], batch['act'],
+            batch['prompt_lengths'], batch['episode_lengths'],
+        )
+        mx.eval(batched)
+
+        # Must return empty flat 1D (no response tokens to compute)
+        assert batched.shape == (0,), f"Expected empty logprobs, got shape {batched.shape}"
 
 
 # ===========================================================================

@@ -1170,7 +1170,8 @@ def _pack_episodes(episodes: List[Any]) -> Dict[str, Any]:
                       for obs in all_obs_mx]
         stacked_obs = mx.stack(padded_obs)  # [N, max_obs_len]
     else:
-        stacked_obs = mx.array([], dtype=mx.int64)
+        # All episodes empty — produce (N, 0) 2D for consistency with act.
+        stacked_obs = mx.zeros((len(all_obs_mx), 0), dtype=mx.int64)
 
     if max_act_len > 0:
         padded_acts = [mx.pad(act, (0, max_act_len - act.shape[0]), constant_values=0)
@@ -1178,7 +1179,10 @@ def _pack_episodes(episodes: List[Any]) -> Dict[str, Any]:
                        for act in all_acts_mx]
         stacked_acts = mx.stack(padded_acts)  # [N, max_act_len]
     else:
-        stacked_acts = mx.array([], dtype=mx.int64)
+        # All episodes have empty responses — produce (N, 0) 2D so the
+        # trainer still enters the batched path (where r_len == 0 skips
+        # each episode) instead of falling to the flat 1D path.
+        stacked_acts = mx.zeros((len(all_acts_mx), 0), dtype=mx.int64)
 
     # Logprobs: concatenate WITHOUT padding to preserve flat 1D invariant.
     # Padding would introduce spurious zero-logprobs that break
