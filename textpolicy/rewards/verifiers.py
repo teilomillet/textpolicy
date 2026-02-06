@@ -15,13 +15,6 @@ from dataclasses import dataclass
 from enum import Enum
 from .registry import verifier
 
-
-warnings.warn(
-    "VerificationResult and VerificationReport are deprecated; use boolean verifiers instead.",
-    DeprecationWarning,
-    stacklevel=2,
-)
-
 # Legacy types for backward compatibility (deprecated)
 class VerificationResult(Enum):
     """Result of verification check (deprecated - use boolean verifiers now)."""
