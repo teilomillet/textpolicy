@@ -304,9 +304,10 @@ class Trainer:
         # Python ``if`` on ``mx.any(...)`` calls ``bool(mx.array)`` which
         # triggers ``.item()`` — illegal inside ``mx.compile`` traced
         # functions.  ``mx.where`` keeps everything on the computation graph.
+        sentinel = mx.array(mx.finfo(action_log_probs.dtype).min, dtype=action_log_probs.dtype)
         action_log_probs = mx.where(
             mx.isnan(action_log_probs) | mx.isinf(action_log_probs),
-            mx.array(-1e6, dtype=action_log_probs.dtype),
+            sentinel,
             action_log_probs,
         )
 

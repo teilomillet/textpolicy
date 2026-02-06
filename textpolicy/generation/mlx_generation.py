@@ -439,9 +439,10 @@ def compute_logprobs(
         # (triggers ``.item()``).  Use ``mx.where`` to sanitize NaN/Inf
         # on the computation graph instead.  See _default_get_logprobs
         # in trainer.py for the same pattern.
+        sentinel = mx.array(mx.finfo(selected.dtype).min, dtype=selected.dtype)
         selected = mx.where(
             mx.isnan(selected) | mx.isinf(selected),
-            mx.array(-1e6, dtype=selected.dtype),
+            sentinel,
             selected,
         )
     else:
@@ -696,9 +697,10 @@ def compute_logprobs_batched(
     # values).  Matches the handling in compute_logprobs(_compiled=True)
     # and _default_get_logprobs so all three extraction paths behave
     # consistently.
+    sentinel = mx.array(mx.finfo(result.dtype).min, dtype=result.dtype)
     result = mx.where(
         mx.isnan(result) | mx.isinf(result),
-        mx.array(-1e6, dtype=result.dtype),
+        sentinel,
         result,
     )
 

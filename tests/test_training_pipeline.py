@@ -1099,7 +1099,7 @@ class TestComputeLogprobsCompileSafety:
         )
 
     def test_compiled_flag_sanitizes_nan(self):
-        """_compiled=True replaces NaN/Inf with -1e6 instead of raising."""
+        """_compiled=True replaces NaN/Inf with finfo.min instead of raising."""
         from textpolicy.generation.mlx_generation import compute_logprobs
 
         inner = self._make_model()
@@ -1121,6 +1121,65 @@ class TestComputeLogprobsCompileSafety:
         mx.eval(result)
         assert not mx.any(mx.isnan(result)).item(), "NaN should be sanitized"
         assert not mx.any(mx.isinf(result)).item(), "Inf should be sanitized"
+
+    def test_compiled_sanitizes_fp16_nan_inf(self):
+        """fp16 NaN/Inf must be replaced with finite values, not -inf."""
+        from textpolicy.generation.mlx_generation import compute_logprobs
+        from mlx.utils import tree_map
+
+        inner = self._make_model()
+        # Cast model to fp16
+        inner.update(tree_map(lambda p: p.astype(mx.float16), inner.parameters()))
+        mx.eval(inner.parameters())
+
+        class InfModel(nn.Module):
+            def __init__(self, wrapped):
+                super().__init__()
+                self.wrapped = wrapped
+            def __call__(self, x):
+                logits = self.wrapped(x)
+                return logits.at[0, 2, :].add(float('inf'))
+
+        model = InfModel(inner)
+        prompt = mx.array([1, 2, 3])
+        resp = mx.array([4, 5])
+
+        result = compute_logprobs(model, prompt, resp, _compiled=True)
+        mx.eval(result)
+        assert result.dtype == mx.float16, f"Expected float16, got {result.dtype}"
+        assert not mx.any(mx.isinf(result)).item(), (
+            f"fp16 sentinel overflowed to -inf: {result.tolist()}"
+        )
+        assert not mx.any(mx.isnan(result)).item()
+
+    def test_batched_sanitizes_fp16_nan_inf(self):
+        """compute_logprobs_batched fp16 NaN/Inf → finite, not -inf."""
+        from textpolicy.generation.mlx_generation import compute_logprobs_batched
+        from mlx.utils import tree_map
+
+        inner = self._make_model()
+        inner.update(tree_map(lambda p: p.astype(mx.float16), inner.parameters()))
+        mx.eval(inner.parameters())
+
+        class InfModel(nn.Module):
+            def __init__(self, wrapped):
+                super().__init__()
+                self.wrapped = wrapped
+            def __call__(self, x):
+                logits = self.wrapped(x)
+                # Corrupt first episode's prediction position
+                return logits.at[0, 2, :].add(float('inf'))
+
+        model = InfModel(inner)
+        full_seq = mx.array([[1, 2, 3, 4, 5]])   # 1 episode, prompt=3, resp=2
+        resp_2d = mx.array([[4, 5]])
+
+        result = compute_logprobs_batched(model, full_seq, resp_2d, [3], [2])
+        mx.eval(result)
+        assert not mx.any(mx.isinf(result)).item(), (
+            f"fp16 batched sentinel overflowed to -inf: {result.tolist()}"
+        )
+        assert not mx.any(mx.isnan(result)).item()
 
     def test_compiled_preserves_dtype(self):
         """_compiled=True must not promote fp16 logprobs to fp32."""
