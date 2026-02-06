@@ -317,5 +317,8 @@ def test_rollout_coordinator_multiprocess_collect_returns_fresh_batches():
     finally:
         coordinator.close()
 
+    assert batch1 is not batch2
     assert rewards1 == [1.0, 2.0, 3.0]
     assert rewards2 == [4.0, 5.0, 6.0]
+    # Verify batch1 was NOT mutated by the second collect() call.
+    assert [float(ep.rew[0]) for ep in batch1.episodes] == [1.0, 2.0, 3.0]

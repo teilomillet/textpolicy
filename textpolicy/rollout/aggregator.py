@@ -30,6 +30,7 @@ class BufferAggregator:
             max_episodes: Maximum episodes to keep (oldest are dropped)
         """
         self.num_workers = num_workers
+        self._max_episodes = max_episodes
         self.buffer = Buffer(max_episodes=max_episodes)
         self._worker_queues: List[Optional[mp.Queue]] = [None] * num_workers
 

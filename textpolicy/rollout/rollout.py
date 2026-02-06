@@ -107,8 +107,8 @@ class RolloutCoordinator:
             except queue.Empty:
                 pass
 
-        # Return only data collected for this request.
-        self.aggregator.clear()
+        # Fresh buffer so previously returned references are not mutated.
+        self.aggregator.buffer = Buffer(max_episodes=self.aggregator._max_episodes)
 
         # Request rollouts from all workers
         for worker in self.workers:
