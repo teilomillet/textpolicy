@@ -306,7 +306,7 @@ class Trainer:
         # functions.  ``mx.where`` keeps everything on the computation graph.
         action_log_probs = mx.where(
             mx.isnan(action_log_probs) | mx.isinf(action_log_probs),
-            mx.array(-1e6),
+            mx.array(-1e6, dtype=action_log_probs.dtype),
             action_log_probs,
         )
 
@@ -381,7 +381,10 @@ class Trainer:
                 )
 
             prompt_lengths = batch_data.get('prompt_lengths')
-            new_logprobs = self._extract_grpo_logprobs(observations, actions, old_logprobs, episode_lengths, prompt_lengths)
+            new_logprobs = self._extract_grpo_logprobs(
+                observations, actions, old_logprobs, episode_lengths,
+                prompt_lengths, _compiled=self._compiled,
+            )
         else:
             # Fallback for non-GRPO data or custom pipelines
             if observations.ndim == 1:
@@ -472,6 +475,8 @@ class Trainer:
         old_logprobs: mx.array,
         episode_lengths: List[int],
         prompt_lengths: Optional[List[int]] = None,
+        *,
+        _compiled: bool = False,
     ) -> mx.array:
         """
         Compute per-episode logprobs under the current model.
@@ -494,6 +499,9 @@ class Trainer:
             episode_lengths: Per-episode response token counts.
             prompt_lengths: Per-episode prompt token counts. When provided
                 with 2D observations, enables the batched path.
+            _compiled: When True, use compile-safe validation in Path 2.
+                Callers inside ``mx.compile`` must pass True; callers
+                outside (e.g. metrics) should pass False for eager checks.
 
         Returns:
             Flat 1D log probabilities matching ``old_logprobs`` shape.
@@ -527,7 +535,7 @@ class Trainer:
                 for i in range(num_episodes):
                     ep_logprobs = compute_logprobs(
                         self.model, observations[i], actions[i],
-                        _compiled=self._compiled,
+                        _compiled=_compiled,
                     )
                     per_episode.append(ep_logprobs)
                 new_logprobs = mx.concatenate(per_episode)
@@ -686,7 +694,12 @@ class Trainer:
             if 'episode_lengths' in batch_data:
                 episode_lengths = batch_data['episode_lengths']
                 prompt_lengths = batch_data.get('prompt_lengths')
-                new_logprobs = self._extract_grpo_logprobs(observations, actions, batch_data['logprob'], episode_lengths, prompt_lengths)
+                # Metrics run outside mx.compile → use eager validation
+                # (_compiled=False) so mx.any() barriers are preserved.
+                new_logprobs = self._extract_grpo_logprobs(
+                    observations, actions, batch_data['logprob'],
+                    episode_lengths, prompt_lengths, _compiled=False,
+                )
             else:
                 # Fallback: add batch dimension if needed and call model
                 if observations.ndim == 1:

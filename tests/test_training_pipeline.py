@@ -1045,17 +1045,42 @@ class TestComputeLogprobsCompileSafety:
         mx.eval(model.parameters())
         return model
 
-    def test_default_raises_on_nan(self):
-        """Default mode (_compiled=False) raises ValueError on NaN logprobs."""
+    def test_default_succeeds_on_normal_input(self):
+        """Default mode returns valid logprobs for normal inputs."""
         from textpolicy.generation.mlx_generation import compute_logprobs
 
         model = self._make_model()
         prompt = mx.array([1, 2, 3])
         resp = mx.array([4, 5])
 
-        # Normal call should succeed
         result = compute_logprobs(model, prompt, resp)
+        mx.eval(result)
         assert result.shape[0] == 2
+        assert not mx.any(mx.isnan(result)).item()
+
+    def test_default_raises_on_nan_logprobs(self):
+        """Default mode (_compiled=False) raises ValueError when model outputs NaN."""
+        from textpolicy.generation.mlx_generation import compute_logprobs
+
+        inner = self._make_model()
+
+        # Wrapper that injects NaN into prediction logits
+        class NaNModel(nn.Module):
+            def __init__(self, wrapped):
+                super().__init__()
+                self.wrapped = wrapped
+            def __call__(self, x):
+                logits = self.wrapped(x)
+                return logits.at[0, 2, :].add(float('nan'))
+
+        model = NaNModel(inner)
+
+        prompt = mx.array([1, 2, 3])
+        resp = mx.array([4, 5])
+
+        with pytest.raises(ValueError, match="nan/inf"):
+            result = compute_logprobs(model, prompt, resp)
+            mx.eval(result)
 
     def test_compiled_flag_returns_same_values(self):
         """_compiled=True produces identical values when no NaN/Inf present."""
@@ -1078,15 +1103,47 @@ class TestComputeLogprobsCompileSafety:
         """_compiled=True replaces NaN/Inf with -1e6 instead of raising."""
         from textpolicy.generation.mlx_generation import compute_logprobs
 
-        model = self._make_model()
+        inner = self._make_model()
+
+        class InfModel(nn.Module):
+            def __init__(self, wrapped):
+                super().__init__()
+                self.wrapped = wrapped
+            def __call__(self, x):
+                logits = self.wrapped(x)
+                return logits.at[0, 2, :].add(float('inf'))
+
+        model = InfModel(inner)
         prompt = mx.array([1, 2, 3])
         resp = mx.array([4, 5])
 
-        # With _compiled=True, should not raise — NaN/Inf (if any) get sanitized
+        # _compiled=True should sanitize, not raise
         result = compute_logprobs(model, prompt, resp, _compiled=True)
         mx.eval(result)
-        assert not mx.any(mx.isnan(result)).item(), "Should have no NaN"
-        assert not mx.any(mx.isinf(result)).item(), "Should have no Inf"
+        assert not mx.any(mx.isnan(result)).item(), "NaN should be sanitized"
+        assert not mx.any(mx.isinf(result)).item(), "Inf should be sanitized"
+
+    def test_compiled_preserves_dtype(self):
+        """_compiled=True must not promote fp16 logprobs to fp32."""
+        from textpolicy.generation.mlx_generation import compute_logprobs
+
+        # Build an fp16 model
+        model = self._make_model()
+        from mlx.utils import tree_map
+        model.update(tree_map(lambda p: p.astype(mx.float16), model.parameters()))
+        mx.eval(model.parameters())
+
+        prompt = mx.array([1, 2, 3])
+        resp = mx.array([4, 5])
+
+        result_default = compute_logprobs(model, prompt, resp, _compiled=False)
+        result_compiled = compute_logprobs(model, prompt, resp, _compiled=True)
+        mx.eval(result_default, result_compiled)
+
+        assert result_default.dtype == result_compiled.dtype, (
+            f"dtype mismatch: default={result_default.dtype}, "
+            f"compiled={result_compiled.dtype}"
+        )
 
     def test_compiled_flag_inside_mx_compile(self):
         """_compiled=True is safe inside mx.compile (no .item() calls)."""

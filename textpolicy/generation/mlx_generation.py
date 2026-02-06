@@ -441,7 +441,7 @@ def compute_logprobs(
         # in trainer.py for the same pattern.
         selected = mx.where(
             mx.isnan(selected) | mx.isinf(selected),
-            mx.array(-1e6),
+            mx.array(-1e6, dtype=selected.dtype),
             selected,
         )
     else:
