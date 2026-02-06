@@ -3,7 +3,7 @@
 Main rollout coordinator and public interface.
 """
 
-from typing import List, Callable, Any
+from typing import List, Callable, Any, Optional
 import queue
 import time
 from .worker import RolloutWorker
@@ -11,6 +11,7 @@ from .runner import RolloutRunner
 from .aggregator import BufferAggregator
 from .strategy import create_strategy
 from textpolicy.buffer import Buffer
+from textpolicy.generation.mlx_generation import create_batched_policy
 
 
 class RolloutCoordinator:
@@ -30,11 +31,15 @@ class RolloutCoordinator:
         algorithm: str,
         num_workers: int = 0,
         max_steps: int = 1000,
-        max_episodes: int = 100
+        max_episodes: int = 100,
+        batch_size: int = 1,
+        model: Optional[Any] = None,
+        tokenizer: Optional[Any] = None,
+        generation_params: Optional[dict] = None,
     ):
         """
         Initialize rollout coordinator.
-        
+
         Args:
             env_fn: Function that creates environment instances
             policy_fn: Function that creates policy instances
@@ -42,16 +47,37 @@ class RolloutCoordinator:
             num_workers: Number of worker processes (0 = single-process mode)
             max_steps: Maximum steps per rollout
             max_episodes: Maximum episodes to buffer
+            batch_size: Number of episodes to generate in parallel (1 = sequential).
+            model: Optional explicit model for batched policy construction.
+            tokenizer: Optional explicit tokenizer for batched policy construction.
+            generation_params: Optional generation params override for batched policy.
         """
         self.env_fn = env_fn
         self.policy_fn = policy_fn
         self.algorithm = algorithm
         self.num_workers = num_workers
         self.max_steps = max_steps
-        
+        self.batch_size = max(1, int(batch_size))
+        self._explicit_model = model
+        self._explicit_tokenizer = tokenizer
+        self._explicit_generation_params = generation_params
+
+        if self.batch_size > 1 and self.num_workers > 0:
+            raise ValueError(
+                "batch_size > 1 is supported only in single-process mode "
+                "(num_workers must be 0)."
+            )
+
         # Create strategy for algorithm
         self.strategy = create_strategy(algorithm)
-        
+
+        # Build batched policy when explicit model/tokenizer are provided.
+        self._batched_policy_fn = None
+        if self.batch_size > 1 and model is not None and tokenizer is not None:
+            self._batched_policy_fn = create_batched_policy(
+                model, tokenizer, generation_params
+            )
+
         # Setup for multi-process or single-process mode
         if num_workers > 0:
             self._setup_multiprocess(max_episodes)
@@ -84,6 +110,36 @@ class RolloutCoordinator:
         env = self.env_fn()
         policy = self.policy_fn()
         self.runner = RolloutRunner(env, policy, self.strategy, self.max_steps)
+
+        if self.batch_size > 1 and self._batched_policy_fn is None:
+            # Accept user-supplied batched policy directly.
+            if getattr(policy, "_tp_is_batched", False):
+                self._batched_policy_fn = policy
+                return
+
+            # Prefer explicit constructor args when provided.
+            model = self._explicit_model
+            tokenizer = self._explicit_tokenizer
+            generation_params = self._explicit_generation_params
+
+            # Fallback: derive from create_policy metadata attributes.
+            if model is None:
+                model = getattr(policy, "_tp_model", None)
+            if tokenizer is None:
+                tokenizer = getattr(policy, "_tp_tokenizer", None)
+            if generation_params is None:
+                generation_params = getattr(policy, "_tp_generation_params", None)
+
+            if model is None or tokenizer is None:
+                raise ValueError(
+                    "batch_size > 1 requires a policy created by "
+                    "textpolicy.generation.create_policy/create_batched_policy "
+                    "or explicit model/tokenizer arguments."
+                )
+
+            self._batched_policy_fn = create_batched_policy(
+                model, tokenizer, generation_params
+            )
     
     def collect(self) -> Buffer:
         """
@@ -132,7 +188,11 @@ class RolloutCoordinator:
         return self.aggregator.buffer
     
     def _collect_singleprocess(self) -> Buffer:
-        """Collect data using single process."""
+        """Collect data using single process (sequential or batched)."""
+        if self._batched_policy_fn is not None and self.batch_size > 1:
+            return self.runner.collect_batched(
+                self._batched_policy_fn, self.batch_size
+            )
         return self.runner.collect()
     
     def close(self):
