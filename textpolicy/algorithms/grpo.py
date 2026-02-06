@@ -456,6 +456,14 @@ def apply_entropy_weighting(
     if entropy_weight == 0.0:
         return advantages
 
+    # Fail fast on shape mismatches rather than silently broadcasting
+    if advantages.shape != token_entropies.shape:
+        raise ValueError(
+            f"Shape mismatch: advantages {advantages.shape} vs "
+            f"token_entropies {token_entropies.shape}. "
+            f"Both must be the same shape (token-level)."
+        )
+
     # Normalize entropy: H_norm(t) = H(t) / mean(H)
     entropy_mean = mx.mean(token_entropies)
 
@@ -530,6 +538,14 @@ def compute_advantages_gtpo(
             raise ValueError(
                 f"Number of episodes ({num_episodes}) does not match "
                 f"episode_lengths ({len(episode_lengths)})"
+            )
+        expected_tokens = sum(episode_lengths)
+        actual_tokens = token_entropies.shape[0]
+        if expected_tokens != actual_tokens:
+            raise ValueError(
+                f"sum(episode_lengths)={expected_tokens} does not match "
+                f"token_entropies length {actual_tokens}. "
+                f"Episode boundaries and entropy array must align."
             )
         # Expand: repeat each episode's advantage for its token count
         if len(set(episode_lengths)) == 1:
@@ -902,6 +918,13 @@ def grpo_loss(
         advantages = compute_advantages_gtpo(
             rewards, token_entropies, entropy_weight, episode_lengths
         )
+        # Validate GTPO advantages align with logprobs (both are flat 1D)
+        if advantages.shape[0] != old_logprobs.shape[0]:
+            raise ValueError(
+                f"GTPO advantages length {advantages.shape[0]} does not match "
+                f"old_logprobs length {old_logprobs.shape[0]}. "
+                f"Check episode_lengths sum matches total tokens."
+            )
     else:
         # Standard GRPO: episode-level advantages
         advantages = compute_advantages(rewards)

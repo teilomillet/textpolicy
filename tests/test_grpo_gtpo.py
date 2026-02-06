@@ -401,6 +401,55 @@ class TestStopGradient:
         # The weighted values should be identical to base advantages
         assert mx.allclose(weighted_uniform, advantages, atol=1e-6)
 
+    def test_gradient_wrt_entropies_is_zero(self):
+        """H4 (strong): Gradient of apply_entropy_weighting w.r.t. token_entropies must be zero.
+
+        mx.stop_gradient inside apply_entropy_weighting should ensure that
+        the gradient of the output w.r.t. the entropy input is numerically zero,
+        even though entropy participates in the forward computation.
+        """
+        def fn(advantages, token_entropies):
+            weighted = grpo.apply_entropy_weighting(
+                advantages, token_entropies, entropy_weight=0.3
+            )
+            return mx.sum(weighted)
+
+        advantages = mx.array([0.5, -0.3, 0.8, -0.1])
+        entropies = mx.array([1.0, 4.0, 2.0, 3.0])
+
+        # argnums=1 → differentiate w.r.t. token_entropies (2nd argument)
+        grad_fn = mx.grad(fn, argnums=1)
+        grad_entropies = grad_fn(advantages, entropies)
+        mx.eval(grad_entropies)
+
+        # All gradients w.r.t. entropies should be exactly zero
+        assert mx.allclose(grad_entropies, mx.zeros_like(grad_entropies), atol=1e-12), \
+            f"Gradient w.r.t. token_entropies should be zero, got {grad_entropies}"
+
+    def test_gradient_wrt_advantages_is_nonzero(self):
+        """Sanity check: gradient w.r.t. advantages should be nonzero.
+
+        While entropy weights are detached, the advantages themselves should
+        still have gradient flow (they are the learning signal).
+        """
+        def fn(advantages, token_entropies):
+            weighted = grpo.apply_entropy_weighting(
+                advantages, token_entropies, entropy_weight=0.3
+            )
+            return mx.sum(weighted)
+
+        advantages = mx.array([0.5, -0.3, 0.8, -0.1])
+        entropies = mx.array([1.0, 4.0, 2.0, 3.0])
+
+        # argnums=0 → differentiate w.r.t. advantages (1st argument)
+        grad_fn = mx.grad(fn, argnums=0)
+        grad_advantages = grad_fn(advantages, entropies)
+        mx.eval(grad_advantages)
+
+        # Gradients w.r.t. advantages should be nonzero (they are the entropy weights)
+        assert not mx.allclose(grad_advantages, mx.zeros_like(grad_advantages), atol=1e-6), \
+            "Gradient w.r.t. advantages should be nonzero"
+
 
 # ---------------------------------------------------------------------------
 # H5: GTPO loss produces valid, finite gradients
@@ -680,6 +729,85 @@ class TestGTPOMathematicalProperties:
 
         assert mx.allclose(loss_list, loss_array, atol=1e-6), \
             "List and mx.array rewards should produce identical GTPO loss"
+
+
+# ---------------------------------------------------------------------------
+# Shape validation (defensive checks from Sourcery review)
+# ---------------------------------------------------------------------------
+
+@pytest.mark.unit
+@pytest.mark.algorithm
+class TestGTPOShapeValidation:
+    """Test that shape mismatches raise clear errors rather than silently broadcasting."""
+
+    def test_apply_entropy_weighting_shape_mismatch_raises(self):
+        """Sourcery #1: advantages and token_entropies must have the same shape."""
+        advantages = mx.array([0.5, -0.3, 0.8])
+        wrong_shape_entropies = mx.array([1.0, 2.0])  # Length 2 != 3
+
+        with pytest.raises(ValueError, match="Shape mismatch"):
+            grpo.apply_entropy_weighting(advantages, wrong_shape_entropies, entropy_weight=0.1)
+
+    def test_apply_entropy_weighting_2d_shape_mismatch_raises(self):
+        """Shape check should catch 2D mismatches too."""
+        advantages = mx.array([[0.5, -0.3], [0.8, -0.1]])  # (2, 2)
+        entropies = mx.array([1.0, 2.0, 3.0, 4.0])  # (4,) — different shape
+
+        with pytest.raises(ValueError, match="Shape mismatch"):
+            grpo.apply_entropy_weighting(advantages, entropies, entropy_weight=0.1)
+
+    def test_compute_advantages_gtpo_token_count_mismatch_raises(self):
+        """Sourcery #2: sum(episode_lengths) must match token_entropies length."""
+        rewards = [1.0, 0.0]
+        episode_lengths = [3, 3]  # sum = 6
+        entropies = mx.array([1.0, 2.0, 3.0, 4.0, 5.0])  # length 5 != 6
+
+        with pytest.raises(ValueError, match="does not match"):
+            grpo.compute_advantages_gtpo(
+                rewards, entropies, entropy_weight=0.1, episode_lengths=episode_lengths
+            )
+
+    def test_grpo_loss_gtpo_advantages_logprobs_mismatch_raises(self):
+        """Sourcery #3: GTPO advantages must match old_logprobs length."""
+        old_logprobs = mx.array([-1.0, -1.0, -1.0])  # 3 tokens
+        new_logprobs = mx.array([-0.9, -1.1, -0.9])
+        rewards = [1.0, 0.0]
+        episode_lengths = [2, 2]  # sum = 4, but logprobs has 3
+        entropies = mx.array([1.0, 2.0, 3.0, 4.0])  # 4 tokens (matches episode_lengths)
+
+        with pytest.raises(ValueError, match="does not match"):
+            grpo.grpo_loss(
+                old_logprobs, new_logprobs, rewards,
+                token_entropies=entropies,
+                entropy_weight=0.1,
+                episode_lengths=episode_lengths
+            )
+
+    def test_grpo_loss_gtpo_matching_shapes_passes(self):
+        """Complementary: correct shapes should not raise."""
+        old_logprobs = mx.array([-1.0, -1.0, -1.0, -1.0])  # 4 tokens
+        new_logprobs = mx.array([-0.9, -1.1, -0.9, -1.1])
+        rewards = [1.0, 0.0]
+        episode_lengths = [2, 2]  # sum = 4 matches logprobs
+        entropies = mx.array([1.0, 2.0, 3.0, 4.0])
+
+        # Should not raise
+        loss = grpo.grpo_loss(
+            old_logprobs, new_logprobs, rewards,
+            token_entropies=entropies,
+            entropy_weight=0.1,
+            episode_lengths=episode_lengths
+        )
+        assert not mx.isnan(loss)
+
+    def test_apply_entropy_weighting_matching_shapes_passes(self):
+        """Complementary: matching shapes should work fine."""
+        advantages = mx.array([0.5, -0.3, 0.8])
+        entropies = mx.array([1.0, 2.0, 3.0])
+
+        # Should not raise
+        weighted = grpo.apply_entropy_weighting(advantages, entropies, entropy_weight=0.1)
+        assert weighted.shape == advantages.shape
 
 
 if __name__ == "__main__":
