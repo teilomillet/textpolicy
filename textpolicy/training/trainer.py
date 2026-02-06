@@ -309,28 +309,20 @@ class Trainer:
         # actions contain the response portions that need logprob evaluation
         # old_logprobs has the exact shape we need to match
         
-        try:
-            # GRPO-specific logprob extraction: observations contain prompt+response, actions contain only response
-            # We need to extract logprobs for the response portion from the full sequence logits
-            
-            # Check if we have episode length information to handle prompt/response splitting
-            if 'episode_lengths' in batch_data:
-                episode_lengths = batch_data['episode_lengths']
-                new_logprobs = self._extract_grpo_logprobs(observations, actions, old_logprobs, episode_lengths)
+        # GRPO-specific logprob extraction: observations contain prompt+response,
+        # actions contain only response tokens that need logprob evaluation.
+        if 'episode_lengths' in batch_data:
+            episode_lengths = batch_data['episode_lengths']
+            new_logprobs = self._extract_grpo_logprobs(observations, actions, old_logprobs, episode_lengths)
+        else:
+            # Fallback for non-GRPO data or custom pipelines
+            if observations.ndim == 1:
+                model_input = observations[None]  # Add batch dimension: [1, seq_len]
             else:
-                # Fallback: use default extraction (this will likely fail for GRPO data)
-                if observations.ndim == 1:
-                    model_input = observations[None]  # Add batch dimension: [1, seq_len]
-                else:
-                    model_input = observations  # Already batched: [batch_size, seq_len]
-                
-                model_output = self.model(model_input)
-                new_logprobs = self.get_logprobs_fn(model_output, actions)
-            
-        except Exception as e:
-            # For now, create a placeholder that matches old_logprobs shape
-            # This allows training to continue while we debug the exact issue
-            new_logprobs = mx.zeros_like(old_logprobs)
+                model_input = observations  # Already batched: [batch_size, seq_len]
+
+            model_output = self.model(model_input)
+            new_logprobs = self.get_logprobs_fn(model_output, actions)
         
         # Compute advantages using algorithm-specific function
         advantages = self.advantage_fn(rewards)
@@ -401,55 +393,49 @@ class Trainer:
     
     def _extract_grpo_logprobs(self, observations: mx.array, actions: mx.array, old_logprobs: mx.array, episode_lengths: List[int]) -> mx.array:
         """
-        Simplified GRPO logprob extraction using the existing compute_logprobs function.
-        
-        The key insight: use MLX-LM's logprob computation approach by splitting
-        observations back into prompt and response portions.
-        
+        Compute per-episode logprobs under the current model.
+
+        For text generation (single-step episodes), ``observations`` is 2D
+        ``[num_episodes, prompt_len]`` and ``actions`` is 2D
+        ``[num_episodes, response_len]``.  Each episode gets its own
+        forward pass via ``compute_logprobs(model, prompt, response)``.
+
+        For multi-step RL (flat 1D data), falls back to a single forward
+        pass through ``get_logprobs_fn``.
+
         Args:
-            observations: Full prompt+response sequences [total_tokens]
-            actions: Response tokens only [response_tokens]
-            old_logprobs: Reference logprobs shape to match
-            episode_lengths: Original prompt lengths (currently unused, will be needed for proper splitting)
-            
+            observations: Episode observations — 2D ``[num_episodes, prompt_len]``
+                for text generation, or flat 1D for multi-step RL.
+            actions: Episode actions — 2D ``[num_episodes, response_len]``
+                for text generation, or flat 1D for multi-step RL.
+            old_logprobs: Reference logprobs (flat 1D) for shape validation.
+            episode_lengths: Per-episode step counts from ``train()``.
+
         Returns:
-            Log probabilities for response tokens
+            Flat 1D log probabilities matching ``old_logprobs`` shape.
         """
-        # Temporary fix: use compute_logprobs from MLX generation with artificial prompt/response split
-        # This assumes uniform episode structure for simplicity
-        try:
+        num_episodes = len(episode_lengths)
+
+        if observations.ndim == 2 and actions.ndim == 2:
+            # Text generation: each row is one episode.
+            # observations[i] = prompt tokens, actions[i] = response tokens.
             from textpolicy.generation.mlx_generation import compute_logprobs
-            
-            # Estimate average prompt length (this is a simplification)
-            total_obs_tokens = observations.size  # Use MLX size property instead of len()
-            total_response_tokens = actions.size  # Use MLX size property instead of len()
-            num_episodes = len(episode_lengths)
-            avg_prompt_length = sum(episode_lengths) // num_episodes if episode_lengths else 4
-            avg_response_length = total_response_tokens // num_episodes
-            
-            # For now, create a simple prompt by taking first avg_prompt_length tokens
-            # This is a temporary solution - proper implementation would split per episode
-            prompt_tokens = observations[:avg_prompt_length]
-            response_tokens = actions[:avg_response_length]  # Use only first episode worth of tokens
-            
-            # Use the proper compute_logprobs function
-            logprobs = compute_logprobs(self.model, prompt_tokens, response_tokens)
-            
-            # Repeat for all episodes (crude approximation)
-            repeated_logprobs = mx.tile(logprobs, num_episodes)
-            
-            # Truncate or pad to match old_logprobs shape
-            if len(repeated_logprobs) > len(old_logprobs):
-                return repeated_logprobs[:len(old_logprobs)]
-            elif len(repeated_logprobs) < len(old_logprobs):
-                padding = mx.zeros(len(old_logprobs) - len(repeated_logprobs))
-                return mx.concatenate([repeated_logprobs, padding])
-            else:
-                return repeated_logprobs
-                
-        except Exception as e:
-            # Final fallback: return zeros with correct shape
-            return mx.zeros_like(old_logprobs)
+
+            per_episode = []
+            for i in range(num_episodes):
+                ep_logprobs = compute_logprobs(
+                    self.model, observations[i], actions[i]
+                )
+                per_episode.append(ep_logprobs)
+            return mx.concatenate(per_episode)
+
+        # Flat 1D: multi-step RL — use the generic logprob extraction.
+        if observations.ndim == 1:
+            model_input = observations[None]
+        else:
+            model_input = observations
+        model_output = self.model(model_input)
+        return self.get_logprobs_fn(model_output, actions)
 
     def _expand_advantages(self, advantages: mx.array, episode_lengths: List[int]) -> mx.array:
         """

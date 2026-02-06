@@ -289,6 +289,10 @@ class TestMetricsInterval:
             metrics_fn=counting_metrics_fn,
             compile_training=False,
             metrics_interval=metrics_interval,
+            # Linear(4,4) can't produce valid sequence logits; bypass
+            # _default_get_logprobs since this test is about metrics_interval
+            # scheduling, not logprob correctness.
+            get_logprobs_fn=lambda model_out, acts: -mx.ones(acts.shape),
         )
         return trainer, call_count
 
@@ -299,9 +303,6 @@ class TestMetricsInterval:
             'act': mx.array([1, 2, 3]),
             'logprob': mx.array([-1.0, -1.0, -1.0]),
             'rewards': mx.array([1.0, 0.5]),
-            # Provide episode_lengths so the metrics path uses
-            # _extract_grpo_logprobs (which has a try/except fallback)
-            # instead of a direct model forward pass
             'episode_lengths': [2, 1],
         }
 
@@ -534,10 +535,11 @@ class TestPipelineRegression:
             loss_fn=lambda o, n, a: mx.mean(n),
             optimizer=optimizer,
             compile_training=False,
+            get_logprobs_fn=lambda model_out, acts: -mx.ones(acts.shape),
         )
 
         batch = {
-            'obs': mx.random.normal((10,)),
+            'obs': mx.random.normal((4,)),
             'act': mx.array([1, 2, 3]),
             'logprob': mx.array([-1.0, -1.0, -1.0]),
             'rewards': mx.array([1.0, 0.5, -0.2]),

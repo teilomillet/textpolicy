@@ -214,6 +214,10 @@ class TestAdvantageExpansion:
             optimizer=optim.Adam(learning_rate=1e-3),
             advantage_fn=grpo.compute_advantages,
             compile_training=False,
+            # TinyLM(Linear(10,10)) can't produce valid [seq_len, vocab]
+            # logits from flat 1D input; bypass _default_get_logprobs so
+            # the advantage expansion validation is what gets tested.
+            get_logprobs_fn=lambda model_out, acts: -mx.ones(acts.shape),
         )
 
     def test_variable_length_episodes_use_real_lengths(self):
@@ -270,7 +274,7 @@ class TestAdvantageExpansion:
 
         # 3 episodes worth of rewards → 3 advantages, but episode_lengths has 2
         batch_data = {
-            'obs': mx.zeros(7),
+            'obs': mx.zeros(10),  # match TinyLM's Linear(10,10) input dim
             'act': mx.zeros(7, dtype=mx.int32),
             'logprob': mx.zeros(7),
             'rewards': mx.array([1.0, 0.5, -0.5]),
@@ -285,7 +289,7 @@ class TestAdvantageExpansion:
 
         # episode_lengths sum to 6, but logprobs have 7 tokens
         batch_data = {
-            'obs': mx.zeros(7),
+            'obs': mx.zeros(10),  # match TinyLM's Linear(10,10) input dim
             'act': mx.zeros(7, dtype=mx.int32),
             'logprob': mx.zeros(7),
             'rewards': mx.array([1.0, 0.5]),
@@ -293,6 +297,144 @@ class TestAdvantageExpansion:
         }
         with pytest.raises(ValueError, match="does not match total_tokens"):
             trainer._loss_fn(batch_data)
+
+
+@pytest.mark.unit
+class TestExtractGrpoLogprobs2D:
+    """Direct tests for the 2D per-episode branch of _extract_grpo_logprobs.
+
+    The 2D branch handles text generation episodes where observations are
+    [num_episodes, prompt_len] and actions are [num_episodes, response_len].
+    Each episode gets its own forward pass via compute_logprobs(model, prompt,
+    response), and the results are concatenated into a flat 1D array.
+    """
+
+    def _make_model(self, vocab_size=16, dim=8):
+        """Minimal causal LM: embedding + head → [batch, seq_len, vocab_size]."""
+        class TinyLM(nn.Module):
+            def __init__(self):
+                super().__init__()
+                self.embed = nn.Embedding(vocab_size, dim)
+                self.head = nn.Linear(dim, vocab_size)
+            def __call__(self, x):
+                return self.head(self.embed(x))
+
+        model = TinyLM()
+        mx.eval(model.parameters())
+        return model
+
+    def _make_trainer(self, model):
+        from textpolicy.training import Trainer
+        from textpolicy.algorithms import grpo
+        return Trainer(
+            model=model,
+            loss_fn=grpo.policy_loss,
+            optimizer=optim.Adam(learning_rate=1e-3),
+            advantage_fn=grpo.compute_advantages,
+            compile_training=False,
+        )
+
+    def test_output_is_flat_with_correct_length(self):
+        """H1: Output is flat 1D with length = num_episodes * response_len."""
+        model = self._make_model()
+        trainer = self._make_trainer(model)
+
+        num_episodes, prompt_len, response_len = 3, 4, 5
+        obs = mx.array([[1, 2, 3, 4], [5, 6, 7, 8], [9, 10, 11, 12]])
+        act = mx.array([[1, 2, 3, 4, 5], [6, 7, 8, 9, 10], [11, 12, 13, 14, 15]])
+        old_lp = mx.zeros(num_episodes * response_len)
+        ep_lengths = [1] * num_episodes
+
+        result = trainer._extract_grpo_logprobs(obs, act, old_lp, ep_lengths)
+        mx.eval(result)
+
+        assert result.ndim == 1
+        assert result.shape[0] == num_episodes * response_len
+
+    def test_logprobs_are_valid(self):
+        """H2: All returned values are ≤ 0 with no NaN or Inf."""
+        model = self._make_model()
+        trainer = self._make_trainer(model)
+
+        obs = mx.array([[1, 2, 3], [7, 8, 9]])
+        act = mx.array([[4, 5, 6, 7], [10, 11, 12, 13]])
+        old_lp = mx.zeros(8)
+        ep_lengths = [1, 1]
+
+        result = trainer._extract_grpo_logprobs(obs, act, old_lp, ep_lengths)
+        mx.eval(result)
+
+        assert not mx.any(mx.isnan(result)).item()
+        assert not mx.any(mx.isinf(result)).item()
+        assert mx.all(result <= 0).item()
+
+    def test_per_episode_not_tiled(self):
+        """H3: Different prompts produce different logprobs.
+
+        Regression: the old code computed logprobs from a single averaged
+        prompt/response slice and mx.tile'd across episodes. With distinct
+        inputs the per-episode logprobs must differ.
+        """
+        model = self._make_model()
+        trainer = self._make_trainer(model)
+
+        obs = mx.array([[1, 2, 3], [10, 11, 12]])
+        act = mx.array([[4, 5], [13, 14]])
+        old_lp = mx.zeros(4)
+        ep_lengths = [1, 1]
+
+        result = trainer._extract_grpo_logprobs(obs, act, old_lp, ep_lengths)
+        mx.eval(result)
+
+        ep1_lp = result[:2]
+        ep2_lp = result[2:]
+        diff = mx.max(mx.abs(ep1_lp - ep2_lp)).item()
+        assert diff > 1e-6, (
+            f"Per-episode logprobs should differ for different inputs, "
+            f"got ep1={ep1_lp.tolist()} ep2={ep2_lp.tolist()}"
+        )
+
+    def test_matches_direct_compute_logprobs(self):
+        """H4: Output equals calling compute_logprobs per episode then concatenating."""
+        from textpolicy.generation.mlx_generation import compute_logprobs
+
+        model = self._make_model()
+        trainer = self._make_trainer(model)
+
+        obs = mx.array([[1, 2, 3], [7, 8, 9]])
+        act = mx.array([[4, 5, 6], [10, 11, 12]])
+        old_lp = mx.zeros(6)
+        ep_lengths = [1, 1]
+
+        result = trainer._extract_grpo_logprobs(obs, act, old_lp, ep_lengths)
+        mx.eval(result)
+
+        expected_ep1 = compute_logprobs(model, obs[0], act[0])
+        expected_ep2 = compute_logprobs(model, obs[1], act[1])
+        expected = mx.concatenate([expected_ep1, expected_ep2])
+        mx.eval(expected)
+
+        assert mx.allclose(result, expected, atol=1e-5).item(), (
+            f"Trainer result {result.tolist()} doesn't match "
+            f"direct compute_logprobs {expected.tolist()}"
+        )
+
+    def test_single_episode_degenerate(self):
+        """H5: Single episode (degenerate case) produces valid output."""
+        model = self._make_model()
+        trainer = self._make_trainer(model)
+
+        obs = mx.array([[1, 2, 3]])
+        act = mx.array([[5, 6]])
+        old_lp = mx.zeros(2)
+        ep_lengths = [1]
+
+        result = trainer._extract_grpo_logprobs(obs, act, old_lp, ep_lengths)
+        mx.eval(result)
+
+        assert result.ndim == 1
+        assert result.shape[0] == 2
+        assert mx.all(result <= 0).item()
 
 
 @pytest.mark.integration
