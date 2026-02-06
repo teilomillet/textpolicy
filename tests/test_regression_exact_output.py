@@ -371,6 +371,29 @@ class TestRegressionPackEpisodes:
             f"Expected [3, 2], got {result['prompt_lengths']}"
         )
 
+    def test_empty_act_episode_preserves_row_alignment(self):
+        """Empty-act episode in the middle must keep obs/act row count == N.
+
+        Regression: filtering out empty-act arrays before stacking caused
+        act.shape[0] < len(episode_lengths), breaking batched logprob
+        extraction.
+        """
+        ep1 = SimpleNamespace(obs=[[1, 2]], act=[[3]], rew=[1.0], logprob=[-0.5])
+        ep2 = SimpleNamespace(obs=[[4, 5]], act=[], rew=[0.0], logprob=[])
+        ep3 = SimpleNamespace(obs=[[6, 7]], act=[[8, 9]], rew=[0.5], logprob=[-0.3, -0.4])
+        result = grpo._pack_episodes([ep1, ep2, ep3])
+        mx.eval(result['obs'], result['act'])
+
+        n_episodes = len(result['episode_lengths'])
+        assert result['obs'].shape[0] == n_episodes, (
+            f"obs rows {result['obs'].shape[0]} != {n_episodes} episodes"
+        )
+        assert result['act'].shape[0] == n_episodes, (
+            f"act rows {result['act'].shape[0]} != {n_episodes} episodes"
+        )
+        assert result['episode_lengths'] == [1, 0, 2]
+        assert result['prompt_lengths'] == [2, 2, 2]
+
 
 # ===========================================================================
 # 5. GSPO

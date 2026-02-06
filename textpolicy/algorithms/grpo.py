@@ -1155,27 +1155,27 @@ def _pack_episodes(episodes: List[Any]) -> Dict[str, Any]:
     max_obs_len = max(len(obs) for obs in all_obs) if all_obs else 0
     max_act_len = max(len(act) for act in all_acts) if all_acts else 0
 
-    # Convert to MLX arrays with padding
-    all_obs_mx = [mx.array(obs, dtype=mx.int64) if obs else mx.array([], dtype=mx.int64) for obs in all_obs]
-    all_acts_mx = [mx.array(act, dtype=mx.int64) if act else mx.array([], dtype=mx.int64) for act in all_acts]
+    # Convert to MLX arrays — keep ALL episodes (including empty ones) to
+    # maintain 1:1 alignment with episode_lengths and prompt_lengths.
+    # Empty episodes get zero-padded rows; compute_logprobs_batched skips
+    # them via the r_len == 0 check.
+    all_obs_mx = [mx.array(obs, dtype=mx.int64) if obs else mx.zeros(0, dtype=mx.int64) for obs in all_obs]
+    all_acts_mx = [mx.array(act, dtype=mx.int64) if act else mx.zeros(0, dtype=mx.int64) for act in all_acts]
 
-    # Filter out empty arrays for padding
-    non_empty_obs = [obs for obs in all_obs_mx if obs.size > 0]
-    non_empty_acts = [act for act in all_acts_mx if act.size > 0]
-
-    # Pad and stack to 2D: [N, max_len] — enables batched model forward passes
-    if non_empty_obs:
+    # Pad and stack to 2D: [N, max_len] — enables batched model forward passes.
+    # Every episode gets a row, even empty ones (padded to max_len with zeros).
+    if max_obs_len > 0:
         padded_obs = [mx.pad(obs, (0, max_obs_len - obs.shape[0]), constant_values=0)
                       if obs.shape[0] < max_obs_len else obs[:max_obs_len]
-                      for obs in non_empty_obs]
+                      for obs in all_obs_mx]
         stacked_obs = mx.stack(padded_obs)  # [N, max_obs_len]
     else:
         stacked_obs = mx.array([], dtype=mx.int64)
 
-    if non_empty_acts:
+    if max_act_len > 0:
         padded_acts = [mx.pad(act, (0, max_act_len - act.shape[0]), constant_values=0)
                        if act.shape[0] < max_act_len else act[:max_act_len]
-                       for act in non_empty_acts]
+                       for act in all_acts_mx]
         stacked_acts = mx.stack(padded_acts)  # [N, max_act_len]
     else:
         stacked_acts = mx.array([], dtype=mx.int64)

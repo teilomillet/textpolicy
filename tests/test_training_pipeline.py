@@ -603,6 +603,48 @@ class TestExtractGrpoLogprobsBatched:
         assert not mx.any(mx.isinf(result)).item(), "Inf in batched logprobs"
         assert mx.all(result <= 0).item(), f"Positive logprobs: {result.tolist()}"
 
+    def test_empty_response_episode_in_middle(self):
+        """Regression: empty-act episode between non-empty ones must not crash.
+
+        Previously, _pack_episodes filtered out empty-act rows before stacking,
+        causing act.shape[0] < len(prompt_lengths). compute_logprobs_batched
+        then indexed out of bounds on the third episode.
+        """
+        from textpolicy.generation.mlx_generation import compute_logprobs
+        from textpolicy.algorithms.grpo import _pack_episodes
+        from types import SimpleNamespace
+
+        model = self._make_model()
+        trainer = self._make_trainer(model)
+
+        ep1 = SimpleNamespace(obs=[[1, 2, 3]], act=[[4, 5]], rew=[1.0], logprob=[-0.5, -0.6])
+        ep2 = SimpleNamespace(obs=[[6, 7]], act=[], rew=[0.0], logprob=[])
+        ep3 = SimpleNamespace(obs=[[8, 9]], act=[[10, 11, 12]], rew=[0.5], logprob=[-0.3, -0.4, -0.7])
+
+        batch = _pack_episodes([ep1, ep2, ep3])
+
+        # act must have same number of rows as obs / episode_lengths
+        assert batch['obs'].shape[0] == batch['act'].shape[0] == 3
+
+        result = trainer._extract_grpo_logprobs(
+            batch['obs'], batch['act'], batch['logprob'],
+            batch['episode_lengths'], batch['prompt_lengths'],
+        )
+        mx.eval(result)
+
+        assert result.ndim == 1
+        assert result.shape[0] == sum(batch['episode_lengths'])  # 2+0+3 = 5
+
+        # Verify against sequential (skip empty ep2)
+        seq1 = compute_logprobs(model, mx.array([1, 2, 3]), mx.array([4, 5]))
+        seq3 = compute_logprobs(model, mx.array([8, 9]), mx.array([10, 11, 12]))
+        sequential = mx.concatenate([seq1, seq3])
+        mx.eval(sequential)
+
+        assert mx.allclose(result, sequential, atol=1e-5).item(), (
+            f"Batched {result.tolist()} != sequential {sequential.tolist()}"
+        )
+
 
 @pytest.mark.integration
 class TestCompiledTraining:
