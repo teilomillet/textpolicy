@@ -400,6 +400,17 @@ def compute_logprobs_batched(
         - The Python loop over episodes is cheap indexing, not model calls.
         - No ``.item()`` or ``mx.eval()`` calls — safe inside ``mx.compile``.
     """
+    if full_sequences.ndim != 2:
+        raise ValueError(
+            f"full_sequences must be 2D [N, max_seq_len], got {full_sequences.ndim}D "
+            f"with shape {full_sequences.shape}."
+        )
+    if response_tokens.ndim != 2:
+        raise ValueError(
+            f"response_tokens must be 2D [N, max_resp_len], got {response_tokens.ndim}D "
+            f"with shape {response_tokens.shape}."
+        )
+
     n_episodes = full_sequences.shape[0]
 
     if n_episodes == 0:

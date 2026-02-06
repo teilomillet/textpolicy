@@ -323,6 +323,19 @@ class Trainer:
         # actions contain only response tokens that need logprob evaluation.
         if 'episode_lengths' in batch_data:
             episode_lengths = batch_data['episode_lengths']
+
+            # Fail fast: old_logprobs must have exactly sum(episode_lengths)
+            # entries. A mismatch here means _pack_episodes produced
+            # inconsistent data — catch it before it causes a cryptic
+            # broadcast error in loss computation.
+            expected_tokens = sum(episode_lengths)
+            if old_logprobs.shape[0] != expected_tokens:
+                raise ValueError(
+                    f"old_logprobs.shape[0]={old_logprobs.shape[0]} does not "
+                    f"match sum(episode_lengths)={expected_tokens}. The batch "
+                    f"data is inconsistent."
+                )
+
             prompt_lengths = batch_data.get('prompt_lengths')
             new_logprobs = self._extract_grpo_logprobs(observations, actions, old_logprobs, episode_lengths, prompt_lengths)
         else:
