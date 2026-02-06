@@ -346,33 +346,22 @@ class Trainer:
         
         if advantages.shape[0] != new_logprobs.shape[0] and not needs_sequence_level:  # type: ignore
             # Expand episode-level advantages to token-level for token-based algorithms (GRPO, PPO)
-            # This handles the common case where advantages are per-episode but logprobs are per-token
-            # 
+            #
             # GRPO: advantages [episodes] → [total_tokens] for token-level importance sampling
             # GSPO: advantages stay [episodes] for sequence-level importance sampling (handled above)
-            # Use robust token distribution to handle variable-length episodes
             num_episodes = advantages.shape[0]  # type: ignore
             total_tokens = new_logprobs.shape[0]  # type: ignore
-            
-            # Distribute tokens as evenly as possible across episodes (same approach as GSPO)
-            base_length = total_tokens // num_episodes
-            remainder = total_tokens % num_episodes
-            # Distribute remainder tokens to first 'remainder' episodes
-            action_lengths = [base_length + (1 if i < remainder else 0) for i in range(num_episodes)]
-            
-            # Debug logging for development (can be removed in production)
-            if getattr(self, '_debug_logging', False):
-                logger = logging.getLogger(__name__)
-                logger.debug(
-                    "Advantage expansion: %d episodes -> %d tokens", num_episodes, total_tokens
-                )
-                logger.debug(
-                    "Distribution: base=%d, remainder=%d", base_length, remainder
-                )
-                logger.debug(
-                    "Sample lengths: %r...", action_lengths[:3]
-                )
-            
+
+            # Use real episode lengths when available (the standard path via train()).
+            # Fall back to even distribution only when episode_lengths is missing
+            # (e.g. direct _loss_fn calls from tests or custom pipelines).
+            if 'episode_lengths' in batch_data:
+                action_lengths = batch_data['episode_lengths']
+            else:
+                base_length = total_tokens // num_episodes
+                remainder = total_tokens % num_episodes
+                action_lengths = [base_length + (1 if i < remainder else 0) for i in range(num_episodes)]
+
             advantages = self._expand_advantages(advantages, action_lengths)
 
             if getattr(self, '_debug_logging', False):
