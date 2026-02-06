@@ -436,6 +436,7 @@ class Trainer:
             Flat 1D log probabilities matching ``old_logprobs`` shape.
         """
         num_episodes = len(episode_lengths)
+        expected_tokens = sum(episode_lengths)
 
         if observations.ndim == 2 and actions.ndim == 2:
             # Path 1: Batched — single model forward pass for all episodes
@@ -448,32 +449,44 @@ class Trainer:
 
                 from textpolicy.generation.mlx_generation import compute_logprobs_batched
 
-                return compute_logprobs_batched(
+                new_logprobs = compute_logprobs_batched(
                     self.model,
                     observations,   # [N, max_obs_len]
                     actions,        # [N, max_act_len]
                     prompt_lengths,
                     episode_lengths,
                 )
+            else:
+                # Path 2: Sequential compat — N per-episode forward passes
+                from textpolicy.generation.mlx_generation import compute_logprobs
 
-            # Path 2: Sequential compat — N per-episode forward passes
-            from textpolicy.generation.mlx_generation import compute_logprobs
-
-            per_episode = []
-            for i in range(num_episodes):
-                ep_logprobs = compute_logprobs(
-                    self.model, observations[i], actions[i]
-                )
-                per_episode.append(ep_logprobs)
-            return mx.concatenate(per_episode)
-
-        # Path 3: Flat 1D — multi-step RL generic path.
-        if observations.ndim == 1:
-            model_input = observations[None]
+                per_episode = []
+                for i in range(num_episodes):
+                    ep_logprobs = compute_logprobs(
+                        self.model, observations[i], actions[i]
+                    )
+                    per_episode.append(ep_logprobs)
+                new_logprobs = mx.concatenate(per_episode)
         else:
-            model_input = observations
-        model_output = self.model(model_input)
-        return self.get_logprobs_fn(model_output, actions)
+            # Path 3: Flat 1D — multi-step RL generic path.
+            if observations.ndim == 1:
+                model_input = observations[None]
+            else:
+                model_input = observations
+            model_output = self.model(model_input)
+            new_logprobs = self.get_logprobs_fn(model_output, actions)
+
+        # Post-condition: new_logprobs must be flat 1D with one entry per
+        # real response token. A mismatch here means one of the extraction
+        # paths produced the wrong number of logprobs.
+        if new_logprobs.shape[0] != expected_tokens:
+            raise ValueError(
+                f"new_logprobs.shape[0]={new_logprobs.shape[0]} does not match "
+                f"sum(episode_lengths)={expected_tokens}. The logprob extraction "
+                f"path produced the wrong number of tokens."
+            )
+
+        return new_logprobs
 
     def _expand_advantages(self, advantages: mx.array, episode_lengths: List[int]) -> mx.array:
         """

@@ -423,6 +423,13 @@ def compute_logprobs_batched(
             f"response_tokens has {response_tokens.shape[0]} rows but "
             f"full_sequences has {n_episodes} rows. They must match."
         )
+    max_r_len = max(response_lengths) if response_lengths else 0
+    if max_r_len > 0 and response_tokens.shape[1] < max_r_len:
+        raise ValueError(
+            f"response_tokens has {response_tokens.shape[1]} columns but "
+            f"max(response_lengths)={max_r_len}. The response_tokens tensor "
+            f"must be wide enough to hold the longest response."
+        )
 
     # Single batched forward pass: [N, max_seq_len] → [N, max_seq_len, vocab]
     logits = model(full_sequences)

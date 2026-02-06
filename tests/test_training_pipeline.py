@@ -295,7 +295,7 @@ class TestAdvantageExpansion:
             'rewards': mx.array([1.0, 0.5]),
             'episode_lengths': [3, 3],  # sum=6, but 7 tokens
         }
-        with pytest.raises(ValueError, match="does not match total_tokens"):
+        with pytest.raises(ValueError, match="does not match sum\\(episode_lengths\\)"):
             trainer._loss_fn(batch_data)
 
 
@@ -343,7 +343,7 @@ class TestExtractGrpoLogprobs2D:
         obs = mx.array([[1, 2, 3, 4], [5, 6, 7, 8], [9, 10, 11, 12]])
         act = mx.array([[1, 2, 3, 4, 5], [6, 7, 8, 9, 10], [11, 12, 13, 14, 15]])
         old_lp = mx.zeros(num_episodes * response_len)
-        ep_lengths = [1] * num_episodes
+        ep_lengths = [response_len] * num_episodes
 
         result = trainer._extract_grpo_logprobs(obs, act, old_lp, ep_lengths)
         mx.eval(result)
@@ -359,7 +359,7 @@ class TestExtractGrpoLogprobs2D:
         obs = mx.array([[1, 2, 3], [7, 8, 9]])
         act = mx.array([[4, 5, 6, 7], [10, 11, 12, 13]])
         old_lp = mx.zeros(8)
-        ep_lengths = [1, 1]
+        ep_lengths = [4, 4]
 
         result = trainer._extract_grpo_logprobs(obs, act, old_lp, ep_lengths)
         mx.eval(result)
@@ -381,7 +381,7 @@ class TestExtractGrpoLogprobs2D:
         obs = mx.array([[1, 2, 3], [10, 11, 12]])
         act = mx.array([[4, 5], [13, 14]])
         old_lp = mx.zeros(4)
-        ep_lengths = [1, 1]
+        ep_lengths = [2, 2]
 
         result = trainer._extract_grpo_logprobs(obs, act, old_lp, ep_lengths)
         mx.eval(result)
@@ -404,7 +404,7 @@ class TestExtractGrpoLogprobs2D:
         obs = mx.array([[1, 2, 3], [7, 8, 9]])
         act = mx.array([[4, 5, 6], [10, 11, 12]])
         old_lp = mx.zeros(6)
-        ep_lengths = [1, 1]
+        ep_lengths = [3, 3]
 
         result = trainer._extract_grpo_logprobs(obs, act, old_lp, ep_lengths)
         mx.eval(result)
@@ -427,7 +427,7 @@ class TestExtractGrpoLogprobs2D:
         obs = mx.array([[1, 2, 3]])
         act = mx.array([[5, 6]])
         old_lp = mx.zeros(2)
-        ep_lengths = [1]
+        ep_lengths = [2]
 
         result = trainer._extract_grpo_logprobs(obs, act, old_lp, ep_lengths)
         mx.eval(result)
