@@ -405,6 +405,25 @@ def compute_logprobs_batched(
     if n_episodes == 0:
         return mx.array([], dtype=mx.float32)
 
+    # Defensive shape check: all episode-indexed inputs must have N entries.
+    # A mismatch here means _pack_episodes dropped rows (e.g. filtering out
+    # empty episodes before stacking) — catch it early with a clear message.
+    if len(prompt_lengths) != n_episodes:
+        raise ValueError(
+            f"prompt_lengths has {len(prompt_lengths)} entries but "
+            f"full_sequences has {n_episodes} rows. They must match."
+        )
+    if len(response_lengths) != n_episodes:
+        raise ValueError(
+            f"response_lengths has {len(response_lengths)} entries but "
+            f"full_sequences has {n_episodes} rows. They must match."
+        )
+    if response_tokens.shape[0] != n_episodes:
+        raise ValueError(
+            f"response_tokens has {response_tokens.shape[0]} rows but "
+            f"full_sequences has {n_episodes} rows. They must match."
+        )
+
     # Single batched forward pass: [N, max_seq_len] → [N, max_seq_len, vocab]
     logits = model(full_sequences)
 
