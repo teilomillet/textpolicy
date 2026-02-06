@@ -337,6 +337,20 @@ class TestHicraComposition:
             f"Expected {expected.tolist()}, got {result.tolist()}"
         )
 
+    def test_misaligned_episode_lengths_raises(self):
+        """H3: sum(episode_lengths) != len(token_ids) gives clear error."""
+        rewards = [1.0, 0.0]
+        episode_lengths = [3, 2]  # sum = 5
+        vocab = {0: "a", 1: "b", 2: "c"}
+        tok = MockTokenizer(vocab)
+        # Only 3 token IDs, but episode_lengths sums to 5
+        token_ids = mx.array([0, 1, 2], dtype=mx.int32)
+        with pytest.raises(ValueError, match="sum\\(episode_lengths\\)=5.*token_ids length 3"):
+            compute_advantages_hicra(
+                rewards, token_ids, tok, ["a b"],
+                episode_lengths=episode_lengths,
+            )
+
     def test_gtpo_then_hicra_composition(self):
         """H2: GTPO + HICRA composes correctly (GTPO first, then HICRA)."""
         rewards = [1.0, 0.0]

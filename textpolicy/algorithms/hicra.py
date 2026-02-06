@@ -221,6 +221,14 @@ def compute_advantages_hicra(
                 f"Number of episodes ({num_episodes}) does not match "
                 f"episode_lengths ({len(episode_lengths)})"
             )
+        expected_tokens = sum(episode_lengths)
+        actual_tokens = token_ids.shape[0]
+        if expected_tokens != actual_tokens:
+            raise ValueError(
+                f"sum(episode_lengths)={expected_tokens} does not match "
+                f"token_ids length {actual_tokens}. "
+                f"Episode boundaries and token_ids array must align."
+            )
         if len(set(episode_lengths)) == 1:
             expanded = mx.repeat(base_advantages, episode_lengths[0])
         else:
