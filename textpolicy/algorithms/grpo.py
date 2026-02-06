@@ -421,31 +421,40 @@ def apply_entropy_weighting(
 
     Where H_norm(t) = H(t) / mean(H).
 
-    This is a simplified proxy inspired by GTPO (arxiv 2508.04349).
-    The actual GTPO paper uses additive reward shaping with sum-normalized
-    entropy (H_{i,t} / Σ_k H_{k,t}), which is bounded in [0, 1] by
-    construction. Our mean-ratio normalization (H / mean(H)) is unbounded,
-    so we clamp weights to non-negative to match the paper's structural
-    guarantee that entropy weights never flip advantage signs.
+    Deviation from the GTPO paper (arxiv 2508.04349):
+        Paper (Eq. 3):  r̃⁺ᵢ,ₜ = α₁·rᵢ + α₂ · (Hᵢ,ₜ / Σₖ Hₖ,ₜ) · dₜ
+                        Additive reward shaping, sum-normalized entropy,
+                        bounded in [0, 1] by construction, separate treatment
+                        of successful/unsuccessful sequences.
+        Ours:           A_GTPO(t) = A(t) · max(0, 1 + β·(H(t)/mean(H) − 1))
+                        Multiplicative advantage weighting, mean-normalized
+                        entropy, unbounded (hence the max(0, ·) clamp), unified
+                        treatment of all sequences.
+    The clamp ensures our weights share the paper's structural property:
+    non-negative, so advantage signs are never flipped.
 
     Args:
-        advantages: Token-level advantages [total_tokens].
-                   Must already be expanded to token level.
-        token_entropies: Per-token entropy [total_tokens].
-                        Same length as advantages.
+        advantages: Token-level advantages [total_tokens] (flat 1D).
+                   Must already be expanded from episode-level to token-level
+                   (compute_advantages_gtpo does this automatically).
+        token_entropies: Per-token entropy [total_tokens] (flat 1D).
+                        Must be the same shape as ``advantages``.
         entropy_weight: β parameter controlling weighting strength.
                        0.0 disables weighting (returns advantages unchanged).
                        Default 0.1 per GTPO paper (α₂ = 0.1).
+                       NOTE: This is NOT ``entropy_coeff`` from entropy_bonus().
+                       That parameter controls an additive entropy bonus in the
+                       loss; this one controls multiplicative advantage re-weighting.
 
     Returns:
-        Entropy-weighted advantages [total_tokens].
+        Entropy-weighted advantages [total_tokens] (flat 1D, same shape as input).
 
     Notes:
         - Weights are clamped to [0, ∞) so advantage signs are never flipped.
           Tokens with very low entropy relative to the mean get weight → 0,
           meaning they contribute no gradient signal (fully suppressed).
         - Entropy weights are detached from gradient via mx.stop_gradient
-          to prevent the model from gaming entropy.
+          to prevent the model from gaming entropy (GTPO paper Remark 2.5).
         - When entropy_weight=0, returns advantages unchanged.
         - When all tokens have equal entropy, returns advantages unchanged.
 
@@ -465,8 +474,10 @@ def apply_entropy_weighting(
         )
 
     # Normalize entropy: H_norm(t) = H(t) / mean(H)
-    # Convert to Python scalar for the conditional to avoid ambiguous
-    # truthiness of 0-D mx.array (and to be safe inside mx.compile).
+    # .item() → Python float so the `if` below is a plain Python branch.
+    # MLX 0-D arrays do support __bool__(), but mx.compile() forbids
+    # evaluating arrays inside traced functions — .item() makes the
+    # eager-scalar intent explicit and avoids that latent trap.
     entropy_mean = mx.mean(token_entropies).item()
 
     # If mean entropy is effectively zero, all tokens are equally confident
@@ -488,7 +499,12 @@ def apply_entropy_weighting(
     # advantage signs — semantically wrong. Clamping to 0 means
     # very-low-entropy tokens are fully suppressed (no gradient signal).
     raw_weights = 1.0 + entropy_weight * (entropy_normalized - 1.0)
-    # CRITICAL: Detach from gradient to prevent gaming
+    # CRITICAL: stop_gradient detaches entropy weights from the backward pass.
+    # Without this, the model could learn to game entropy (increase uncertainty
+    # to amplify its own advantage signal). The GTPO paper (Remark 2.5) states:
+    # "the entropy term is detached from the gradient computation."
+    # Gradient w.r.t. advantages flows normally; gradient w.r.t. token_entropies
+    # is exactly zero — verified by test_gradient_wrt_entropies_is_zero.
     entropy_weights = mx.stop_gradient(mx.maximum(raw_weights, 0.0))
 
     return advantages * entropy_weights
@@ -879,9 +895,15 @@ def grpo_loss(
     Supports DAPO-style asymmetric clipping bounds, Dr. GRPO length-bias fix,
     and GTPO entropy-weighted credit assignment.
 
+    Data layout:
+        All logprob/advantage arrays are **flat 1D** — tokens from all episodes
+        concatenated into a single vector.  Episode boundaries are tracked via
+        ``episode_lengths``, NOT via array dimensions.  There is no 2D
+        ``[num_episodes, seq_len]`` layout anywhere in this pipeline.
+
     Args:
-        old_logprobs: Log probabilities from rollout
-        new_logprobs: Log probabilities from current policy
+        old_logprobs: Log probabilities from rollout [total_tokens] (flat 1D).
+        new_logprobs: Log probabilities from current policy [total_tokens] (flat 1D).
         rewards: Episode rewards for group-relative advantages
         clip_ratio: Symmetric clipping ratio (for backward compatibility).
                    If provided, overrides clip_ratio_low and clip_ratio_high.
@@ -928,15 +950,12 @@ def grpo_loss(
                 f"Check episode_lengths sum matches total tokens."
             )
     else:
-        # Standard GRPO: episode-level advantages
+        # Standard GRPO: episode-level advantages.
+        # Note: expansion from episode-level [num_episodes] to token-level
+        # [total_tokens] is handled by the Trainer._loss_fn, not here.
+        # When called directly, the caller must ensure advantages and
+        # logprobs are already aligned (both flat 1D, same length).
         advantages = compute_advantages(rewards)
-
-        # Expand advantages to match logprob sequence length if needed
-        if advantages.ndim == 1 and old_logprobs.ndim > 1:
-            # Each episode contributes its advantage to all tokens in that episode
-            # This requires knowing episode boundaries - simplified version assumes
-            # advantages and logprobs are already aligned
-            pass
 
     # Compute policy loss with asymmetric clipping and optional length-bias fix
     policy_loss_val = policy_loss(
