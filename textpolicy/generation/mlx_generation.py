@@ -737,7 +737,11 @@ def batch_generate_tokens(
     cache_obj: Optional[Any] = None
     if HAS_MLX_LM:
         try:
-            from mlx_lm import cache as mlx_cache
+            try:
+                from mlx_lm import cache as mlx_cache
+            except Exception:
+                # Newer mlx-lm versions expose cache helpers via cache_prompt.
+                from mlx_lm import cache_prompt as mlx_cache
 
             cache_obj = mlx_cache.make_prompt_cache(model)
         except Exception:
