@@ -376,6 +376,156 @@ def entropy_bonus(logprobs: mx.array, coefficient: float = 0.01) -> mx.array:
     return -coefficient * mx.mean(entropy)
 
 
+# --- GTPO: Entropy-Weighted Credit Assignment (Issue #10) ---
+
+def compute_token_entropy(logits: mx.array) -> mx.array:
+    """
+    Compute per-token entropy from logits.
+
+    Uses log-softmax for numerical stability (avoids separate softmax + log
+    which can overflow/underflow).
+
+    Args:
+        logits: Raw model logits [..., vocab_size]
+
+    Returns:
+        Per-token entropy [...] (same shape as logits minus last dimension).
+        Values are non-negative; zero means the model is perfectly confident.
+
+    References:
+        GTPO: Token and Sequence-Level Reward Shaping with Policy Entropy
+        https://arxiv.org/abs/2508.04349
+    """
+    # log_softmax is more numerically stable than log(softmax(x))
+    log_probs = logits - mx.logsumexp(logits, axis=-1, keepdims=True)
+    probs = mx.exp(log_probs)
+    # H(p) = -sum(p * log(p))
+    entropy = -mx.sum(probs * log_probs, axis=-1)
+    return entropy
+
+
+def apply_entropy_weighting(
+    advantages: mx.array,
+    token_entropies: mx.array,
+    entropy_weight: float = 0.1
+) -> mx.array:
+    """
+    Apply GTPO-style entropy weighting to token-level advantages.
+
+    High-entropy tokens (decision points) get amplified advantages;
+    low-entropy tokens (routine execution) get dampened advantages.
+
+    Formula:
+        A_GTPO(t) = A(t) * (1 + β * (H_norm(t) - 1))
+
+    Where H_norm(t) = H(t) / mean(H), so the mean weight is exactly 1.0
+    (entropy weighting redistributes signal, does not change its total scale).
+
+    Args:
+        advantages: Token-level advantages [total_tokens].
+                   Must already be expanded to token level.
+        token_entropies: Per-token entropy [total_tokens].
+                        Same length as advantages.
+        entropy_weight: β parameter controlling weighting strength.
+                       0.0 disables weighting (returns advantages unchanged).
+                       Default 0.1 per GTPO paper.
+
+    Returns:
+        Entropy-weighted advantages [total_tokens].
+
+    Notes:
+        - Entropy weights are detached from gradient via mx.stop_gradient
+          to prevent the model from gaming entropy.
+        - When entropy_weight=0, returns advantages unchanged.
+        - When all tokens have equal entropy, returns advantages unchanged.
+
+    References:
+        GTPO: Token and Sequence-Level Reward Shaping with Policy Entropy
+        https://arxiv.org/abs/2508.04349
+    """
+    if entropy_weight == 0.0:
+        return advantages
+
+    # Normalize entropy: H_norm(t) = H(t) / mean(H)
+    entropy_mean = mx.mean(token_entropies)
+    entropy_normalized = token_entropies / (entropy_mean + 1e-8)
+
+    # GTPO weight: 1 + β * (H_norm - 1)
+    # When H_norm = 1 (average entropy), weight = 1 (no change)
+    # When H_norm > 1 (high entropy), weight > 1 (amplified)
+    # When H_norm < 1 (low entropy), weight < 1 (dampened)
+    # CRITICAL: Detach from gradient to prevent gaming
+    entropy_weights = mx.stop_gradient(
+        1.0 + entropy_weight * (entropy_normalized - 1.0)
+    )
+
+    return advantages * entropy_weights
+
+
+def compute_advantages_gtpo(
+    rewards: Union[List[float], mx.array],
+    token_entropies: mx.array,
+    entropy_weight: float = 0.1,
+    episode_lengths: Optional[List[int]] = None
+) -> mx.array:
+    """
+    Compute GTPO advantages: group-relative base + entropy weighting.
+
+    Convenience function that combines compute_advantages() with
+    apply_entropy_weighting(). Handles expansion from episode-level
+    to token-level when episode_lengths is provided.
+
+    Args:
+        rewards: Episode rewards for group-relative baseline.
+        token_entropies: Per-token entropy [total_tokens].
+        entropy_weight: β parameter (default 0.1).
+        episode_lengths: Length of each episode in tokens.
+                        Required when rewards has fewer elements than
+                        token_entropies (episode-level vs token-level).
+                        If None, assumes rewards are already token-level.
+
+    Returns:
+        Entropy-weighted token-level advantages [total_tokens].
+
+    Example:
+        >>> rewards = [1.0, 0.0]  # 2 episodes
+        >>> entropies = mx.array([3.2, 1.1, 4.5, 2.0, 3.8])  # 5 tokens total
+        >>> lengths = [3, 2]  # episode 0 has 3 tokens, episode 1 has 2
+        >>> advantages = compute_advantages_gtpo(rewards, entropies, 0.1, lengths)
+        >>> advantages.shape  # [5]
+
+    References:
+        GTPO: Token and Sequence-Level Reward Shaping with Policy Entropy
+        https://arxiv.org/abs/2508.04349
+    """
+    # Compute episode-level base advantages
+    base_advantages = compute_advantages(rewards)
+
+    # Expand to token-level if needed
+    if episode_lengths is not None:
+        num_episodes = base_advantages.shape[0]
+        if num_episodes != len(episode_lengths):
+            raise ValueError(
+                f"Number of episodes ({num_episodes}) does not match "
+                f"episode_lengths ({len(episode_lengths)})"
+            )
+        # Expand: repeat each episode's advantage for its token count
+        if len(set(episode_lengths)) == 1:
+            # All same length: efficient vectorized repeat
+            expanded = mx.repeat(base_advantages, episode_lengths[0])
+        else:
+            # Variable lengths
+            parts = []
+            for i, length in enumerate(episode_lengths):
+                parts.append(mx.repeat(base_advantages[i:i+1], length))
+            expanded = mx.concatenate(parts)
+    else:
+        expanded = base_advantages
+
+    # Apply entropy weighting
+    return apply_entropy_weighting(expanded, token_entropies, entropy_weight)
+
+
 # Note: compute_length_penalty, apply_length_shaping, and compute_length_shaping_stats
 # are imported from .length_shaping module (see imports at top of file)
 
@@ -676,14 +826,18 @@ def grpo_loss(
     clip_ratio_low: float = 0.2,
     clip_ratio_high: float = 0.28,
     entropy_coeff: float = 0.0,
-    normalize_constant: int = None
+    normalize_constant: int = None,
+    token_entropies: Optional[mx.array] = None,
+    entropy_weight: float = 0.1,
+    episode_lengths: Optional[List[int]] = None
 ) -> mx.array:
     """
     Complete GRPO loss computation in one function.
 
     Combines advantage calculation and policy loss for convenience.
     Can be compiled as a single unit for maximum efficiency.
-    Supports DAPO-style asymmetric clipping bounds and Dr. GRPO length-bias fix.
+    Supports DAPO-style asymmetric clipping bounds, Dr. GRPO length-bias fix,
+    and GTPO entropy-weighted credit assignment.
 
     Args:
         old_logprobs: Log probabilities from rollout
@@ -697,9 +851,19 @@ def grpo_loss(
         normalize_constant: Fixed constant divisor for loss normalization.
                            If None (default), uses mean. If provided, uses
                            sum/constant to eliminate length bias.
+        token_entropies: Per-token entropy for GTPO weighting [total_tokens].
+                        If None, uses standard GRPO (no entropy weighting).
+                        If provided, advantages are weighted by normalized
+                        entropy so decision-point tokens get amplified signal.
+        entropy_weight: β parameter for GTPO (default 0.1). Only used when
+                       token_entropies is provided.
+        episode_lengths: Token count per episode, required for expanding
+                        episode-level advantages to token-level when using
+                        GTPO. If None with token_entropies, assumes rewards
+                        are already token-level aligned.
 
     Returns:
-        Total GRPO loss (policy + optional entropy)
+        Total GRPO loss (policy + optional entropy bonus)
 
     References:
         DAPO: An Open-Source LLM Reinforcement Learning System at Scale
@@ -707,16 +871,25 @@ def grpo_loss(
 
         Dr. GRPO: Understanding R1-Zero-Like Training
         https://arxiv.org/abs/2503.20783
-    """
-    # Compute group-relative advantages
-    advantages = compute_advantages(rewards)
 
-    # Expand advantages to match logprob sequence length if needed
-    if advantages.ndim == 1 and old_logprobs.ndim > 1:
-        # Each episode contributes its advantage to all tokens in that episode
-        # This requires knowing episode boundaries - simplified version assumes
-        # advantages and logprobs are already aligned
-        pass
+        GTPO: Token and Sequence-Level Reward Shaping with Policy Entropy
+        https://arxiv.org/abs/2508.04349
+    """
+    if token_entropies is not None:
+        # GTPO mode: entropy-weighted token-level advantages
+        advantages = compute_advantages_gtpo(
+            rewards, token_entropies, entropy_weight, episode_lengths
+        )
+    else:
+        # Standard GRPO: episode-level advantages
+        advantages = compute_advantages(rewards)
+
+        # Expand advantages to match logprob sequence length if needed
+        if advantages.ndim == 1 and old_logprobs.ndim > 1:
+            # Each episode contributes its advantage to all tokens in that episode
+            # This requires knowing episode boundaries - simplified version assumes
+            # advantages and logprobs are already aligned
+            pass
 
     # Compute policy loss with asymmetric clipping and optional length-bias fix
     policy_loss_val = policy_loss(
