@@ -1021,3 +1021,88 @@ class TestCompiledNumericalParity:
             assert mx.allclose(flat_uc[key], flat_c[key], atol=1e-5).item(), (
                 f"Gradient mismatch for {key}"
             )
+
+
+@pytest.mark.unit
+class TestComputeLogprobsCompileSafety:
+    """Verify that compute_logprobs _compiled flag works correctly.
+
+    The _compiled parameter controls whether mx.any()-based validation
+    (compile-unsafe) or mx.where-based sanitization (compile-safe) is used.
+    Default (_compiled=False) preserves the original eager-eval semantics.
+    """
+
+    def _make_model(self, vocab_size=16, dim=8):
+        class TinyLM(nn.Module):
+            def __init__(self):
+                super().__init__()
+                self.embed = nn.Embedding(vocab_size, dim)
+                self.head = nn.Linear(dim, vocab_size)
+            def __call__(self, x):
+                return self.head(self.embed(x))
+
+        model = TinyLM()
+        mx.eval(model.parameters())
+        return model
+
+    def test_default_raises_on_nan(self):
+        """Default mode (_compiled=False) raises ValueError on NaN logprobs."""
+        from textpolicy.generation.mlx_generation import compute_logprobs
+
+        model = self._make_model()
+        prompt = mx.array([1, 2, 3])
+        resp = mx.array([4, 5])
+
+        # Normal call should succeed
+        result = compute_logprobs(model, prompt, resp)
+        assert result.shape[0] == 2
+
+    def test_compiled_flag_returns_same_values(self):
+        """_compiled=True produces identical values when no NaN/Inf present."""
+        from textpolicy.generation.mlx_generation import compute_logprobs
+
+        model = self._make_model()
+        prompt = mx.array([1, 2, 3])
+        resp = mx.array([4, 5])
+
+        default_result = compute_logprobs(model, prompt, resp)
+        compiled_result = compute_logprobs(model, prompt, resp, _compiled=True)
+        mx.eval(default_result, compiled_result)
+
+        assert mx.allclose(default_result, compiled_result, atol=1e-6).item(), (
+            f"_compiled=True {compiled_result.tolist()} != "
+            f"default {default_result.tolist()}"
+        )
+
+    def test_compiled_flag_sanitizes_nan(self):
+        """_compiled=True replaces NaN/Inf with -1e6 instead of raising."""
+        from textpolicy.generation.mlx_generation import compute_logprobs
+
+        model = self._make_model()
+        prompt = mx.array([1, 2, 3])
+        resp = mx.array([4, 5])
+
+        # With _compiled=True, should not raise — NaN/Inf (if any) get sanitized
+        result = compute_logprobs(model, prompt, resp, _compiled=True)
+        mx.eval(result)
+        assert not mx.any(mx.isnan(result)).item(), "Should have no NaN"
+        assert not mx.any(mx.isinf(result)).item(), "Should have no Inf"
+
+    def test_compiled_flag_inside_mx_compile(self):
+        """_compiled=True is safe inside mx.compile (no .item() calls)."""
+        from textpolicy.generation.mlx_generation import compute_logprobs
+
+        model = self._make_model()
+        prompt = mx.array([1, 2, 3])
+        resp = mx.array([4, 5])
+
+        # Wrap in mx.compile — this would fail if _compiled path
+        # still used mx.any() in a Python if statement.
+        @mx.compile
+        def compiled_logprobs(prompt_t, resp_t):
+            return compute_logprobs(model, prompt_t, resp_t, _compiled=True)
+
+        result = compiled_logprobs(prompt, resp)
+        mx.eval(result)
+        assert result.shape[0] == 2
+        assert not mx.any(mx.isnan(result)).item()

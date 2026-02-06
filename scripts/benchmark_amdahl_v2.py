@@ -494,7 +494,9 @@ def main():
     parser.add_argument("--lora-layers", type=int, default=8,
                         help="Number of layers to apply LoRA to (default: 8)")
     parser.add_argument("--compile", action="store_true",
-                        help="Enable mx.compile for the training step.")
+                        help="Enable mx.compile for the training step "
+                             "(full-pipeline mode with --model only; "
+                             "ignored in synthetic mode).")
     parser.add_argument("--output-dir", type=str, default="artefacts/perf",
                         help="Directory for JSON output (default: artefacts/perf)")
     args = parser.parse_args()

@@ -139,8 +139,13 @@ class Trainer:
                 f"{n_params:,}",
                 "compiling" if should_compile else "skipping (below threshold)",
             )
+        elif isinstance(compile_training, bool):
+            should_compile = compile_training
         else:
-            should_compile = bool(compile_training)
+            raise ValueError(
+                f"compile_training must be True, False, or 'auto', "
+                f"got {compile_training!r}"
+            )
 
         self._compiled = should_compile
         if should_compile:
@@ -521,7 +526,8 @@ class Trainer:
                 per_episode = []
                 for i in range(num_episodes):
                     ep_logprobs = compute_logprobs(
-                        self.model, observations[i], actions[i]
+                        self.model, observations[i], actions[i],
+                        _compiled=self._compiled,
                     )
                     per_episode.append(ep_logprobs)
                 new_logprobs = mx.concatenate(per_episode)

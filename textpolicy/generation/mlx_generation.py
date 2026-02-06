@@ -400,15 +400,27 @@ def _simple_generate(
 def compute_logprobs(
     model: nn.Module,
     prompt_tokens: mx.array,
-    response_tokens: mx.array
+    response_tokens: mx.array,
+    *,
+    _compiled: bool = False,
 ) -> mx.array:
     """
     Extract log-probabilities of response_tokens under model via teacher-forcing.
-    Raises on dimension mismatch or invalid (nan/inf/positive) values.
+
+    Raises on dimension mismatch or invalid (nan/inf/positive) values when
+    ``_compiled=False`` (the default).  When ``_compiled=True``, NaN/Inf
+    values are replaced with ``-1e6`` using compile-safe ``mx.where``
+    instead — Python branching on ``mx.any(...)`` is illegal inside
+    ``mx.compile`` traced functions.
+
+    Args:
+        _compiled: When True, skip ``mx.any``-based validation (uses
+            ``mx.where`` sanitization instead).  Set by the Trainer when
+            ``_loss_fn`` is wrapped with ``mx.compile``.
     """
     if len(response_tokens) == 0:
         return mx.array([])
-    
+
     full_sequence = mx.concatenate([prompt_tokens, response_tokens])
     model_input = full_sequence[None] if full_sequence.ndim == 1 else full_sequence
     logits = model(model_input)
@@ -418,13 +430,29 @@ def compute_logprobs(
         raise ValueError(
             f"Logits/tokens mismatch: {prediction_logits.shape[0]} vs {response_len}"
         )
-    
+
     log_probs = prediction_logits - mx.logsumexp(prediction_logits, axis=-1, keepdims=True)
     selected = log_probs[mx.arange(response_len), response_tokens]
-    if mx.any(mx.isnan(selected)) or mx.any(mx.isinf(selected)):
-        raise ValueError("Invalid logprobs (nan/inf)")
-    if mx.any(selected > 0):
-        print("Warning: positive logprobs detected")
+
+    if _compiled:
+        # Inside mx.compile: Python ``if`` on ``mx.any(...)`` is illegal
+        # (triggers ``.item()``).  Use ``mx.where`` to sanitize NaN/Inf
+        # on the computation graph instead.  See _default_get_logprobs
+        # in trainer.py for the same pattern.
+        selected = mx.where(
+            mx.isnan(selected) | mx.isinf(selected),
+            mx.array(-1e6),
+            selected,
+        )
+    else:
+        # Outside compilation: eager validation with clear error messages.
+        # The mx.any() calls also act as implicit sync barriers, which
+        # preserves evaluation ordering for sequential callers.
+        if mx.any(mx.isnan(selected)) or mx.any(mx.isinf(selected)):
+            raise ValueError("Invalid logprobs (nan/inf)")
+        if mx.any(selected > 0):
+            print("Warning: positive logprobs detected")
+
     return selected
 
 
