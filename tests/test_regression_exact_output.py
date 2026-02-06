@@ -341,6 +341,54 @@ class TestRegressionPackEpisodes:
             f"sum(episode_lengths)={total_real_tokens}"
         )
 
+    def test_logprobs_flattened_from_array_steps(self):
+        """H3: Logprobs from mx.array steps are flattened to 1D.
+
+        Regression (Issue #34): _pack_episodes appended raw episode.logprob
+        (a list like [mx.array(shape=(4,))]) without flattening. mx.array()
+        then produced shape (1, 4) instead of (4,), breaking the flat 1D
+        invariant and causing ValueError in policy_loss.
+        """
+        ep = SimpleNamespace(
+            obs=[[1, 2, 3]],
+            act=[[4, 5, 6, 7]],
+            rew=[1.0],
+            logprob=[mx.array([-0.5, -0.4, -0.3, -0.2])],
+        )
+        result = grpo._pack_episodes([ep])
+        mx.eval(result['logprob'])
+        assert result['logprob'].ndim == 1, (
+            f"Expected 1D logprobs, got {result['logprob'].ndim}D shape {result['logprob'].shape}"
+        )
+        assert result['logprob'].shape[0] == 4, (
+            f"Expected 4 logprobs, got {result['logprob'].shape[0]}"
+        )
+        assert result['episode_lengths'] == [4]
+
+    def test_logprobs_flattened_multi_step(self):
+        """H3: Multi-step episodes with multiple logprob arrays are flattened.
+
+        Regression (Issue #34): Ensures flattening works when episode.logprob
+        contains multiple mx.array objects from successive generation steps.
+        """
+        ep = SimpleNamespace(
+            obs=[[1, 2]],
+            act=[[3, 4], [5, 6, 7]],
+            rew=[1.0],
+            logprob=[mx.array([-0.5, -0.4]), mx.array([-0.3, -0.2, -0.1])],
+        )
+        result = grpo._pack_episodes([ep])
+        mx.eval(result['logprob'])
+        assert result['logprob'].ndim == 1, (
+            f"Expected 1D logprobs, got {result['logprob'].ndim}D shape {result['logprob'].shape}"
+        )
+        assert result['logprob'].shape[0] == 5, (
+            f"Expected 5 logprobs (2+3), got {result['logprob'].shape[0]}"
+        )
+        expected = [-0.5, -0.4, -0.3, -0.2, -0.1]
+        for i, (got, want) in enumerate(zip(result['logprob'].tolist(), expected)):
+            assert abs(got - want) < 1e-6, f"logprob[{i}]: got {got}, want {want}"
+
     def test_empty_episodes(self):
         """Empty input returns empty arrays with correct dtypes."""
         result = grpo._pack_episodes([])

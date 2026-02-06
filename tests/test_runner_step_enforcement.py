@@ -24,9 +24,29 @@ class _DictEnv:
         }
 
 
+class _VectorObsEnv:
+    def reset(self):
+        return [1, 2, 3], {}
+
+    def step(self, action):
+        return {
+            "observation": [1, 2, 3],
+            "reward": 1.0,
+            "terminated": True,
+            "truncated": False,
+            "info": {},
+        }
+
+
 def _policy(obs, deterministic=False):
     # Return scalar action as MLX array substitute (runner only inspects ndim)
     import mlx.core as mx
+    return mx.array(0), {}
+
+
+def _policy_requires_vector_obs(obs, deterministic=False):
+    import mlx.core as mx
+    assert obs.ndim == 1, f"Expected 1D observation, got shape {obs.shape}"
     return mx.array(0), {}
 
 
@@ -78,3 +98,15 @@ def test_runner_collect_accepts_dict_step():
     buf = runner.collect()
     # Buffer should contain at least one episode
     assert len(buf.episodes) >= 0  # episodes may be reset; ensure call succeeds
+
+
+def test_runner_collect_single_step_uses_single_observation_shape():
+    from textpolicy.rollout.runner import RolloutRunner
+    from textpolicy.rollout.strategy import create_strategy
+
+    env = _VectorObsEnv()
+    strategy = create_strategy("grpo")
+    runner = RolloutRunner(env, policy=_policy_requires_vector_obs, strategy=strategy, max_steps=1)
+
+    buf = runner.collect()
+    assert len(buf.episodes) == 1

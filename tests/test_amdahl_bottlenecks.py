@@ -200,6 +200,24 @@ class TestPackEpisodesRewards:
         # Each episode has act=[[4,5]], flattened length = 2
         assert result['episode_lengths'] == [2] * 5
 
+    def test_logprobs_flattened_for_single_step_token_arrays(self):
+        from textpolicy.algorithms.grpo import _pack_episodes
+
+        episodes = [{
+            'obs': [[101, 102, 103]],
+            'act': [[201, 202, 203, 204]],
+            'rew': [1.0],
+            'next_obs': [[0]],
+            'done': [True],
+            'timeout': [False],
+            'logprob': [mx.array([-0.5, -0.4, -0.3, -0.2])],
+        }]
+        result = _pack_episodes(episodes)
+
+        assert result['episode_lengths'] == [4]
+        assert result['logprob'].shape == (4,)
+        assert np.allclose(result['logprob'].tolist(), [-0.5, -0.4, -0.3, -0.2], atol=1e-6)
+
     def test_empty_episodes(self):
         from textpolicy.algorithms.grpo import _pack_episodes
 

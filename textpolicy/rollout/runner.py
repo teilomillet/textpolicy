@@ -90,70 +90,51 @@ class RolloutRunner:
         Returns:
             Buffer containing collected episodes
         """
-        obs, _ = self.env.reset()
+        reset_result = self.env.reset()
+        if isinstance(reset_result, tuple):
+            obs, _ = reset_result
+        else:
+            obs = reset_result
 
-        # Batch observations for efficient MLX conversion
-        # Collect multiple observations before converting to MLX arrays
-        batch_size = min(32, self.max_steps)  # Batch size for array conversion
-        obs_batch = []
+        for _ in range(self.max_steps):
+            obs_single = obs
+            obs_mx = mx.array(obs_single)
 
-        for step in range(self.max_steps):
-            obs_batch.append(obs)
-            
-            # Process batch when full or on final step
-            if len(obs_batch) == batch_size or step == self.max_steps - 1:
-                # Single MLX array conversion for the entire batch
-                try:
-                    import numpy as np
-                    obs_batch_np = np.array(obs_batch)
-                    obs_batch_mx = mx.array(obs_batch_np)
-                except (ValueError, TypeError):
-                    # Fallback to individual conversion if batch conversion fails
-                    obs_batch_mx = mx.stack([mx.array(o) for o in obs_batch])
-                
-                # Process each observation in the batch
-                for i, obs_single in enumerate(obs_batch):
-                    # Extract single observation from batch
-                    obs_mx = obs_batch_mx[i] if len(obs_batch) > 1 else obs_batch_mx
-                    
-                    # Policy forward pass - runs on GPU/ANE
-                    action_mx, extra = self.strategy.select_action(self.policy, obs_mx)
+            # Policy forward pass - runs on GPU/ANE
+            action_mx, extra = self.strategy.select_action(self.policy, obs_mx)
 
-                    # Convert action back to Python format (once per step)
-                    if action_mx.ndim == 0:
-                        action = action_mx.item()  # Scalar action (discrete environments)
-                    else:
-                        action = action_mx.tolist()  # Vector action (continuous environments)
+            # Convert action back to Python format (once per step)
+            if action_mx.ndim == 0:
+                action = action_mx.item()  # Scalar action (discrete environments)
+            else:
+                action = action_mx.tolist()  # Vector action (continuous environments)
 
-                    # Environment step (CPU-bound). Normalize to a standard tuple.
-                    step_result = self.env.step(action)
-                    next_obs, reward, done, trunc, info = self._normalize_step_result(step_result)
+            # Environment step (CPU-bound). Normalize to a standard tuple.
+            step_result = self.env.step(action)
+            next_obs, reward, done, trunc, info = self._normalize_step_result(step_result)
 
-                    # Store transition using strategy-specific logic
-                    # Strategy handles filtering and algorithm-specific data
-                    self.strategy.store_transition(
-                        buffer=self.buffer,
-                        obs=obs_single,  # Use original observation
-                        act=action,
-                        rew=reward,
-                        next_obs=next_obs,
-                        done=done,
-                        timeout=trunc,
-                        **extra  # Algorithm-specific data (logprob, value, etc.)
-                    )
+            # Store transition using strategy-specific logic
+            # Strategy handles filtering and algorithm-specific data
+            self.strategy.store_transition(
+                buffer=self.buffer,
+                obs=obs_single,
+                act=action,
+                rew=reward,
+                next_obs=next_obs,
+                done=done,
+                timeout=trunc,
+                **extra  # Algorithm-specific data (logprob, value, etc.)
+            )
 
-                    # Handle episode boundaries
-                    if done or trunc:
-                        obs, _ = self.env.reset()
-                    else:
-                        obs = next_obs
-                    
-                    # Break if we've reached max steps
-                    if step >= self.max_steps - 1:
-                        break
-                
-                # Clear batch for next iteration
-                obs_batch = []
+            # Handle episode boundaries
+            if done or trunc:
+                reset_result = self.env.reset()
+                if isinstance(reset_result, tuple):
+                    obs, _ = reset_result
+                else:
+                    obs = reset_result
+            else:
+                obs = next_obs
 
         return self.buffer
     

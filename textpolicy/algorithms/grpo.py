@@ -1117,7 +1117,8 @@ def _pack_episodes(episodes: List[Any]) -> Dict[str, Any]:
             full_sequence = flattened_obs + flattened_acts
             all_obs.append(full_sequence)
             all_acts.append(flattened_acts)
-            all_logprobs.append(episode.logprob if episode.logprob is not None else [])
+            # Keep logprobs token-aligned with flattened actions.
+            all_logprobs.append(_flatten_tokens(episode.logprob) if episode.logprob is not None else [])
         else:
             # Serialized dictionary from multiprocessing
             rew = episode['rew']
@@ -1137,7 +1138,8 @@ def _pack_episodes(episodes: List[Any]) -> Dict[str, Any]:
             full_sequence = flattened_obs + flattened_acts
             all_obs.append(full_sequence)
             all_acts.append(flattened_acts)
-            all_logprobs.append(episode.get('logprob', []))
+            logprob = episode.get('logprob', [])
+            all_logprobs.append(_flatten_tokens(logprob) if logprob is not None else [])
 
     # Batch evaluate all pending reward sums (single sync barrier instead of N)
     episode_rewards = [0.0] * len(episodes)
