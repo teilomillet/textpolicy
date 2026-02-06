@@ -12,6 +12,8 @@ This trainer achieves maximum efficiency through:
 
 import logging
 from typing import Callable, Dict, Any, Optional, Union, List, cast
+
+logger = logging.getLogger(__name__)
 import mlx.core as mx # type: ignore
 import mlx.nn as nn # type: ignore
 import mlx.optimizers as optim # type: ignore
@@ -56,7 +58,8 @@ class Trainer:
         auto_save_lora: Optional[str] = None,
         metrics_interval: int = 10,
         advantage_transform_fn: Optional[Callable] = None,
-        profile: bool = False
+        profile: bool = False,
+        on_policy: bool = True
     ):
         """
         Initialize unified trainer with composable algorithm functions.
@@ -85,6 +88,11 @@ class Trainer:
                 phases and record per-phase wall-clock times in the metrics dict
                 returned by ``train()``.  Zero cost when False (single boolean
                 check per phase).
+            on_policy: When True (the default), clear the linked buffer
+                after each ``train()`` call (automatic buffer mode only).
+                GRPO and GTPO are on-policy algorithms — they should only
+                train on the latest rollouts.  Set to False for off-policy
+                algorithms that intentionally replay older episodes.
         """
         self.model = model
         self.advantage_fn = advantage_fn
@@ -104,6 +112,9 @@ class Trainer:
         # Buffer management
         self.buffer = buffer
         self.data_selector_fn = data_selector_fn or self._default_data_selector
+        self.on_policy = on_policy
+        self._prev_buffer_episodes = 0  # track growth for warning
+        self._buffer_growth_warned = False
 
         # LoRA management - detect auto-reload models
         self.auto_save_lora = auto_save_lora or self._detect_auto_reload_lora(model)
@@ -667,6 +678,32 @@ class Trainer:
 
         self._step_count += 1
         self.metrics.update(metrics)
+
+        # On-policy buffer management: clear stale episodes so training
+        # time stays constant.  Only applies when the buffer was used
+        # automatically (rollout_data was None).
+        if self.buffer is not None and rollout_data is None:
+            if self.on_policy:
+                self.buffer.clear()
+            else:
+                # Warn once if buffer is growing — a sign that the user
+                # may need on_policy=True for their algorithm.
+                current_count = self.buffer.episode_count
+                if (
+                    not self._buffer_growth_warned
+                    and self._prev_buffer_episodes > 0
+                    and current_count > self._prev_buffer_episodes
+                ):
+                    self._buffer_growth_warned = True
+                    logger.warning(
+                        "Buffer grew from %d to %d episodes between training "
+                        "steps. For on-policy algorithms (GRPO, GTPO), set "
+                        "Trainer(on_policy=True) to clear the buffer after "
+                        "each step and prevent training slowdown.",
+                        self._prev_buffer_episodes,
+                        current_count,
+                    )
+                self._prev_buffer_episodes = current_count
 
         # Auto-save LoRA adapters if enabled (invisible to user)
         self._save_lora_if_enabled()
