@@ -436,6 +436,17 @@ def compute_logprobs_batched(
         if r_len == 0:
             continue
 
+        # Guard: p_len == 0 would make the slice index (p_len - 1) wrap to
+        # -1 (the last token), silently corrupting logprobs. A prompt of
+        # length 0 is invalid for causal logprob extraction — you need at
+        # least one token to condition on.
+        if p_len == 0:
+            raise ValueError(
+                f"Episode {i} has prompt_length=0. Causal logprob extraction "
+                f"requires at least 1 prompt token (the model needs context "
+                f"to predict response tokens)."
+            )
+
         # Prediction logits: same slicing as compute_logprobs
         # logits at position (p_len-1) predicts the first response token
         prediction_logits = logits[i, p_len - 1 : p_len - 1 + r_len, :]

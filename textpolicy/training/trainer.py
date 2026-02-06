@@ -440,6 +440,12 @@ class Trainer:
         if observations.ndim == 2 and actions.ndim == 2:
             # Path 1: Batched — single model forward pass for all episodes
             if prompt_lengths is not None:
+                if len(prompt_lengths) != num_episodes:
+                    raise ValueError(
+                        f"len(prompt_lengths)={len(prompt_lengths)} does not "
+                        f"match num_episodes={num_episodes} from episode_lengths."
+                    )
+
                 from textpolicy.generation.mlx_generation import compute_logprobs_batched
 
                 return compute_logprobs_batched(
