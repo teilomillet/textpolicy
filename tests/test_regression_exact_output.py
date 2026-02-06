@@ -327,17 +327,18 @@ class TestRegressionPackEpisodes:
         assert result['logprob'].ndim == 1, f"Expected 1D, got {result['logprob'].ndim}D"
 
     def test_boundary_invariant(self):
-        """Episode lengths sum equals total real action tokens."""
+        """Episode lengths sum equals total real action tokens AND logprob count."""
         result = grpo._pack_episodes(self._make_episodes())
         mx.eval(result['logprob'])
-        # Semantic contract: episode_lengths tracks how many action tokens
-        # each episode contributed. Their sum is the count of real tokens;
-        # the logprob array may be larger due to padding, but the lengths
-        # must always account for exactly the real tokens.
         total_real_tokens = sum(result['episode_lengths'])
         # ep1 has 2 action tokens, ep2 has 3 → 5 real tokens
         assert total_real_tokens == 5, (
             f"episode_lengths sum {total_real_tokens} != expected real tokens 5"
+        )
+        # Unpadded logprobs must exactly match real token count
+        assert result['logprob'].shape[0] == total_real_tokens, (
+            f"logprob.shape[0]={result['logprob'].shape[0]} != "
+            f"sum(episode_lengths)={total_real_tokens}"
         )
 
     def test_empty_episodes(self):
@@ -346,7 +347,29 @@ class TestRegressionPackEpisodes:
         mx.eval(result['rewards'], result['obs'], result['logprob'])
         assert result['rewards'].shape == (0,)
         assert result['episode_lengths'] == []
+        assert result['prompt_lengths'] == []
         assert result['obs'].shape == (0,)
+
+    def test_obs_is_2d(self):
+        """H3: obs output is 2D [N, max_obs_len] after stacking."""
+        result = grpo._pack_episodes(self._make_episodes())
+        mx.eval(result['obs'])
+        assert result['obs'].ndim == 2, f"Expected 2D obs, got {result['obs'].ndim}D"
+        assert result['obs'].shape[0] == 2, "Expected 2 episodes"
+
+    def test_act_is_2d(self):
+        """H3: act output is 2D [N, max_act_len] after stacking."""
+        result = grpo._pack_episodes(self._make_episodes())
+        mx.eval(result['act'])
+        assert result['act'].ndim == 2, f"Expected 2D act, got {result['act'].ndim}D"
+        assert result['act'].shape[0] == 2, "Expected 2 episodes"
+
+    def test_prompt_lengths_present(self):
+        """prompt_lengths tracks per-episode prompt token counts."""
+        result = grpo._pack_episodes(self._make_episodes())
+        assert result['prompt_lengths'] == [3, 2], (
+            f"Expected [3, 2], got {result['prompt_lengths']}"
+        )
 
 
 # ===========================================================================

@@ -323,7 +323,8 @@ class Trainer:
         # actions contain only response tokens that need logprob evaluation.
         if 'episode_lengths' in batch_data:
             episode_lengths = batch_data['episode_lengths']
-            new_logprobs = self._extract_grpo_logprobs(observations, actions, old_logprobs, episode_lengths)
+            prompt_lengths = batch_data.get('prompt_lengths')
+            new_logprobs = self._extract_grpo_logprobs(observations, actions, old_logprobs, episode_lengths, prompt_lengths)
         else:
             # Fallback for non-GRPO data or custom pipelines
             if observations.ndim == 1:
@@ -401,25 +402,35 @@ class Trainer:
         
         return loss
     
-    def _extract_grpo_logprobs(self, observations: mx.array, actions: mx.array, old_logprobs: mx.array, episode_lengths: List[int]) -> mx.array:
+    def _extract_grpo_logprobs(
+        self,
+        observations: mx.array,
+        actions: mx.array,
+        old_logprobs: mx.array,
+        episode_lengths: List[int],
+        prompt_lengths: Optional[List[int]] = None,
+    ) -> mx.array:
         """
         Compute per-episode logprobs under the current model.
 
-        For text generation (single-step episodes), ``observations`` is 2D
-        ``[num_episodes, prompt_len]`` and ``actions`` is 2D
-        ``[num_episodes, response_len]``.  Each episode gets its own
-        forward pass via ``compute_logprobs(model, prompt, response)``.
+        Three paths, in priority order:
 
-        For multi-step RL (flat 1D data), falls back to a single forward
-        pass through ``get_logprobs_fn``.
+        1. **Batched** (default for text generation): 2D obs + prompt_lengths
+           → single ``compute_logprobs_batched`` call (one model forward pass).
+        2. **Sequential compat**: 2D obs, no prompt_lengths → N per-episode
+           ``compute_logprobs`` calls (legacy path).
+        3. **Flat 1D fallback**: multi-step RL → single forward pass through
+           ``get_logprobs_fn``.
 
         Args:
-            observations: Episode observations — 2D ``[num_episodes, prompt_len]``
+            observations: Episode observations — 2D ``[N, max_obs_len]``
                 for text generation, or flat 1D for multi-step RL.
-            actions: Episode actions — 2D ``[num_episodes, response_len]``
+            actions: Episode actions — 2D ``[N, max_act_len]``
                 for text generation, or flat 1D for multi-step RL.
             old_logprobs: Reference logprobs (flat 1D) for shape validation.
-            episode_lengths: Per-episode step counts from ``train()``.
+            episode_lengths: Per-episode response token counts.
+            prompt_lengths: Per-episode prompt token counts. When provided
+                with 2D observations, enables the batched path.
 
         Returns:
             Flat 1D log probabilities matching ``old_logprobs`` shape.
@@ -427,8 +438,19 @@ class Trainer:
         num_episodes = len(episode_lengths)
 
         if observations.ndim == 2 and actions.ndim == 2:
-            # Text generation: each row is one episode.
-            # observations[i] = prompt tokens, actions[i] = response tokens.
+            # Path 1: Batched — single model forward pass for all episodes
+            if prompt_lengths is not None:
+                from textpolicy.generation.mlx_generation import compute_logprobs_batched
+
+                return compute_logprobs_batched(
+                    self.model,
+                    observations,   # [N, max_obs_len]
+                    actions,        # [N, max_act_len]
+                    prompt_lengths,
+                    episode_lengths,
+                )
+
+            # Path 2: Sequential compat — N per-episode forward passes
             from textpolicy.generation.mlx_generation import compute_logprobs
 
             per_episode = []
@@ -439,7 +461,7 @@ class Trainer:
                 per_episode.append(ep_logprobs)
             return mx.concatenate(per_episode)
 
-        # Flat 1D: multi-step RL — use the generic logprob extraction.
+        # Path 3: Flat 1D — multi-step RL generic path.
         if observations.ndim == 1:
             model_input = observations[None]
         else:
@@ -580,7 +602,8 @@ class Trainer:
             # Use GRPO-specific extraction if episode_lengths available, otherwise fallback
             if 'episode_lengths' in batch_data:
                 episode_lengths = batch_data['episode_lengths']
-                new_logprobs = self._extract_grpo_logprobs(observations, actions, batch_data['logprob'], episode_lengths)
+                prompt_lengths = batch_data.get('prompt_lengths')
+                new_logprobs = self._extract_grpo_logprobs(observations, actions, batch_data['logprob'], episode_lengths, prompt_lengths)
             else:
                 # Fallback: add batch dimension if needed and call model
                 if observations.ndim == 1:

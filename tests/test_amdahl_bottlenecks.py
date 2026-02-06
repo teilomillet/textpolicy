@@ -723,3 +723,129 @@ class TestInlineLogprobCapture:
             assert float(logprobs[i]) <= 0.0, (
                 f"Token {i}: logprob={float(logprobs[i]):.6f} is positive"
             )
+
+
+# ---------------------------------------------------------------------------
+# 9. Batched logprob recomputation (Issue #27)
+# ---------------------------------------------------------------------------
+
+@pytest.mark.unit
+class TestBatchedLogprobRecomputation:
+    """Verify batched compute_logprobs_batched matches sequential compute_logprobs.
+
+    This tests the core optimization from Issue #27: converting N sequential
+    model forward passes into a single batched forward pass.
+    """
+
+    def _make_model(self, vocab_size=16, dim=8):
+        model = _TinyLM(vocab_size=vocab_size, dim=dim)
+        mx.eval(model.parameters())
+        return model
+
+    def test_batched_matches_sequential(self):
+        """Batched output matches N sequential compute_logprobs calls."""
+        from textpolicy.generation.mlx_generation import compute_logprobs, compute_logprobs_batched
+
+        model = self._make_model()
+        n_episodes = 4
+        prompt_len = 3
+        resp_len = 2
+
+        # Build per-episode data
+        prompts = [mx.array([1 + i * 3, 2 + i * 3, 3 + i * 3]) for i in range(n_episodes)]
+        responses = [mx.array([10 + i * 2, 11 + i * 2]) for i in range(n_episodes)]
+
+        # Sequential reference
+        sequential_parts = []
+        for i in range(n_episodes):
+            lp = compute_logprobs(model, prompts[i], responses[i])
+            sequential_parts.append(lp)
+        sequential = mx.concatenate(sequential_parts)
+        mx.eval(sequential)
+
+        # Batched: build 2D arrays
+        full_seqs = mx.stack([mx.concatenate([p, r]) for p, r in zip(prompts, responses)])
+        resp_2d = mx.stack(responses)
+        prompt_lengths = [prompt_len] * n_episodes
+        response_lengths = [resp_len] * n_episodes
+
+        batched = compute_logprobs_batched(model, full_seqs, resp_2d, prompt_lengths, response_lengths)
+        mx.eval(batched)
+
+        assert mx.allclose(sequential, batched, atol=1e-5).item(), (
+            f"Batched {batched.tolist()} != sequential {sequential.tolist()}"
+        )
+
+    def test_variable_lengths(self):
+        """Variable prompt/response lengths produce correct flat 1D output."""
+        from textpolicy.generation.mlx_generation import compute_logprobs, compute_logprobs_batched
+
+        model = self._make_model()
+
+        prompt1 = mx.array([1, 2, 3])     # len=3
+        resp1 = mx.array([4, 5])          # len=2
+        prompt2 = mx.array([6, 7])        # len=2
+        resp2 = mx.array([8, 9, 10])      # len=3
+
+        # Sequential
+        seq1 = compute_logprobs(model, prompt1, resp1)
+        seq2 = compute_logprobs(model, prompt2, resp2)
+        sequential = mx.concatenate([seq1, seq2])
+        mx.eval(sequential)
+
+        # Batched: pad to max lengths
+        full1 = mx.concatenate([prompt1, resp1])          # [5]
+        full2 = mx.concatenate([prompt2, resp2])           # [5]
+        full_seqs = mx.stack([full1, full2])               # [2, 5]
+
+        resp_2d = mx.stack([mx.pad(resp1, (0, 1)), resp2])  # [2, 3]
+
+        batched = compute_logprobs_batched(
+            model, full_seqs, resp_2d, [3, 2], [2, 3]
+        )
+        mx.eval(batched)
+
+        assert batched.shape[0] == 5  # sum(response_lengths) = 2+3
+        assert mx.allclose(sequential, batched, atol=1e-5).item()
+
+    def test_fewer_model_calls(self):
+        """Batched path uses 1 model call vs N sequential calls.
+
+        We verify by wrapping the model in a counting proxy that intercepts
+        the forward pass.
+        """
+        from textpolicy.generation.mlx_generation import compute_logprobs, compute_logprobs_batched
+
+        inner_model = self._make_model()
+        call_count = {'n': 0}
+
+        class CountingWrapper(nn.Module):
+            """Thin wrapper that counts forward-pass invocations."""
+            def __init__(self, wrapped):
+                super().__init__()
+                self._wrapped = wrapped
+            def __call__(self, x):
+                call_count['n'] += 1
+                return self._wrapped(x)
+
+        model = CountingWrapper(inner_model)
+
+        n_episodes = 8
+        prompts = [mx.array([1, 2, 3]) for _ in range(n_episodes)]
+        responses = [mx.array([4, 5]) for _ in range(n_episodes)]
+
+        # Sequential: N calls
+        call_count['n'] = 0
+        for i in range(n_episodes):
+            compute_logprobs(model, prompts[i], responses[i])
+        n_sequential = call_count['n']
+
+        # Batched: 1 call
+        call_count['n'] = 0
+        full_seqs = mx.stack([mx.concatenate([p, r]) for p, r in zip(prompts, responses)])
+        resp_2d = mx.stack(responses)
+        compute_logprobs_batched(model, full_seqs, resp_2d, [3] * n_episodes, [2] * n_episodes)
+        n_batched = call_count['n']
+
+        assert n_sequential == n_episodes, f"Sequential should be {n_episodes} calls, got {n_sequential}"
+        assert n_batched == 1, f"Batched should be 1 call, got {n_batched}"

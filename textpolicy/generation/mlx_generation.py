@@ -370,6 +370,70 @@ def compute_logprobs(
     return selected
 
 
+def compute_logprobs_batched(
+    model: nn.Module,
+    full_sequences: mx.array,
+    response_tokens: mx.array,
+    prompt_lengths: list,
+    response_lengths: list,
+) -> mx.array:
+    """
+    Batched log-probability extraction: single forward pass for N episodes.
+
+    Replaces N sequential ``compute_logprobs`` calls with one batched
+    ``model(full_sequences)`` call, converting O(N) serial model invocations
+    into a single parallel operation.
+
+    Args:
+        model: Causal language model.
+        full_sequences: ``[N, max_seq_len]`` right-padded prompt+response tokens.
+        response_tokens: ``[N, max_resp_len]`` right-padded response-only tokens.
+        prompt_lengths: Per-episode prompt token count (Python list of ints).
+        response_lengths: Per-episode response token count (Python list of ints).
+
+    Returns:
+        Flat 1D unpadded logprobs — ``shape[0] == sum(response_lengths)``.
+
+    Safety notes:
+        - Right-padding is safe for causal models (padded tokens are right of
+          real tokens and cannot influence them via causal attention).
+        - The Python loop over episodes is cheap indexing, not model calls.
+        - No ``.item()`` or ``mx.eval()`` calls — safe inside ``mx.compile``.
+    """
+    n_episodes = full_sequences.shape[0]
+
+    if n_episodes == 0:
+        return mx.array([], dtype=mx.float32)
+
+    # Single batched forward pass: [N, max_seq_len] → [N, max_seq_len, vocab]
+    logits = model(full_sequences)
+
+    # Extract per-episode logprobs (cheap indexing, not model calls)
+    per_episode = []
+    for i in range(n_episodes):
+        p_len = prompt_lengths[i]
+        r_len = response_lengths[i]
+
+        if r_len == 0:
+            continue
+
+        # Prediction logits: same slicing as compute_logprobs
+        # logits at position (p_len-1) predicts the first response token
+        prediction_logits = logits[i, p_len - 1 : p_len - 1 + r_len, :]
+
+        # Log-softmax → select the actual response token at each position
+        log_probs = prediction_logits - mx.logsumexp(
+            prediction_logits, axis=-1, keepdims=True
+        )
+        selected = log_probs[mx.arange(r_len), response_tokens[i, :r_len]]
+        per_episode.append(selected)
+
+    if not per_episode:
+        return mx.array([], dtype=mx.float32)
+
+    return mx.concatenate(per_episode)
+
+
 def encode(tokenizer: Any, text: str) -> mx.array:
     """
     Convert text to MLX token array.

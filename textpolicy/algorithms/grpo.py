@@ -1062,16 +1062,24 @@ def _pack_episodes(episodes: List[Any]) -> Dict[str, Any]:
     This is the shared helper for episode-to-batch conversion, used by all
     data selectors (select_all_data, select_informative_data, select_recent_data).
 
+    Output layout:
+        - 'obs': 2D ``[N, max_obs_len]`` right-padded full sequences (prompt + response)
+        - 'act': 2D ``[N, max_act_len]`` right-padded response tokens
+        - 'logprob': Flat 1D unpadded concatenated log probabilities
+        - 'rewards': Episode rewards as MLX array
+        - 'episode_lengths': List of per-episode response token counts
+        - 'prompt_lengths': List of per-episode prompt token counts
+
+    The 2D obs/act layout enables batched model forward passes in
+    ``_extract_grpo_logprobs``, converting N sequential calls into one.
+    Logprobs remain flat 1D (unpadded) to preserve the flat-token invariant
+    used by ``policy_loss`` and ``_expand_advantages``.
+
     Args:
         episodes: List of episodes (Episode objects or serialized dicts)
 
     Returns:
-        Dictionary with:
-        - 'obs': Flat concatenated full sequences (prompt + response)
-        - 'act': Flat concatenated response tokens
-        - 'logprob': Flat concatenated log probabilities
-        - 'rewards': Episode rewards as MLX array
-        - 'episode_lengths': List of episode lengths
+        Batch dictionary (see layout above)
     """
     if not episodes:
         return {
@@ -1080,9 +1088,11 @@ def _pack_episodes(episodes: List[Any]) -> Dict[str, Any]:
             'logprob': mx.array([], dtype=mx.float32),
             'rewards': mx.array([]),
             'episode_lengths': [],
+            'prompt_lengths': [],
         }
 
     episode_lengths = []
+    prompt_lengths = []
     all_obs = []
     all_acts = []
     all_logprobs = []
@@ -1101,6 +1111,7 @@ def _pack_episodes(episodes: List[Any]) -> Dict[str, Any]:
             # Use flattened token count for episode_lengths (used by _expand_advantages)
             # This ensures alignment between expanded advantages and actual token sequences
             episode_lengths.append(len(flattened_acts))
+            prompt_lengths.append(len(flattened_obs))
 
             # Create full sequence: [prompt_tokens..., response_tokens...]
             full_sequence = flattened_obs + flattened_acts
@@ -1121,6 +1132,7 @@ def _pack_episodes(episodes: List[Any]) -> Dict[str, Any]:
 
             # Use flattened token count for episode_lengths
             episode_lengths.append(len(flattened_acts))
+            prompt_lengths.append(len(flattened_obs))
 
             full_sequence = flattened_obs + flattened_acts
             all_obs.append(full_sequence)
@@ -1142,47 +1154,46 @@ def _pack_episodes(episodes: List[Any]) -> Dict[str, Any]:
     # Find maximum sequence lengths for padding
     max_obs_len = max(len(obs) for obs in all_obs) if all_obs else 0
     max_act_len = max(len(act) for act in all_acts) if all_acts else 0
-    max_logprob_len = max(len(logprob) for logprob in all_logprobs) if all_logprobs else 0
 
     # Convert to MLX arrays with padding
-    # Always create an array for each episode to maintain alignment
     all_obs_mx = [mx.array(obs, dtype=mx.int64) if obs else mx.array([], dtype=mx.int64) for obs in all_obs]
     all_acts_mx = [mx.array(act, dtype=mx.int64) if act else mx.array([], dtype=mx.int64) for act in all_acts]
-    all_logprobs_mx = [mx.array(logprob, dtype=mx.float32) if logprob else mx.array([], dtype=mx.float32) for logprob in all_logprobs]
 
-    # Filter out empty arrays for padding/concatenation
+    # Filter out empty arrays for padding
     non_empty_obs = [obs for obs in all_obs_mx if obs.size > 0]
     non_empty_acts = [act for act in all_acts_mx if act.size > 0]
-    non_empty_logprobs = [logprob for logprob in all_logprobs_mx if logprob.size > 0]
 
-    # Pad using native MLX operations
+    # Pad and stack to 2D: [N, max_len] — enables batched model forward passes
     if non_empty_obs:
         padded_obs = [mx.pad(obs, (0, max_obs_len - obs.shape[0]), constant_values=0)
                       if obs.shape[0] < max_obs_len else obs[:max_obs_len]
                       for obs in non_empty_obs]
+        stacked_obs = mx.stack(padded_obs)  # [N, max_obs_len]
     else:
-        padded_obs = []
+        stacked_obs = mx.array([], dtype=mx.int64)
 
     if non_empty_acts:
         padded_acts = [mx.pad(act, (0, max_act_len - act.shape[0]), constant_values=0)
                        if act.shape[0] < max_act_len else act[:max_act_len]
                        for act in non_empty_acts]
+        stacked_acts = mx.stack(padded_acts)  # [N, max_act_len]
     else:
-        padded_acts = []
+        stacked_acts = mx.array([], dtype=mx.int64)
 
-    if non_empty_logprobs:
-        padded_logprobs = [mx.pad(logprob, (0, max_logprob_len - logprob.shape[0]), constant_values=0.0)
-                          if logprob.shape[0] < max_logprob_len else logprob[:max_logprob_len]
-                          for logprob in non_empty_logprobs]
-    else:
-        padded_logprobs = []
+    # Logprobs: concatenate WITHOUT padding to preserve flat 1D invariant.
+    # Padding would introduce spurious zero-logprobs that break
+    # shape == sum(episode_lengths) for variable-length episodes.
+    all_logprobs_mx = [mx.array(logprob, dtype=mx.float32) if logprob else mx.array([], dtype=mx.float32) for logprob in all_logprobs]
+    non_empty_logprobs = [logprob for logprob in all_logprobs_mx if logprob.size > 0]
+    flat_logprobs = mx.concatenate(non_empty_logprobs) if non_empty_logprobs else mx.array([], dtype=mx.float32)
 
     return {
-        'obs': mx.concatenate(padded_obs) if padded_obs else mx.array([], dtype=mx.int64),
-        'act': mx.concatenate(padded_acts) if padded_acts else mx.array([], dtype=mx.int64),
-        'logprob': mx.concatenate([lp.flatten() for lp in padded_logprobs]) if padded_logprobs else mx.array([], dtype=mx.float32),
+        'obs': stacked_obs,
+        'act': stacked_acts,
+        'logprob': flat_logprobs,
         'rewards': mx.array(episode_rewards),
         'episode_lengths': episode_lengths,
+        'prompt_lengths': prompt_lengths,
     }
 
 
