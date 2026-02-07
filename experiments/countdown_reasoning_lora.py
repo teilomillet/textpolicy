@@ -16,11 +16,12 @@ import argparse
 import json
 from dataclasses import asdict, dataclass
 from pathlib import Path
-from typing import Optional
+from typing import Optional, Union
 
 import mlx.core as mx
 import mlx.optimizers as optim
 
+from textpolicy.algorithms import grpo
 from textpolicy.analysis import EmergenceLogger, load_strategic_grams
 from textpolicy.buffer import Buffer
 from textpolicy.environment.text_generation import TextGenerationEnv
@@ -57,7 +58,7 @@ class ReasoningConfig:
     learning_rate: float = 5e-6
     max_steps: int = 500
     max_grad_norm: float = 0.5
-    compile_training: str = "auto"
+    compile_training: Union[bool, str] = False
 
     # Generation
     max_completion_tokens: int = 512
@@ -222,6 +223,7 @@ def run_experiment(config: ReasoningConfig) -> None:
     )
 
     buffer = Buffer(max_episodes=config.episodes_per_step)
+    trainer.link_buffer(buffer, data_selector_fn=grpo.select_recent_data)
     emergence = EmergenceLogger(output_dir=output_dir / "emergence")
 
     print(f"\nStarting reasoning training for {config.max_steps} steps...")
@@ -243,7 +245,7 @@ def run_experiment(config: ReasoningConfig) -> None:
             examples=[example],
         )
 
-        metrics = trainer.train(buffer)
+        metrics = trainer.train()
 
         if step % 10 == 0:
             print(
@@ -281,11 +283,25 @@ if __name__ == "__main__":
     parser.add_argument("--entropy-weight", type=float, default=0.1, help="GTPO entropy weight")
     parser.add_argument("--hicra-alpha", type=float, default=0.2, help="HICRA amplification alpha")
     parser.add_argument(
+        "--compile-training",
+        choices=["false", "true", "auto"],
+        default="false",
+        help="Training compilation mode (HICRA defaults to false for compatibility)",
+    )
+    parser.add_argument(
         "--strategic-grams",
         default=None,
         help="Optional path to strategic grams JSON (defaults to built-ins)",
     )
     args = parser.parse_args()
+
+    compile_mode: Union[bool, str]
+    if args.compile_training == "true":
+        compile_mode = True
+    elif args.compile_training == "false":
+        compile_mode = False
+    else:
+        compile_mode = "auto"
 
     cfg = ReasoningConfig(
         model_id=args.model,
@@ -303,5 +319,6 @@ if __name__ == "__main__":
         entropy_weight=args.entropy_weight,
         hicra_alpha=args.hicra_alpha,
         strategic_grams_path=args.strategic_grams,
+        compile_training=compile_mode,
     )
     run_experiment(cfg)

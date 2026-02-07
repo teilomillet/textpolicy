@@ -217,9 +217,15 @@ class Trainer:
         try:
             # Extract and save only LoRA parameters
             lora_params = {}
-            for name, param in self.model.named_parameters():
-                if 'lora_' in name.lower() and param.requires_grad:
-                    lora_params[name] = param
+            if hasattr(self.model, "named_parameters"):
+                for name, param in self.model.named_parameters():
+                    if 'lora_' in name.lower() and getattr(param, "requires_grad", True):
+                        lora_params[name] = param
+            else:
+                from mlx.utils import tree_flatten
+                for name, param in tree_flatten(self.model.trainable_parameters()):
+                    if 'lora' in name.lower() or 'adapter' in name.lower():
+                        lora_params[name] = param
             
             if lora_params:
                 mx.save_safetensors(self.auto_save_lora, lora_params)

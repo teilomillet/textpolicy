@@ -473,20 +473,16 @@ def apply_entropy_weighting(
             f"Both must be the same shape (token-level)."
         )
 
-    # Normalize entropy: H_norm(t) = H(t) / mean(H)
-    # .item() → Python float so the `if` below is a plain Python branch.
-    # MLX 0-D arrays do support __bool__(), but mx.compile() forbids
-    # evaluating arrays inside traced functions — .item() makes the
-    # eager-scalar intent explicit and avoids that latent trap.
-    entropy_mean = mx.mean(token_entropies).item()
-
-    # If mean entropy is effectively zero, all tokens are equally confident
-    # (or all entropies are zero). No meaningful signal to redistribute —
-    # return advantages unchanged to satisfy the uniform-entropy invariant.
-    if entropy_mean < 1e-7:
-        return advantages
-
-    entropy_normalized = token_entropies / (entropy_mean + 1e-8)
+    # Compile-safe mean normalization:
+    # avoid Python branching on mx arrays (illegal under mx.compile).
+    entropy_mean = mx.mean(token_entropies)
+    mean_is_tiny = entropy_mean < 1e-7
+    safe_mean = mx.where(
+        mean_is_tiny,
+        mx.array(1.0, dtype=token_entropies.dtype),
+        entropy_mean,
+    )
+    entropy_normalized = token_entropies / (safe_mean + 1e-8)
 
     # GTPO weight: 1 + β * (H_norm - 1)
     # When H_norm = 1 (average entropy), weight = 1 (no change)
@@ -506,8 +502,10 @@ def apply_entropy_weighting(
     # Gradient w.r.t. advantages flows normally; gradient w.r.t. token_entropies
     # is exactly zero — verified by test_gradient_wrt_entropies_is_zero.
     entropy_weights = mx.stop_gradient(mx.maximum(raw_weights, 0.0))
+    weighted = advantages * entropy_weights
 
-    return advantages * entropy_weights
+    # Preserve the uniform/near-zero invariant in both eager and compiled modes.
+    return mx.where(mean_is_tiny, advantages, weighted)
 
 
 def compute_advantages_gtpo(

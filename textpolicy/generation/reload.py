@@ -33,10 +33,20 @@ def save_adapters(
     """
     # Extract LoRA parameters
     lora_params = {}
-    for name, param in model.named_parameters():
-        if 'lora_' in name.lower() and param.requires_grad:
-            lora_params[name] = param
-    
+    if hasattr(model, "named_parameters"):
+        for name, param in model.named_parameters():
+            if 'lora_' in name.lower() and getattr(param, "requires_grad", True):
+                lora_params[name] = param
+    else:
+        from mlx.utils import tree_flatten
+        for name, param in tree_flatten(model.trainable_parameters()):
+            if 'lora' in name.lower() or 'adapter' in name.lower():
+                lora_params[name] = param
+
+    if not lora_params:
+        print("Warning: no LoRA adapter parameters found — skipping save.")
+        return
+
     # Save using MLX
     mx.save_safetensors(adapter_path, lora_params)
     print(f"✓ Saved LoRA adapters to {adapter_path}")
