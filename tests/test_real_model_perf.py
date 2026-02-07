@@ -202,6 +202,10 @@ def _load_and_quantize_model() -> Tuple[Any, Any, int, int]:
 
     Returns ``(model, tokenizer, fp16_bytes, q4_bytes)``.
     Raises on failure — callers should catch and ``pytest.skip``.
+
+    Note: ``apply_quantization_to_model`` silently catches exceptions and
+    returns the original model.  We detect that via a memory comparison
+    and raise so the caller can skip rather than test an FP16 model.
     """
     from mlx_lm import load as mlx_lm_load
 
@@ -218,6 +222,16 @@ def _load_and_quantize_model() -> Tuple[Any, Any, int, int]:
     fp16_bytes = _get_model_memory_bytes(model)
     model = apply_quantization_to_model(model, config, bits=4, group_size=64)
     q4_bytes = _get_model_memory_bytes(model)
+
+    # apply_quantization_to_model silently returns the original model on
+    # failure (lora.py:474-479).  Detect this via memory: 4-bit should be
+    # roughly 4x smaller than FP16.
+    if q4_bytes >= fp16_bytes:
+        raise RuntimeError(
+            f"Quantization had no effect (memory unchanged: {fp16_bytes} bytes). "
+            "apply_quantization_to_model likely caught an internal exception."
+        )
+
     return model, tokenizer, fp16_bytes, q4_bytes
 
 
@@ -354,79 +368,13 @@ def test_real_model_logprobs_valid(real_model: Tuple[Any, Any]) -> None:
     assert not bool(mx.any(mx.isinf(logprobs)).item())
 
 
-def test_real_model_training_step_finite_loss(real_model_with_lora: Tuple[Any, Any]) -> None:
-    model, tokenizer = real_model_with_lora
-    batch = _build_real_rollout_batch(model, tokenizer, n_episodes=4, max_tokens=32)
-
-    trainer = _make_trainer(model, profile=False)
-    metrics = trainer.train(batch)
-    loss = float(metrics["loss"])
-
-    assert math.isfinite(loss)
-    assert -10.0 < loss < 100.0
-
-
-@pytest.mark.apple_silicon
-def test_training_step_under_5s(real_model_with_lora: Tuple[Any, Any]) -> None:
-    _require_apple_silicon()
-    model, tokenizer = real_model_with_lora
-    batch = _build_real_rollout_batch(model, tokenizer, n_episodes=4, max_tokens=32)
-
-    trainer = _make_trainer(model, profile=False)
-    trainer.train(batch)  # warmup
-
-    t0 = time.perf_counter()
-    metrics = trainer.train(batch)
-    elapsed_s = time.perf_counter() - t0
-
-    assert math.isfinite(float(metrics["loss"]))
-    assert elapsed_s < 5.0, f"Training step took {elapsed_s:.2f}s (expected < 5.0s)."
-
-
-@pytest.mark.apple_silicon
-def test_rollout_under_30s(real_model_with_lora: Tuple[Any, Any]) -> None:
-    _require_apple_silicon()
-    model, tokenizer = real_model_with_lora
-    prompts = _make_prompt_batch(tokenizer, n=4)
-    no_eos_tokenizer = _NoEOSTokenizerProxy(tokenizer)
-
-    t0 = time.perf_counter()
-    results = batch_generate_tokens(
-        model,
-        no_eos_tokenizer,
-        prompts,
-        max_tokens=128,
-        temperature=0.0,
-    )
-    _eval_nested(results)
-    elapsed_s = time.perf_counter() - t0
-
-    assert len(results) == 4
-    assert elapsed_s < 30.0, f"Rollout took {elapsed_s:.2f}s (expected < 30.0s)."
-
-
-def test_profiling_overhead_under_25pct(real_model_with_lora: Tuple[Any, Any]) -> None:
-    model, tokenizer = real_model_with_lora
-    batch = _build_real_rollout_batch(model, tokenizer, n_episodes=4, max_tokens=32)
-
-    trainer_unprofiled = _make_trainer(model, profile=False)
-    trainer_profiled = _make_trainer(model, profile=True)
-
-    trainer_unprofiled.train(batch)  # warmup
-    trainer_profiled.train(batch)    # warmup
-
-    unprofiled_ms = _median_ms(lambda: trainer_unprofiled.train(batch), repeats=4, warmup=0)
-    profiled_ms = _median_ms(lambda: trainer_profiled.train(batch), repeats=4, warmup=0)
-    overhead = (profiled_ms - unprofiled_ms) / max(unprofiled_ms, 1e-9)
-
-    assert overhead < 0.25, (
-        f"Profiling overhead {overhead * 100:.1f}% exceeds 25% "
-        f"(profiled={profiled_ms:.2f}ms, unprofiled={unprofiled_ms:.2f}ms)."
-    )
-
-
 # ---------------------------------------------------------------------------
 # Quantized-model litmus tests (Issue #43)
+#
+# L1–L3 use ``real_model`` as the FP16 baseline and must appear BEFORE
+# ``real_model_with_lora`` consumers so the baseline is un-mutated.
+# L4 (QLoRA training) appears after, since it triggers
+# ``quantized_model_with_qlora`` which mutates ``quantized_model``.
 # ---------------------------------------------------------------------------
 
 
@@ -539,6 +487,87 @@ def test_quantized_rollout_faster(
         f"Expected ≥1.2x rollout speedup from quantization "
         f"(FP16={fp16_ms:.1f}ms, Q4={q4_ms:.1f}ms, speedup={speedup:.2f}x)."
     )
+
+
+# ---------------------------------------------------------------------------
+# FP16+LoRA tests (mutate real_model in-place)
+# ---------------------------------------------------------------------------
+
+
+def test_real_model_training_step_finite_loss(real_model_with_lora: Tuple[Any, Any]) -> None:
+    model, tokenizer = real_model_with_lora
+    batch = _build_real_rollout_batch(model, tokenizer, n_episodes=4, max_tokens=32)
+
+    trainer = _make_trainer(model, profile=False)
+    metrics = trainer.train(batch)
+    loss = float(metrics["loss"])
+
+    assert math.isfinite(loss)
+    assert -10.0 < loss < 100.0
+
+
+@pytest.mark.apple_silicon
+def test_training_step_under_5s(real_model_with_lora: Tuple[Any, Any]) -> None:
+    _require_apple_silicon()
+    model, tokenizer = real_model_with_lora
+    batch = _build_real_rollout_batch(model, tokenizer, n_episodes=4, max_tokens=32)
+
+    trainer = _make_trainer(model, profile=False)
+    trainer.train(batch)  # warmup
+
+    t0 = time.perf_counter()
+    metrics = trainer.train(batch)
+    elapsed_s = time.perf_counter() - t0
+
+    assert math.isfinite(float(metrics["loss"]))
+    assert elapsed_s < 5.0, f"Training step took {elapsed_s:.2f}s (expected < 5.0s)."
+
+
+@pytest.mark.apple_silicon
+def test_rollout_under_30s(real_model_with_lora: Tuple[Any, Any]) -> None:
+    _require_apple_silicon()
+    model, tokenizer = real_model_with_lora
+    prompts = _make_prompt_batch(tokenizer, n=4)
+    no_eos_tokenizer = _NoEOSTokenizerProxy(tokenizer)
+
+    t0 = time.perf_counter()
+    results = batch_generate_tokens(
+        model,
+        no_eos_tokenizer,
+        prompts,
+        max_tokens=128,
+        temperature=0.0,
+    )
+    _eval_nested(results)
+    elapsed_s = time.perf_counter() - t0
+
+    assert len(results) == 4
+    assert elapsed_s < 30.0, f"Rollout took {elapsed_s:.2f}s (expected < 30.0s)."
+
+
+def test_profiling_overhead_under_25pct(real_model_with_lora: Tuple[Any, Any]) -> None:
+    model, tokenizer = real_model_with_lora
+    batch = _build_real_rollout_batch(model, tokenizer, n_episodes=4, max_tokens=32)
+
+    trainer_unprofiled = _make_trainer(model, profile=False)
+    trainer_profiled = _make_trainer(model, profile=True)
+
+    trainer_unprofiled.train(batch)  # warmup
+    trainer_profiled.train(batch)    # warmup
+
+    unprofiled_ms = _median_ms(lambda: trainer_unprofiled.train(batch), repeats=4, warmup=0)
+    profiled_ms = _median_ms(lambda: trainer_profiled.train(batch), repeats=4, warmup=0)
+    overhead = (profiled_ms - unprofiled_ms) / max(unprofiled_ms, 1e-9)
+
+    assert overhead < 0.25, (
+        f"Profiling overhead {overhead * 100:.1f}% exceeds 25% "
+        f"(profiled={profiled_ms:.2f}ms, unprofiled={unprofiled_ms:.2f}ms)."
+    )
+
+
+# ---------------------------------------------------------------------------
+# QLoRA training (mutates quantized_model in-place)
+# ---------------------------------------------------------------------------
 
 
 def test_qlora_training_loss_finite(
