@@ -74,7 +74,7 @@ class ReasoningConfig:
 
     # Rollout
     episodes_per_step: int = 8
-    batch_size: int = 1
+    batch_size: int = 8
 
     # Output
     output_dir: str = "results/countdown_reasoning_lora"
@@ -187,6 +187,12 @@ def run_experiment(config: ReasoningConfig) -> None:
             f"silently evicted before reaching the training buffer."
         )
 
+    if config.batch_size > config.episodes_per_step:
+        raise ValueError(
+            f"batch_size ({config.batch_size}) exceeds episodes_per_step "
+            f"({config.episodes_per_step}). batch_size should be <= episodes_per_step."
+        )
+
     output_dir = Path(config.output_dir)
     output_dir.mkdir(parents=True, exist_ok=True)
     save_config(config, output_dir)
@@ -264,6 +270,14 @@ def run_experiment(config: ReasoningConfig) -> None:
         max_steps=config.episodes_per_step,
         max_episodes=config.episodes_per_step,
         batch_size=config.batch_size,
+        model=model,
+        tokenizer=tokenizer,
+        generation_params={
+            "max_tokens": config.max_completion_tokens,
+            "temperature": config.temperature,
+            "top_p": config.top_p,
+            "repetition_penalty": config.repetition_penalty,
+        },
     )
 
     buffer = Buffer(max_episodes=config.episodes_per_step)
@@ -311,12 +325,16 @@ def run_experiment(config: ReasoningConfig) -> None:
                 trainer_phase_totals[phase] = trainer_phase_totals.get(phase, 0.0) + float(value)
 
         if step % 10 == 0:
+            cumulative_total = sum(phase_totals.values()) or 1e-9
+            rollout_pct = phase_totals["rollout_collect_s"] / cumulative_total * 100
+            train_pct = phase_totals["train_s"] / cumulative_total * 100
             print(
                 f"Step {step}: loss={metrics['loss']:.4f} "
                 f"reward={step_stats['mean_reward']:.3f} "
                 f"correct={step_stats['correct_count']}/{step_stats['total_count']} "
                 f"planning_ratio={step_stats['planning_token_ratio']:.4f} "
-                f"step_time={time.perf_counter() - step_start:.2f}s"
+                f"step_time={time.perf_counter() - step_start:.2f}s "
+                f"[rollout {rollout_pct:.0f}% | train {train_pct:.0f}%]"
             )
 
         if step % 100 == 0 and step > 0:
@@ -343,7 +361,7 @@ if __name__ == "__main__":
     parser.add_argument("--lr", type=float, default=5e-6, help="Learning rate")
     parser.add_argument("--num-problems", type=int, default=50, help="Number of countdown problems")
     parser.add_argument("--episodes-per-step", type=int, default=8, help="Episodes per training step")
-    parser.add_argument("--batch-size", type=int, default=1, help="Batched generation across episodes")
+    parser.add_argument("--batch-size", type=int, default=8, help="Batched generation across episodes")
     parser.add_argument("--temperature", type=float, default=0.7, help="Temperature")
     parser.add_argument("--seed", type=int, default=42, help="Dataset seed")
     parser.add_argument("--lora-rank", type=int, default=2, help="LoRA rank")
