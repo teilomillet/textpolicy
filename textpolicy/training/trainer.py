@@ -312,6 +312,57 @@ class Trainer:
         )
 
         return action_log_probs
+
+    def _default_get_token_entropies(self, model_output: Any, actions: mx.array) -> mx.array:
+        """
+        Extract per-token entropy aligned to the provided action layout.
+
+        This mirrors ``_default_get_logprobs`` shape handling so downstream
+        transforms (GTPO/HICRA) can consume token entropies without extra
+        rollout fields.
+        """
+        if hasattr(model_output, 'logits'):
+            logits = model_output.logits
+        else:
+            logits = model_output
+
+        if logits.ndim < 2:
+            raise ValueError(f"Expected logits with at least 2 dimensions, got {logits.ndim}")
+
+        log_probs = logits - mx.logsumexp(logits, axis=-1, keepdims=True)
+        token_entropies = -mx.sum(mx.exp(log_probs) * log_probs, axis=-1)
+
+        if actions.ndim == 1:
+            if token_entropies.ndim == 2:
+                token_entropies = token_entropies[0]
+
+            actions_len = actions.size
+            if token_entropies.shape[0] != actions_len:
+                raise ValueError(
+                    f"Sequence length mismatch: token_entropies has "
+                    f"{token_entropies.shape[0]} positions but actions have "
+                    f"{actions_len} tokens"
+                )
+            aligned = token_entropies
+        elif actions.ndim == 2:
+            batch_size = actions.shape[0]  # type: ignore
+            seq_len = actions.shape[1]  # type: ignore
+
+            if token_entropies.shape[0] != batch_size or token_entropies.shape[1] != seq_len:
+                raise ValueError(
+                    f"Batch shape mismatch: token_entropies shape "
+                    f"{token_entropies.shape[:2]} vs actions shape {actions.shape}"
+                )
+            aligned = token_entropies
+        else:
+            raise ValueError(f"Unsupported actions dimension: {actions.ndim}")
+
+        aligned = mx.where(
+            mx.isnan(aligned) | mx.isinf(aligned),
+            mx.array(0.0, dtype=aligned.dtype),
+            aligned,
+        )
+        return aligned
     
     def _default_data_selector(self, buffer: Buffer) -> Dict[str, mx.array]:
         """
@@ -366,6 +417,10 @@ class Trainer:
         
         # GRPO-specific logprob extraction: observations contain prompt+response,
         # actions contain only response tokens that need logprob evaluation.
+        needs_token_entropies = (
+            self.advantage_transform_fn is not None
+            and batch_data.get("token_entropies") is None
+        )
         if 'episode_lengths' in batch_data:
             episode_lengths = batch_data['episode_lengths']
 
@@ -382,10 +437,22 @@ class Trainer:
                 )
 
             prompt_lengths = batch_data.get('prompt_lengths')
-            new_logprobs = self._extract_grpo_logprobs(
-                observations, actions, old_logprobs, episode_lengths,
-                prompt_lengths, _compiled=self._compiled,
-            )
+            if needs_token_entropies:
+                new_logprobs, token_entropies = self._extract_grpo_logprobs(
+                    observations,
+                    actions,
+                    old_logprobs,
+                    episode_lengths,
+                    prompt_lengths,
+                    _compiled=self._compiled,
+                    return_token_entropies=True,
+                )
+                batch_data['token_entropies'] = token_entropies
+            else:
+                new_logprobs = self._extract_grpo_logprobs(
+                    observations, actions, old_logprobs, episode_lengths,
+                    prompt_lengths, _compiled=self._compiled,
+                )
         else:
             # Fallback for non-GRPO data or custom pipelines
             if observations.ndim == 1:
@@ -395,6 +462,13 @@ class Trainer:
 
             model_output = self.model(model_input)
             new_logprobs = self.get_logprobs_fn(model_output, actions)
+            if needs_token_entropies:
+                token_entropies = self._default_get_token_entropies(model_output, actions)
+                batch_data['token_entropies'] = (
+                    token_entropies.reshape(-1)
+                    if token_entropies.ndim > 1
+                    else token_entropies
+                )
         
         # No tokens → no loss.  Return 0.0 so gradients are zero and the
         # optimizer step is a no-op.  Without this guard, mx.mean([]) in
@@ -478,7 +552,8 @@ class Trainer:
         prompt_lengths: Optional[List[int]] = None,
         *,
         _compiled: bool = False,
-    ) -> mx.array:
+        return_token_entropies: bool = False,
+    ) -> Any:
         """
         Compute per-episode logprobs under the current model.
 
@@ -506,6 +581,8 @@ class Trainer:
 
         Returns:
             Flat 1D log probabilities matching ``old_logprobs`` shape.
+            When ``return_token_entropies=True``, returns a tuple
+            ``(new_logprobs, token_entropies)``.
         """
         num_episodes = len(episode_lengths)
         expected_tokens = sum(episode_lengths)
@@ -521,25 +598,39 @@ class Trainer:
 
                 from textpolicy.generation.mlx_generation import compute_logprobs_batched
 
-                new_logprobs = compute_logprobs_batched(
+                batched_out = compute_logprobs_batched(
                     self.model,
                     observations,   # [N, max_obs_len]
                     actions,        # [N, max_act_len]
                     prompt_lengths,
                     episode_lengths,
+                    return_token_entropies=return_token_entropies,
                 )
+                if return_token_entropies:
+                    new_logprobs, token_entropies = batched_out
+                else:
+                    new_logprobs = batched_out
             else:
                 # Path 2: Sequential compat — N per-episode forward passes
                 from textpolicy.generation.mlx_generation import compute_logprobs
 
                 per_episode = []
+                per_episode_entropies = []
                 for i in range(num_episodes):
                     ep_logprobs = compute_logprobs(
                         self.model, observations[i], actions[i],
                         _compiled=_compiled,
+                        return_token_entropies=return_token_entropies,
                     )
-                    per_episode.append(ep_logprobs)
+                    if return_token_entropies:
+                        episode_logprobs, episode_entropies = ep_logprobs
+                        per_episode.append(episode_logprobs)
+                        per_episode_entropies.append(episode_entropies)
+                    else:
+                        per_episode.append(ep_logprobs)
                 new_logprobs = mx.concatenate(per_episode)
+                if return_token_entropies:
+                    token_entropies = mx.concatenate(per_episode_entropies)
         else:
             # Path 3: Flat 1D — multi-step RL generic path.
             if observations.ndim == 1:
@@ -548,6 +639,10 @@ class Trainer:
                 model_input = observations
             model_output = self.model(model_input)
             new_logprobs = self.get_logprobs_fn(model_output, actions)
+            if return_token_entropies:
+                token_entropies = self._default_get_token_entropies(model_output, actions)
+                if token_entropies.ndim > 1:
+                    token_entropies = token_entropies.reshape(-1)
 
         # Post-condition: new_logprobs must be flat 1D with one entry per
         # real response token. A mismatch here means one of the extraction
@@ -558,6 +653,15 @@ class Trainer:
                 f"sum(episode_lengths)={expected_tokens}. The logprob extraction "
                 f"path produced the wrong number of tokens."
             )
+
+        if return_token_entropies:
+            if token_entropies.shape[0] != expected_tokens:  # type: ignore[name-defined]
+                raise ValueError(
+                    f"token_entropies.shape[0]={token_entropies.shape[0]} does not "
+                    f"match sum(episode_lengths)={expected_tokens}. Entropy extraction "
+                    f"must align one value per response token."
+                )
+            return new_logprobs, token_entropies  # type: ignore[name-defined]
 
         return new_logprobs
 

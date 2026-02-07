@@ -603,6 +603,55 @@ class TestExtractGrpoLogprobsBatched:
         assert not mx.any(mx.isinf(result)).item(), "Inf in batched logprobs"
         assert mx.all(result <= 0).item(), f"Positive logprobs: {result.tolist()}"
 
+    def test_return_token_entropies_matches_sequential(self):
+        """Batched token entropy extraction matches per-episode sequential reference."""
+        from textpolicy.generation.mlx_generation import compute_logprobs
+
+        model = self._make_model()
+        trainer = self._make_trainer(model)
+
+        prompt1 = mx.array([1, 2, 3])
+        resp1 = mx.array([4, 5])
+        prompt2 = mx.array([7, 8, 9])
+        resp2 = mx.array([10, 11])
+
+        obs = mx.stack([
+            mx.concatenate([prompt1, resp1]),
+            mx.concatenate([prompt2, resp2]),
+        ])
+        act = mx.stack([resp1, resp2])
+        old_lp = mx.zeros(4)
+        ep_lengths = [2, 2]
+        prompt_lengths = [3, 3]
+
+        batched_lp, batched_ent = trainer._extract_grpo_logprobs(
+            obs,
+            act,
+            old_lp,
+            ep_lengths,
+            prompt_lengths,
+            return_token_entropies=True,
+        )
+        mx.eval(batched_lp, batched_ent)
+
+        seq1_lp, seq1_ent = compute_logprobs(
+            model, prompt1, resp1, return_token_entropies=True
+        )
+        seq2_lp, seq2_ent = compute_logprobs(
+            model, prompt2, resp2, return_token_entropies=True
+        )
+        seq_lp = mx.concatenate([seq1_lp, seq2_lp])
+        seq_ent = mx.concatenate([seq1_ent, seq2_ent])
+        mx.eval(seq_lp, seq_ent)
+
+        assert batched_lp.shape == seq_lp.shape
+        assert batched_ent.shape == seq_ent.shape
+        assert mx.allclose(batched_lp, seq_lp, atol=1e-5).item()
+        assert mx.allclose(batched_ent, seq_ent, atol=1e-5).item()
+        assert not mx.any(mx.isnan(batched_ent)).item()
+        assert not mx.any(mx.isinf(batched_ent)).item()
+        assert mx.all(batched_ent >= 0).item()
+
     def test_empty_response_episode_in_middle(self):
         """Regression: empty-act episode between non-empty ones must not crash.
 
@@ -675,6 +724,49 @@ class TestExtractGrpoLogprobsBatched:
 
         metrics = trainer.train(batch)
         assert metrics['loss'] == 0.0, f"Expected loss=0.0, got {metrics['loss']}"
+
+    def test_loss_fn_populates_token_entropies_for_advantage_transform(self):
+        """_loss_fn auto-populates token_entropies when transform is enabled."""
+        from textpolicy.algorithms import grpo
+        from textpolicy.training import Trainer
+
+        model = self._make_model()
+        seen = {"called": False}
+
+        def passthrough_transform(advantages, batch_data):
+            seen["called"] = True
+            entropies = batch_data.get("token_entropies")
+            assert entropies is not None, "token_entropies should be auto-populated"
+            assert entropies.shape == advantages.shape
+            assert not mx.any(mx.isnan(entropies)).item()
+            assert not mx.any(mx.isinf(entropies)).item()
+            assert mx.all(entropies >= 0).item()
+            return advantages
+
+        trainer = Trainer(
+            model=model,
+            loss_fn=grpo.policy_loss,
+            optimizer=optim.Adam(learning_rate=1e-3),
+            advantage_fn=grpo.compute_advantages,
+            compile_training=False,
+            advantage_transform_fn=passthrough_transform,
+        )
+
+        batch = {
+            "obs": mx.array([[1, 2, 3, 4, 5], [6, 7, 8, 9, 10]], dtype=mx.int64),
+            "act": mx.array([[4, 5], [9, 10]], dtype=mx.int64),
+            "logprob": mx.zeros(4, dtype=mx.float32),
+            "rewards": mx.array([1.0, 0.5], dtype=mx.float32),
+            "episode_lengths": [2, 2],
+            "prompt_lengths": [3, 3],
+        }
+
+        loss = trainer._loss_fn(batch)
+        mx.eval(loss)
+
+        assert seen["called"], "advantage_transform_fn should be invoked"
+        assert "token_entropies" in batch
+        assert batch["token_entropies"].shape == (4,)
 
 
 @pytest.mark.integration

@@ -403,7 +403,8 @@ def compute_logprobs(
     response_tokens: mx.array,
     *,
     _compiled: bool = False,
-) -> mx.array:
+    return_token_entropies: bool = False,
+) -> Any:
     """
     Extract log-probabilities of response_tokens under model via teacher-forcing.
 
@@ -417,9 +418,15 @@ def compute_logprobs(
         _compiled: When True, skip ``mx.any``-based validation (uses
             ``mx.where`` sanitization instead).  Set by the Trainer when
             ``_loss_fn`` is wrapped with ``mx.compile``.
+        return_token_entropies: When True, return a tuple
+            ``(logprobs, token_entropies)`` where token entropies are
+            Shannon entropy values per response token.
     """
     if len(response_tokens) == 0:
-        return mx.array([])
+        empty = mx.array([])
+        if return_token_entropies:
+            return empty, empty
+        return empty
 
     full_sequence = mx.concatenate([prompt_tokens, response_tokens])
     model_input = full_sequence[None] if full_sequence.ndim == 1 else full_sequence
@@ -433,6 +440,7 @@ def compute_logprobs(
 
     log_probs = prediction_logits - mx.logsumexp(prediction_logits, axis=-1, keepdims=True)
     selected = log_probs[mx.arange(response_len), response_tokens]
+    token_entropies = -mx.sum(mx.exp(log_probs) * log_probs, axis=-1)
 
     if _compiled:
         # Inside mx.compile: Python ``if`` on ``mx.any(...)`` is illegal
@@ -445,6 +453,11 @@ def compute_logprobs(
             sentinel,
             selected,
         )
+        token_entropies = mx.where(
+            mx.isnan(token_entropies) | mx.isinf(token_entropies),
+            mx.array(0.0, dtype=token_entropies.dtype),
+            token_entropies,
+        )
     else:
         # Outside compilation: eager validation with clear error messages.
         # The mx.any() calls also act as implicit sync barriers, which
@@ -453,7 +466,11 @@ def compute_logprobs(
             raise ValueError("Invalid logprobs (nan/inf)")
         if mx.any(selected > 0):
             print("Warning: positive logprobs detected")
+        if mx.any(mx.isnan(token_entropies)) or mx.any(mx.isinf(token_entropies)):
+            raise ValueError("Invalid token entropies (nan/inf)")
 
+    if return_token_entropies:
+        return selected, token_entropies
     return selected
 
 
@@ -588,7 +605,8 @@ def compute_logprobs_batched(
     response_tokens: mx.array,
     prompt_lengths: list,
     response_lengths: list,
-) -> mx.array:
+    return_token_entropies: bool = False,
+) -> Any:
     """
     Batched log-probability extraction: single forward pass for N episodes.
 
@@ -605,6 +623,8 @@ def compute_logprobs_batched(
 
     Returns:
         Flat 1D unpadded logprobs — ``shape[0] == sum(response_lengths)``.
+        When ``return_token_entropies=True``, returns a tuple
+        ``(logprobs, token_entropies)`` with matching flat 1D shapes.
 
     Safety notes:
         - Right-padding is safe for causal models (padded tokens are right of
@@ -626,7 +646,10 @@ def compute_logprobs_batched(
     n_episodes = full_sequences.shape[0]
 
     if n_episodes == 0:
-        return mx.array([], dtype=mx.float32)
+        empty = mx.array([], dtype=mx.float32)
+        if return_token_entropies:
+            return empty, empty
+        return empty
 
     # Defensive shape check: all episode-indexed inputs must have N entries.
     # A mismatch here means _pack_episodes dropped rows (e.g. filtering out
@@ -659,6 +682,7 @@ def compute_logprobs_batched(
 
     # Extract per-episode logprobs (cheap indexing, not model calls)
     per_episode = []
+    per_episode_entropies = []
     for i in range(n_episodes):
         p_len = prompt_lengths[i]
         r_len = response_lengths[i]
@@ -686,12 +710,18 @@ def compute_logprobs_batched(
             prediction_logits, axis=-1, keepdims=True
         )
         selected = log_probs[mx.arange(r_len), response_tokens[i, :r_len]]
+        entropies = -mx.sum(mx.exp(log_probs) * log_probs, axis=-1)
         per_episode.append(selected)
+        per_episode_entropies.append(entropies)
 
     if not per_episode:
-        return mx.array([], dtype=mx.float32)
+        empty = mx.array([], dtype=mx.float32)
+        if return_token_entropies:
+            return empty, empty
+        return empty
 
     result = mx.concatenate(per_episode)
+    entropy_result = mx.concatenate(per_episode_entropies)
 
     # Sanitize NaN/Inf — compile-safe (no Python branching on array
     # values).  Matches the handling in compute_logprobs(_compiled=True)
@@ -703,7 +733,14 @@ def compute_logprobs_batched(
         sentinel,
         result,
     )
+    entropy_result = mx.where(
+        mx.isnan(entropy_result) | mx.isinf(entropy_result),
+        mx.array(0.0, dtype=entropy_result.dtype),
+        entropy_result,
+    )
 
+    if return_token_entropies:
+        return result, entropy_result
     return result
 
 
