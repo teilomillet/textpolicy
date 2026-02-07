@@ -87,6 +87,10 @@ def moe_model_with_lora(moe_model_and_tokenizer):
     model, _tok = moe_model_and_tokenizer
     apply_lora(model, lora_layers=2, lora_rank=4, lora_scale=20.0)
     freeze_base(model)
+    # MoE models require training mode so that SwitchGLU/SwitchMLP apply
+    # mx.stop_gradient to routing indices (otherwise gather_mm VJP fails).
+    # Trainer.__init__ does this automatically; tests must do it manually.
+    model.train()
     return model
 
 

@@ -123,12 +123,17 @@ class Trainer:
         self.auto_save_lora = auto_save_lora or self._detect_auto_reload_lora(model)
         self._has_lora = self._detect_lora_model(model)
 
-        # MoE detection — purely observability, no behavioral changes.
+        # MoE detection — enable training mode for correct backprop.
+        # SwitchGLU/SwitchMLP apply mx.stop_gradient to routing indices
+        # only when model.training is True.  Without this, mx.gather_mm
+        # raises "Cannot calculate VJP with respect to indices" during
+        # the backward pass.
         from textpolicy.generation.lora import detect_moe_model, get_moe_config
         self._is_moe = detect_moe_model(model)
         if self._is_moe:
+            model.train()
             moe_cfg = get_moe_config(model)
-            logger.info("MoE model detected: %s", moe_cfg)
+            logger.info("MoE model detected, enabled training mode: %s", moe_cfg)
 
         # Resolve compile_training: "auto" checks model param count.
         # Compilation amortises tracing overhead over many ops, so it only

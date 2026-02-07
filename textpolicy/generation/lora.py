@@ -97,6 +97,16 @@ def apply_lora(
             f"Applied LoRA to {lora_layers} layers "
             f"(rank={lora_rank}, scale={lora_scale}, arch={arch})"
         )
+        if is_moe:
+            # SwitchGLU/SwitchMLP only apply mx.stop_gradient to routing
+            # indices when model.training is True.  Without this, backprop
+            # through mx.gather_mm fails.  Trainer.train() sets this
+            # automatically; warn for manual usage.
+            if not model.training:
+                print(
+                    "  ⚠ MoE model: call model.train() before backprop "
+                    "(Trainer does this automatically)"
+                )
     else:
         _apply_lora_manual(model, lora_layers, lora_rank, lora_scale, lora_dropout)
 
