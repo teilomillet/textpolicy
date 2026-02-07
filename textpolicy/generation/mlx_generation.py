@@ -993,6 +993,12 @@ def batch_generate_tokens(
     arange_batch = mx.arange(batch_size)
 
     use_rep_penalty = repetition_penalty is not None and repetition_penalty != 1.0
+    # Persistent per-sequence context for repetition penalty.  Initialized
+    # from the *original* prompt tokens (immutable copy) so the non-cache
+    # fallback path — which mutates prompt_token_lists_py — cannot introduce
+    # duplicate tokens into the penalty window.
+    if use_rep_penalty:
+        rep_ctx: List[List[int]] = [list(p) for p in prompt_token_lists_py]
 
     for decode_step in range(max_tokens):
         # Logprobs from unscaled logits (matches _simple_generate convention).
@@ -1007,9 +1013,7 @@ def batch_generate_tokens(
             for i in range(batch_size):
                 if finished[i]:
                     continue
-                ctx = (prompt_token_lists_py[i] + per_seq_tokens[i])[
-                    -repetition_context_size:
-                ]
+                ctx = rep_ctx[i][-repetition_context_size:]
                 if ctx:
                     tok_ids = mx.array(ctx, dtype=mx.int32)
                     sel = sample_logits[i, tok_ids]
@@ -1022,6 +1026,7 @@ def batch_generate_tokens(
                 sample_logits, axis=-1, keepdims=True
             )
         else:
+            sample_logits = next_logits
             sample_log_probs = log_probs
 
         if temperature <= 0:
@@ -1029,7 +1034,7 @@ def batch_generate_tokens(
         elif sampler is not None:
             sampled = sampler(sample_log_probs)
         else:
-            scaled_logits = sample_log_probs / temperature
+            scaled_logits = sample_logits / temperature
             probs = mx.softmax(scaled_logits, axis=-1)
             sampled = mx.random.categorical(mx.log(probs))
 
@@ -1043,6 +1048,8 @@ def batch_generate_tokens(
             tok = int(sampled_list[i])
             per_seq_tokens[i].append(tok)
             per_seq_logprobs[i].append(float(logprob_list[i]))
+            if use_rep_penalty:
+                rep_ctx[i].append(tok)
             if tok in eos_ids:
                 finished[i] = True
 
