@@ -928,6 +928,11 @@ def batch_generate_tokens(
         ``response_tokens`` includes EOS tokens when sampled; no tokens are
         emitted after EOS for a finished sequence.
     """
+    if repetition_penalty is not None and repetition_penalty <= 0:
+        raise ValueError(
+            f"repetition_penalty must be a positive float, got {repetition_penalty}"
+        )
+
     if max_tokens <= 0:
         return [
             (mx.array([], dtype=mx.int32), {"logprob": mx.array([], dtype=mx.float32)})

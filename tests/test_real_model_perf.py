@@ -169,9 +169,18 @@ def real_model() -> Tuple[Any, Any]:
 
 
 @pytest.fixture(scope="module")
-def real_model_with_lora(real_model: Tuple[Any, Any]) -> Tuple[Any, Any]:
-    """Model with LoRA adapters for training tests (matches experiment usage)."""
-    model, tokenizer = real_model
+def real_model_with_lora() -> Tuple[Any, Any]:
+    """Separate model instance with LoRA adapters for training tests.
+
+    Loads its own model to avoid mutating the shared ``real_model`` fixture
+    (apply_lora + freeze_base are in-place).  This keeps generation-only
+    tests order-independent.
+    """
+    model_name = os.environ.get(_MODEL_ENV, _DEFAULT_MODEL)
+    try:
+        model, tokenizer = load_model(model_name)
+    except Exception as exc:
+        pytest.skip(f"Could not load real model '{model_name}': {exc}")
     from textpolicy.generation.lora import apply_lora, freeze_base
 
     apply_lora(model, lora_layers=4, lora_rank=2, lora_scale=8.0)

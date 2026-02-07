@@ -512,3 +512,74 @@ def test_rollout_coordinator_batch_size_routes_to_batched_path():
         assert len(buffer.episodes) == 4
     finally:
         coordinator.close()
+
+
+# ── Repetition penalty tests ────────────────────────────────────────
+
+
+@pytest.mark.unit
+def test_batch_generate_rejects_invalid_repetition_penalty():
+    """Negative / zero repetition_penalty must raise ValueError."""
+    model = _TinyLM()
+    tok = _DummyTokenizer()
+    prompts = [mx.array([3, 4], dtype=mx.int32)]
+
+    for bad_value in [-1.0, 0.0, -0.5]:
+        with pytest.raises(ValueError, match="repetition_penalty must be a positive"):
+            batch_generate_tokens(
+                model, tok, prompts, max_tokens=2, repetition_penalty=bad_value,
+            )
+
+
+@pytest.mark.unit
+def test_create_batched_policy_forwards_repetition_penalty():
+    """Regression guard: create_batched_policy must pass repetition_penalty
+    through to batch_generate_tokens (the exact bug fixed in this PR)."""
+    import unittest.mock as mock
+
+    model = _TinyLM()
+    tok = _DummyTokenizer()
+    policy = create_batched_policy(
+        model, tok,
+        generation_params={
+            "max_tokens": 2,
+            "temperature": 0.0,
+            "repetition_penalty": 1.3,
+        },
+    )
+
+    prompts = [mx.array([3, 4], dtype=mx.int32)]
+    with mock.patch(
+        "textpolicy.generation.mlx_generation.batch_generate_tokens",
+        wraps=batch_generate_tokens,
+    ) as spy:
+        policy(prompts)
+        spy.assert_called_once()
+        _, kwargs = spy.call_args
+        assert kwargs.get("repetition_penalty") == 1.3, (
+            "repetition_penalty was not forwarded to batch_generate_tokens"
+        )
+
+
+@pytest.mark.unit
+def test_repetition_penalty_affects_sampling():
+    """Repetition penalty should discourage re-sampling the same token."""
+    model = _TinyLM()
+    tok = _DummyTokenizer()
+    prompt = mx.array([5, 5, 5, 5], dtype=mx.int32)  # repeated token 5
+
+    results_no_penalty = batch_generate_tokens(
+        model, tok, [prompt], max_tokens=8, temperature=0.0,
+    )
+    results_with_penalty = batch_generate_tokens(
+        model, tok, [prompt], max_tokens=8, temperature=0.0,
+        repetition_penalty=2.0,
+    )
+
+    tokens_no = results_no_penalty[0][0].tolist()
+    tokens_with = results_with_penalty[0][0].tolist()
+    # With a strong penalty the output should differ from the unpenalized
+    # baseline (the penalty reshapes the logit distribution).
+    assert tokens_no != tokens_with, (
+        "repetition_penalty=2.0 should change the generated sequence"
+    )
