@@ -793,10 +793,9 @@ class Trainer:
             timer.start("optimizer_update")
 
         self.optimizer.update(self.model, grads)
+        mx.eval(self.model.parameters())
 
         if timer is not None:
-            # Force parameter materialization before stopping the timer
-            mx.eval(self.model.parameters())
             timer.stop("optimizer_update")
 
         # ── Phase: metrics ─────────────────────────────────────────────

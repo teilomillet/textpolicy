@@ -168,6 +168,17 @@ def real_model() -> Tuple[Any, Any]:
     return model, tokenizer
 
 
+@pytest.fixture(scope="module")
+def real_model_with_lora(real_model: Tuple[Any, Any]) -> Tuple[Any, Any]:
+    """Model with LoRA adapters for training tests (matches experiment usage)."""
+    model, tokenizer = real_model
+    from textpolicy.generation.lora import apply_lora, freeze_base
+
+    apply_lora(model, lora_layers=4, lora_rank=2, lora_scale=8.0)
+    freeze_base(model)
+    return model, tokenizer
+
+
 def test_kv_cache_active(real_model: Tuple[Any, Any]) -> None:
     model, tokenizer = real_model
     cache_obj = _make_prompt_cache_if_available(model)
@@ -262,8 +273,8 @@ def test_real_model_logprobs_valid(real_model: Tuple[Any, Any]) -> None:
     assert not bool(mx.any(mx.isinf(logprobs)).item())
 
 
-def test_real_model_training_step_finite_loss(real_model: Tuple[Any, Any]) -> None:
-    model, tokenizer = real_model
+def test_real_model_training_step_finite_loss(real_model_with_lora: Tuple[Any, Any]) -> None:
+    model, tokenizer = real_model_with_lora
     batch = _build_real_rollout_batch(model, tokenizer, n_episodes=4, max_tokens=32)
 
     trainer = _make_trainer(model, profile=False)
@@ -275,9 +286,9 @@ def test_real_model_training_step_finite_loss(real_model: Tuple[Any, Any]) -> No
 
 
 @pytest.mark.apple_silicon
-def test_training_step_under_5s(real_model: Tuple[Any, Any]) -> None:
+def test_training_step_under_5s(real_model_with_lora: Tuple[Any, Any]) -> None:
     _require_apple_silicon()
-    model, tokenizer = real_model
+    model, tokenizer = real_model_with_lora
     batch = _build_real_rollout_batch(model, tokenizer, n_episodes=4, max_tokens=32)
 
     trainer = _make_trainer(model, profile=False)
@@ -313,8 +324,8 @@ def test_rollout_under_30s(real_model: Tuple[Any, Any]) -> None:
     assert elapsed_s < 30.0, f"Rollout took {elapsed_s:.2f}s (expected < 30.0s)."
 
 
-def test_profiling_overhead_under_25pct(real_model: Tuple[Any, Any]) -> None:
-    model, tokenizer = real_model
+def test_profiling_overhead_under_25pct(real_model_with_lora: Tuple[Any, Any]) -> None:
+    model, tokenizer = real_model_with_lora
     batch = _build_real_rollout_batch(model, tokenizer, n_episodes=4, max_tokens=32)
 
     trainer_unprofiled = _make_trainer(model, profile=False)
