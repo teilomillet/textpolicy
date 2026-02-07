@@ -12,7 +12,7 @@ These functions integrate with our GRPO trainer for efficient
 parameter updates using LoRA adapters.
 """
 
-from typing import Dict, Tuple, Any
+from typing import Dict, Optional, Tuple, Any
 import mlx.core as mx # type: ignore
 import mlx.nn as nn # type: ignore
 
@@ -26,69 +26,121 @@ except ImportError:
         print("Warning: LoRA not available in this MLX-LM version")
         LoRALinear = None # type: ignore
 
+# Import linear_to_lora_layers for automatic dense/MoE LoRA conversion
+_has_linear_to_lora_layers = False
+try:
+    from mlx_lm.tuner.utils import linear_to_lora_layers as _linear_to_lora_layers
+    _has_linear_to_lora_layers = True
+except ImportError:
+    _linear_to_lora_layers = None  # type: ignore
+
+# Import MoE layer types for detection
+try:
+    from mlx_lm.models.switch_layers import SwitchLinear as _SwitchLinear
+    from mlx_lm.models.switch_layers import SwitchGLU as _SwitchGLU
+except ImportError:
+    _SwitchLinear = None  # type: ignore
+    _SwitchGLU = None  # type: ignore
+
 
 def apply_lora(
     model: nn.Module,
     lora_layers: int = 8,
     lora_rank: int = 8,
     lora_scale: float = 20.0,
-    lora_dropout: float = 0.0
+    lora_dropout: float = 0.0,
+    lora_keys: Optional[set] = None,
 ) -> nn.Module:
     """
-    Pure function to apply LoRA adapters to an MLX model.
-    
-    Converts specified layers to LoRA-enabled versions for memory-efficient
-    training. This function creates a new model with LoRA layers.
-    
+    Apply LoRA adapters to an MLX model.
+
+    Delegates to ``mlx_lm.tuner.utils.linear_to_lora_layers`` which handles
+    both dense (``nn.Linear → LoRALinear``) and MoE
+    (``SwitchLinear → LoRASwitchLinear``) layers automatically.  Falls back
+    to the manual q_proj/v_proj conversion when ``mlx_lm.tuner.utils`` is
+    unavailable.
+
     Args:
-        model: Original MLX model
-        lora_layers: Number of layers to apply LoRA to (from the end)
-        lora_rank: LoRA rank parameter (lower = more compression)
-        lora_scale: LoRA scaling factor
-        lora_dropout: LoRA dropout rate
-        
+        model: Original MLX model (must have a ``layers`` attribute,
+            either directly or via ``model.model.layers``).
+        lora_layers: Number of transformer blocks to apply LoRA to
+            (counted from the end of the stack).
+        lora_rank: LoRA rank parameter (lower = more compression).
+        lora_scale: LoRA scaling factor (alpha).
+        lora_dropout: LoRA dropout rate.
+        lora_keys: Optional set of module key names to restrict which
+            sub-modules get LoRA (e.g. ``{"self_attn.q_proj"}``).
+            When ``None``, all eligible linear / switch-linear layers
+            in the selected blocks are converted.
+
     Returns:
-        Model with LoRA adapters applied
+        Model with LoRA adapters applied (mutated in-place).
     """
-    # Clone the model to avoid modifying the original
-    lora_model = model
-    
-    # Apply LoRA to the last N transformer layers
     if LoRALinear is None:
         print("Warning: LoRA not available, returning original model")
         return model
-        
-    for layer_idx in range(max(0, len(lora_model.model.layers) - lora_layers), 
-                          len(lora_model.model.layers)):
-        layer = lora_model.model.layers[layer_idx]
-        
-        # Convert attention projections to LoRA using current API
-        # Skip if already LoRA layer (from quantization)
-        if hasattr(layer, 'self_attn'):
-            if hasattr(layer.self_attn, 'q_proj'):
-                original_layer = layer.self_attn.q_proj
-                # Check if already a LoRA layer to avoid double application
-                if not (hasattr(original_layer, '__class__') and 'LoRA' in original_layer.__class__.__name__):
-                    layer.self_attn.q_proj = LoRALinear.from_base(
-                        original_layer,
-                        r=lora_rank,
-                        scale=lora_scale,
-                        dropout=lora_dropout
-                    )
-            
-            if hasattr(layer.self_attn, 'v_proj'):
-                original_layer = layer.self_attn.v_proj
-                # Check if already a LoRA layer to avoid double application
-                if not (hasattr(original_layer, '__class__') and 'LoRA' in original_layer.__class__.__name__):
-                    layer.self_attn.v_proj = LoRALinear.from_base(
-                        original_layer,
-                        r=lora_rank,
-                        scale=lora_scale,
-                        dropout=lora_dropout
-                    )
-    
+
+    if _has_linear_to_lora_layers:
+        config = {
+            "rank": lora_rank,
+            "scale": lora_scale,
+            "dropout": lora_dropout,
+            "keys": lora_keys,
+        }
+        # linear_to_lora_layers accesses model.layers — both the top-level
+        # Model wrapper and model.model resolve to the same list for all
+        # MLX-LM models, so we can pass the model directly.
+        _linear_to_lora_layers(model, num_layers=lora_layers, config=config)
+        is_moe = detect_moe_model(model)
+        arch = "MoE (SwitchLinear → LoRASwitchLinear)" if is_moe else "dense"
+        print(
+            f"Applied LoRA to {lora_layers} layers "
+            f"(rank={lora_rank}, scale={lora_scale}, arch={arch})"
+        )
+        if is_moe:
+            # SwitchGLU/SwitchMLP only apply mx.stop_gradient to routing
+            # indices when model.training is True.  Without this, backprop
+            # through mx.gather_mm fails.  Trainer.train() sets this
+            # automatically; warn for manual usage.
+            if not model.training:
+                print(
+                    "  ⚠ MoE model: call model.train() before backprop "
+                    "(Trainer does this automatically)"
+                )
+    else:
+        _apply_lora_manual(model, lora_layers, lora_rank, lora_scale, lora_dropout)
+
+    return model
+
+
+def _apply_lora_manual(
+    model: nn.Module,
+    lora_layers: int,
+    lora_rank: int,
+    lora_scale: float,
+    lora_dropout: float,
+) -> None:
+    """Fallback: manually convert q_proj/v_proj to LoRALinear (dense only)."""
+    layers = model.model.layers if hasattr(model, "model") else model.layers
+    for layer_idx in range(max(0, len(layers) - lora_layers), len(layers)):
+        layer = layers[layer_idx]
+
+        if hasattr(layer, "self_attn"):
+            for proj_name in ("q_proj", "v_proj"):
+                proj = getattr(layer.self_attn, proj_name, None)
+                if proj is None:
+                    continue
+                if "LoRA" in type(proj).__name__:
+                    continue
+                setattr(
+                    layer.self_attn,
+                    proj_name,
+                    LoRALinear.from_base(
+                        proj, r=lora_rank, scale=lora_scale, dropout=lora_dropout
+                    ),
+                )
+
     print(f"Applied LoRA to {lora_layers} layers (rank={lora_rank}, scale={lora_scale})")
-    return lora_model
 
 
 def freeze_base(model: nn.Module) -> nn.Module:
@@ -182,6 +234,73 @@ def merge_weights(model: nn.Module) -> nn.Module:
     # properly merge the LoRA matrices into the base weights
     print("Note: LoRA weight merging is placeholder - implement based on MLX LoRA utils")
     return model
+
+
+# ── MoE detection utilities ──────────────────────────────────────────────
+
+
+def detect_moe_model(model: nn.Module) -> bool:
+    """
+    Detect whether *model* is a Mixture-of-Experts architecture.
+
+    Walks the module tree looking for ``SwitchLinear`` or ``SwitchGLU``
+    layers (the standard MoE building blocks in MLX-LM).
+
+    Args:
+        model: An MLX-LM model (e.g. from ``mlx_lm.load()``).
+
+    Returns:
+        ``True`` if at least one MoE layer is found, ``False`` otherwise.
+    """
+    if _SwitchLinear is None:
+        # mlx_lm.models.switch_layers not available — can't be MoE.
+        return False
+
+    moe_types = (_SwitchLinear,)
+    if _SwitchGLU is not None:
+        moe_types = (_SwitchLinear, _SwitchGLU)
+
+    for _name, module in model.named_modules():
+        if isinstance(module, moe_types):
+            return True
+    return False
+
+
+def get_moe_config(model: nn.Module) -> Optional[Dict[str, Any]]:
+    """
+    Extract MoE configuration from *model*.
+
+    MLX-LM models store architecture hyper-parameters in ``model.args``
+    (a ``SimpleNamespace`` or dataclass).  This function reads the
+    standard MoE fields and returns them as a plain dict.
+
+    Args:
+        model: An MLX-LM model.
+
+    Returns:
+        A dict with MoE configuration keys, or ``None`` for dense models.
+    """
+    if not detect_moe_model(model):
+        return None
+
+    args = getattr(model, "args", None)
+    if args is None:
+        # Model is MoE but has no .args — return minimal info.
+        return {"is_moe": True}
+
+    config: Dict[str, Any] = {"is_moe": True}
+    for key in (
+        "num_experts",
+        "num_experts_per_tok",
+        "num_shared_experts",
+        "num_dense_layers",
+        "moe_intermediate_size",
+    ):
+        value = getattr(args, key, None)
+        if value is not None:
+            config[key] = value
+
+    return config
 
 
 def compute_lora_memory_savings(

@@ -109,6 +109,9 @@ def pytest_configure(config):
     config.addinivalue_line(
         "markers", "regression: Exact-output regression tests for optimization safety"
     )
+    config.addinivalue_line(
+        "markers", "requires_moe_model: Tests needing a MoE model"
+    )
 
 
 def pytest_collection_modifyitems(config, items):
