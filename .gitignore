@@ -212,3 +212,6 @@ CLAUDE.md
 
 # Benchmark artefacts
 artefacts/
+
+# Experiment results
+results/
