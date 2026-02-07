@@ -249,10 +249,10 @@ def quantized_model_with_qlora(
 
     Mutates the shared ``quantized_model`` in-place (apply_lora + freeze_base).
     A separate load would add ~3.4 GB to peak memory, risking OOM on 16 GB
-    Apple Silicon.  LoRA at rank-2 on 4 layers is transparent for inference
-    timing (adapter overhead is <0.1% of base-layer compute), so benchmark
-    tests that also depend on ``quantized_model`` are unaffected.  Those tests
-    explicitly request this fixture to avoid order dependence.
+    Apple Silicon.  Benchmark tests (L1–L3) use ``quantized_model`` directly
+    and must appear before this fixture's consumers in the file so they run
+    on the un-mutated Q4 model — same file-order convention used by
+    ``real_model`` / ``real_model_with_lora`` above.
     """
     model, tokenizer, _stats = quantized_model
     apply_lora(model, lora_layers=4, lora_rank=2, lora_scale=8.0)
@@ -432,7 +432,6 @@ def test_profiling_overhead_under_25pct(real_model_with_lora: Tuple[Any, Any]) -
 
 def test_quantized_model_generates_valid_text(
     quantized_model: Tuple[Any, Any, dict],
-    quantized_model_with_qlora: Tuple[Any, Any],  # forces LoRA-first ordering
 ) -> None:
     """L1: 4-bit quantized model produces valid logprobs and non-empty output."""
     model, tokenizer, stats = quantized_model
@@ -460,7 +459,6 @@ def test_quantized_model_generates_valid_text(
 def test_quantized_decode_step_faster(
     real_model: Tuple[Any, Any],
     quantized_model: Tuple[Any, Any, dict],
-    quantized_model_with_qlora: Tuple[Any, Any],  # forces LoRA-first ordering
 ) -> None:
     """L2: Per-decode-step latency is lower with 4-bit quantization."""
     _require_apple_silicon()
@@ -501,8 +499,8 @@ def test_quantized_decode_step_faster(
     q4_ms = _setup_and_measure(q4_model)
     speedup = fp16_ms / q4_ms
 
-    assert speedup >= 1.2, (
-        f"Expected ≥1.2x decode speedup from quantization "
+    assert speedup >= 1.3, (
+        f"Expected ≥1.3x decode speedup from quantization "
         f"(FP16={fp16_ms:.2f}ms, Q4={q4_ms:.2f}ms, speedup={speedup:.2f}x)."
     )
 
@@ -511,7 +509,6 @@ def test_quantized_decode_step_faster(
 def test_quantized_rollout_faster(
     real_model: Tuple[Any, Any],
     quantized_model: Tuple[Any, Any, dict],
-    quantized_model_with_qlora: Tuple[Any, Any],  # forces LoRA-first ordering
 ) -> None:
     """L3: Full batch rollout is faster with 4-bit quantization."""
     _require_apple_silicon()
