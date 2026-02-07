@@ -1006,8 +1006,10 @@ def batch_generate_tokens(
         log_probs = next_logits - mx.logsumexp(next_logits, axis=-1, keepdims=True)
 
         # Apply repetition penalty for sampling only (paper: arXiv 1909.05858).
-        # MLX arrays are immutable values so __setitem__ creates new arrays
-        # without aliasing next_logits.
+        # Note: sample_logits IS next_logits (same Python object).  The
+        # __setitem__ below mutates it in-place, but log_probs (computed
+        # above) is safe because MLX lazy eval captures graph nodes, not
+        # Python bindings — the old node is unaffected by the mutation.
         if use_rep_penalty:
             sample_logits = next_logits
             for i in range(batch_size):
@@ -1229,19 +1231,20 @@ def create_policy(
     max_tokens = params.get('max_tokens', 50)
     temperature = params.get('temperature', 0.8)
     top_p = params.get('top_p', 0.95)
-    
+    rep_penalty = params.get('repetition_penalty', 1.1)
+
     def policy_fn(prompt_tokens: mx.array, deterministic: bool = False) -> Tuple[mx.array, Dict[str, Any]]:
         """
         Policy function that generates responses for RL training with automatic chat template support.
-        
+
         Automatically applies chat templates for instruction models to enable
         proper EOS token generation. This allows models to naturally end responses with
         appropriate end-of-sequence tokens instead of being artificially truncated.
-        
+
         Args:
             prompt_tokens: Input prompt tokens
             deterministic: Whether to use deterministic generation
-            
+
         Returns:
             (response_tokens, generation_info): Response and metadata for training
         """
@@ -1249,7 +1252,7 @@ def create_policy(
             tokenizer,
             mx.array(prompt_tokens, dtype=mx.int32),
         )
-        
+
         # Generate response with processed tokens
         temp = 0.0 if deterministic else temperature
         return generate_tokens(
@@ -1258,7 +1261,8 @@ def create_policy(
             prompt_tokens=processed_tokens,  # Use formatted tokens for proper EOS generation
             max_tokens=max_tokens,
             temperature=temp,
-            top_p=top_p
+            top_p=top_p,
+            repetition_penalty=rep_penalty,
         )
     
     # Attach metadata so rollout coordination can derive batched policy automatically.

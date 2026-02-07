@@ -18,6 +18,7 @@ from textpolicy.generation.mlx_generation import (
     batch_generate_tokens,
     create_batched_policy,
     create_policy,
+    generate_tokens,
 )
 from textpolicy.rollout.rollout import RolloutCoordinator
 from textpolicy.rollout.runner import RolloutRunner
@@ -605,3 +606,29 @@ def test_repetition_penalty_affects_sampling():
     assert tokens_with[0] == 4, (
         f"Expected token 4 (penalty flips argmax from 3), got {tokens_with[0]}"
     )
+
+
+@pytest.mark.unit
+def test_create_policy_forwards_repetition_penalty():
+    """Unbatched create_policy should forward repetition_penalty to generate_tokens."""
+    import unittest.mock as mock
+
+    model = _TinyLM()
+    tok = _DummyTokenizer()
+    policy = create_policy(model, tok, generation_params={"repetition_penalty": 1.5})
+
+    # Mock generate_tokens without wraps — the unbatched path calls
+    # mlx_lm.stream_generate internally which needs a real tokenizer.
+    # We only need to verify the call signature, not execute generation.
+    dummy_result = (mx.array([1], dtype=mx.int32), {"logprob": mx.array([0.0])})
+    prompt = mx.array([1, 2], dtype=mx.int32)
+    with mock.patch(
+        "textpolicy.generation.mlx_generation.generate_tokens",
+        return_value=dummy_result,
+    ) as spy:
+        policy(prompt)
+        spy.assert_called_once()
+        _, kwargs = spy.call_args
+        assert kwargs.get("repetition_penalty") == 1.5, (
+            "repetition_penalty was not forwarded to generate_tokens"
+        )
