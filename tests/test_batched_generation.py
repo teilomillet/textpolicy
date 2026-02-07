@@ -561,25 +561,47 @@ def test_create_batched_policy_forwards_repetition_penalty():
         )
 
 
+class _NarrowGapModel:
+    """Model with a small logit gap: token 3 gets +1.0, token 4 gets +0.8,
+    everything else -10.  A repetition_penalty of 2.0 on token 3 flips
+    its logit from +1.0 to +0.5, making token 4 (+0.8) the argmax."""
+
+    def __init__(self, vocab_size: int = 32):
+        self.vocab_size = vocab_size
+
+    def __call__(self, x, mask=None, cache=None):  # noqa: ARG002
+        bsz, seq_len = x.shape
+        base = mx.full((1, 1, self.vocab_size), -10.0)
+        base = base.at[:, :, 3].add(11.0)   # token 3 → +1.0
+        base = base.at[:, :, 4].add(10.8)   # token 4 → +0.8
+        return mx.broadcast_to(base, (bsz, seq_len, self.vocab_size))
+
+
 @pytest.mark.unit
 def test_repetition_penalty_affects_sampling():
-    """Repetition penalty should discourage re-sampling the same token."""
-    model = _TinyLM()
+    """Repetition penalty should discourage re-sampling the same token.
+
+    Uses a deterministic model with a narrow logit gap (token 3: +1.0,
+    token 4: +0.8).  Penalty=2.0 divides token 3's logit to +0.5, making
+    token 4 the new argmax.
+    """
+    model = _NarrowGapModel()
     tok = _DummyTokenizer()
-    prompt = mx.array([5, 5, 5, 5], dtype=mx.int32)  # repeated token 5
+    prompt = mx.array([3, 3, 3, 3], dtype=mx.int32)  # token 3 in context
 
     results_no_penalty = batch_generate_tokens(
-        model, tok, [prompt], max_tokens=8, temperature=0.0,
+        model, tok, [prompt], max_tokens=4, temperature=0.0,
     )
     results_with_penalty = batch_generate_tokens(
-        model, tok, [prompt], max_tokens=8, temperature=0.0,
+        model, tok, [prompt], max_tokens=4, temperature=0.0,
         repetition_penalty=2.0,
     )
 
     tokens_no = results_no_penalty[0][0].tolist()
     tokens_with = results_with_penalty[0][0].tolist()
-    # With a strong penalty the output should differ from the unpenalized
-    # baseline (the penalty reshapes the logit distribution).
-    assert tokens_no != tokens_with, (
-        "repetition_penalty=2.0 should change the generated sequence"
+    # Without penalty: all token 3 (highest logit).
+    # With penalty: token 3 is penalized, so token 4 wins.
+    assert all(t == 3 for t in tokens_no), f"Expected all 3s, got {tokens_no}"
+    assert tokens_with[0] == 4, (
+        f"Expected token 4 (penalty flips argmax from 3), got {tokens_with[0]}"
     )

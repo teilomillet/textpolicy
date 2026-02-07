@@ -169,18 +169,17 @@ def real_model() -> Tuple[Any, Any]:
 
 
 @pytest.fixture(scope="module")
-def real_model_with_lora() -> Tuple[Any, Any]:
-    """Separate model instance with LoRA adapters for training tests.
+def real_model_with_lora(real_model: Tuple[Any, Any]) -> Tuple[Any, Any]:
+    """Model with LoRA adapters for training tests (matches experiment usage).
 
-    Loads its own model to avoid mutating the shared ``real_model`` fixture
-    (apply_lora + freeze_base are in-place).  This keeps generation-only
-    tests order-independent.
+    Mutates the shared ``real_model`` in-place (apply_lora + freeze_base).
+    A separate load would double memory to ~12 GB and cause OOM-induced
+    slowdowns on Apple Silicon.  LoRA is transparent for inference, so tests
+    that only generate (KV-cache, decode, logprobs) are unaffected.  The
+    rollout timing test explicitly requests this fixture to avoid order
+    dependence.
     """
-    model_name = os.environ.get(_MODEL_ENV, _DEFAULT_MODEL)
-    try:
-        model, tokenizer = load_model(model_name)
-    except Exception as exc:
-        pytest.skip(f"Could not load real model '{model_name}': {exc}")
+    model, tokenizer = real_model
     from textpolicy.generation.lora import apply_lora, freeze_base
 
     apply_lora(model, lora_layers=4, lora_rank=2, lora_scale=8.0)
@@ -312,9 +311,9 @@ def test_training_step_under_5s(real_model_with_lora: Tuple[Any, Any]) -> None:
 
 
 @pytest.mark.apple_silicon
-def test_rollout_under_30s(real_model: Tuple[Any, Any]) -> None:
+def test_rollout_under_30s(real_model_with_lora: Tuple[Any, Any]) -> None:
     _require_apple_silicon()
-    model, tokenizer = real_model
+    model, tokenizer = real_model_with_lora
     prompts = _make_prompt_batch(tokenizer, n=4)
     no_eos_tokenizer = _NoEOSTokenizerProxy(tokenizer)
 
