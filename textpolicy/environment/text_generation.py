@@ -631,7 +631,8 @@ class TextGenerationEnv(Environment):
         max_tokens: int = 25,
         seed: int = 42,
         tokenizer: Any = None,
-        examples: Optional[List[dict]] = None
+        examples: Optional[List[dict]] = None,
+        group_size: int = 1,
     ):
         """
         Initialize simple text generation environment.
@@ -644,26 +645,34 @@ class TextGenerationEnv(Environment):
             tokenizer: Tokenizer for converting prompts to tokens (required for MLX compatibility)
             examples: Optional list of example dicts to pass to reward function. If provided,
                       must have same length as prompts. examples[i] is passed when prompts[i] is used.
+            group_size: Number of consecutive episodes that share the same prompt.
+                Set to episodes_per_step for GRPO so that group-relative advantages
+                compare completions of the *same* problem. Default 1 preserves the
+                legacy round-robin behaviour.
         """
         super().__init__()
-        
+
         if tokenizer is None:
             raise ValueError("tokenizer is required for TextGenerationEnv to work with MLX rollout system")
 
         if examples is not None and len(examples) != len(prompts):
             raise ValueError(f"examples length ({len(examples)}) must match prompts length ({len(prompts)})")
 
+        if group_size < 1:
+            raise ValueError(f"group_size must be >= 1, got {group_size}")
+
         self.prompts = prompts
         self.examples = examples if examples is not None else [{} for _ in prompts]
         self.reward_fn = reward_fn
         self.max_tokens = max_tokens
         self.tokenizer = tokenizer
+        self.group_size = group_size
         self.current_episode = 0
         self.current_prompt = None
-        
+
         # Environment state
         random.seed(seed)
-        
+
         # Debug prints removed for production efficiency
     
     def reset(self) -> Tuple[Any, Dict[str, Any]]:
@@ -673,8 +682,12 @@ class TextGenerationEnv(Environment):
         Returns:
             (observation, info): Current prompt tokens and episode metadata
         """
-        # Cycle through prompts
-        prompt_index = self.current_episode % len(self.prompts)
+        # Cycle through prompts, repeating each prompt for `group_size`
+        # consecutive episodes.  With group_size=episodes_per_step every
+        # episode in a training batch shares the same prompt — required for
+        # correct GRPO group-relative advantage normalisation and enabling
+        # shared KV-cache prefill (Opt 2).
+        prompt_index = (self.current_episode // self.group_size) % len(self.prompts)
         self.current_prompt = self.prompts[prompt_index]
         
         # Tokenize prompt for MLX compatibility
@@ -742,7 +755,7 @@ class TextGenerationEnv(Environment):
         
         # Compute reward using provided reward function
         # Pass tokenizer for EOS token detection and truncation detection
-        prompt_index = self.current_episode % len(self.prompts)
+        prompt_index = (self.current_episode // self.group_size) % len(self.prompts)
         reward = self.reward_fn(
             prompt=self.current_prompt,
             completion=response_text,
@@ -793,5 +806,7 @@ class TextGenerationEnv(Environment):
             reward_fn=self.reward_fn,
             max_tokens=self.max_tokens,
             tokenizer=self.tokenizer,  # Tokenizer is required for MLX compatibility
-            seed=random.randint(0, 10000)  # New seed for variety
+            seed=random.randint(0, 10000),  # New seed for variety
+            examples=self.examples.copy(),
+            group_size=self.group_size,
         )

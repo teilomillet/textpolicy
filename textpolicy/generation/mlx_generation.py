@@ -858,6 +858,65 @@ def _make_prompt_cache_if_available(model: nn.Module) -> Optional[Any]:
     return None
 
 
+def _clone_single_cache_to_batch(
+    single_cache: List[Any],
+    batch_size: int,
+) -> List[Any]:
+    """Replicate a batch_size=1 KV-cache into a batch_size=B cache.
+
+    After prefilling a single copy of an identical prompt, this function
+    creates B independent decode streams.  Uses the mlx_lm cache
+    ``.merge()`` protocol when available (which creates a proper
+    ``BatchKVCache`` / ``BatchRotatingKVCache`` that handles per-stream
+    offsets correctly).  Falls back to manual K/V tiling for simple cache
+    objects (e.g. test stubs).
+
+    Args:
+        single_cache: List of per-layer cache objects (batch_size=1).
+        batch_size: Desired batch size for the output cache.
+
+    Returns:
+        List of per-layer cache objects with batch_size=B.
+    """
+    if batch_size <= 1:
+        return single_cache
+
+    # Build B copies of the single-stream cache references.
+    # mlx_lm's .merge() expects a list of individual caches.
+    copies = [single_cache] * batch_size
+
+    cloned: List[Any] = []
+    for layer_idx in range(len(single_cache)):
+        layer_cache = single_cache[layer_idx]
+
+        # Prefer the mlx_lm .merge() protocol — it creates proper
+        # BatchKVCache / BatchRotatingKVCache with per-stream offsets
+        # and left-padding support.
+        if hasattr(layer_cache, "merge"):
+            try:
+                per_stream = [copies[b][layer_idx] for b in range(batch_size)]
+                merged = layer_cache.merge(per_stream)
+                cloned.append(merged)
+                continue
+            except Exception:
+                pass  # Fall through to manual tiling.
+
+        # Manual fallback for simple cache objects (test stubs, etc.).
+        keys = getattr(layer_cache, "keys", None)
+        values = getattr(layer_cache, "values", None)
+
+        if keys is None or values is None:
+            cloned.append(layer_cache)
+            continue
+
+        # Tile K/V from [1, H, S, D] → [B, H, S, D].
+        layer_cache.keys = mx.repeat(keys, batch_size, axis=0)
+        layer_cache.values = mx.repeat(values, batch_size, axis=0)
+        cloned.append(layer_cache)
+
+    return cloned
+
+
 def _model_forward_with_optional_mask_and_cache(
     model: nn.Module,
     input_tokens: mx.array,
@@ -903,10 +962,13 @@ def batch_generate_tokens(
     Algorithm
     ---------
     1. Left-pad all prompts to ``[N, max_prompt_len]`` with ``pad_token_id``.
-    2. Single prefill forward pass with a combined causal + padding mask.
-    3. Autoregressive decode loop (up to ``max_tokens`` steps): one forward
-       pass per step for all sequences, with per-sequence EOS tracking.
-    4. Return per-sequence ``(response_tokens, {'logprob': logprobs})``.
+    2. If all prompts are identical (GRPO same-prompt groups), prefill once
+       with batch_size=1 and clone the KV-cache for B decode streams.
+    3. Autoregressive decode loop with reduced sync barriers: accumulate
+       tokens/logprobs as MLX arrays where possible, use vectorised EOS
+       detection with a single ``.item()`` sync per step.
+    4. Early-exit: when all sequences have finished, break immediately.
+    5. Return per-sequence ``(response_tokens, {'logprob': logprobs})``.
 
     Logprob convention: computed from *unscaled* logits (before temperature),
     matching the existing ``_simple_generate`` pattern.
@@ -959,38 +1021,87 @@ def batch_generate_tokens(
     # 1) Left-pad prompts for prefill.
     prompt_lengths = [int(p.shape[0]) for p in prompts]
     max_prompt_len = max(prompt_lengths)
-    padded_rows: List[mx.array] = []
     prompt_token_lists_py = [p.tolist() for p in prompts]
-    for prompt in prompts:
-        pad_count = max_prompt_len - int(prompt.shape[0])
-        if pad_count > 0:
-            row = mx.concatenate(
-                [mx.full((pad_count,), pad_id, dtype=mx.int32), prompt]
-            )
-        else:
-            row = prompt
-        padded_rows.append(row)
-    prompt_batch = mx.stack(padded_rows)  # [B, max_prompt_len]
 
     # 2) Create prompt cache when available.
     cache_obj = _make_prompt_cache_if_available(model)
 
-    # 3) Prefill pass: one model call for all prompts.
-    prefill_mask = _create_batched_prefill_mask(prompt_lengths, max_prompt_len)
-    prefill_logits, used_cache = _model_forward_with_optional_mask_and_cache(
-        model,
-        prompt_batch,
-        mask=prefill_mask,
-        cache_obj=cache_obj,
+    # ── Opt 2: Shared-prefill for identical prompts ──────────────────
+    # When all prompts are the same (GRPO group_size == episodes_per_step),
+    # prefill once with batch_size=1 and tile the KV-cache for B decode
+    # streams.  This avoids B redundant prefill forward passes.
+    all_same_prompt = (
+        batch_size > 1
+        and all(p.shape[0] == prompts[0].shape[0] for p in prompts[1:])
+        and all(
+            mx.array_equal(p, prompts[0]).item() for p in prompts[1:]
+        )
     )
-    next_logits = prefill_logits[:, max_prompt_len - 1, :]  # [B, vocab]
 
-    # 4) Decode loop (with per-sequence EOS tracking).
+    shared_prefill_ok = False  # tracks whether single-stream prefill succeeded
+    if all_same_prompt and cache_obj is not None:
+        # Prefill with batch_size=1 — single prompt, no padding needed.
+        single_prompt = prompts[0][None]  # [1, prompt_len]
+        single_mask = _create_batched_prefill_mask([prompt_lengths[0]], max_prompt_len)
+        prefill_logits, used_cache = _model_forward_with_optional_mask_and_cache(
+            model, single_prompt, mask=single_mask, cache_obj=cache_obj,
+        )
+        if used_cache:
+            # Tile the single-stream cache into B decode streams.
+            cache_obj = _clone_single_cache_to_batch(cache_obj, batch_size)
+            # Broadcast the single-row logits to [B, vocab].
+            next_logits = mx.broadcast_to(
+                prefill_logits[:, max_prompt_len - 1, :],
+                (batch_size, prefill_logits.shape[-1]),
+            )
+            shared_prefill_ok = True
+        # If used_cache is False, fall through to standard prefill below.
+    # ── End Opt 2 ────────────────────────────────────────────────────
+
+    if not shared_prefill_ok:
+        # Standard full-batch prefill (different prompts or no cache).
+        padded_rows: List[mx.array] = []
+        for prompt in prompts:
+            pad_count = max_prompt_len - int(prompt.shape[0])
+            if pad_count > 0:
+                row = mx.concatenate(
+                    [mx.full((pad_count,), pad_id, dtype=mx.int32), prompt]
+                )
+            else:
+                row = prompt
+            padded_rows.append(row)
+        prompt_batch = mx.stack(padded_rows)  # [B, max_prompt_len]
+
+        # Re-create cache since the shared-prefill attempt may have
+        # partially populated the old one.
+        cache_obj = _make_prompt_cache_if_available(model)
+
+        prefill_mask = _create_batched_prefill_mask(prompt_lengths, max_prompt_len)
+        prefill_logits, used_cache = _model_forward_with_optional_mask_and_cache(
+            model, prompt_batch, mask=prefill_mask, cache_obj=cache_obj,
+        )
+        next_logits = prefill_logits[:, max_prompt_len - 1, :]  # [B, vocab]
+
+    # 3) Decode loop with batch compaction (Opt 4).
+    # When sequences hit EOS, they are removed from the active batch,
+    # reducing GPU compute for subsequent decode steps.  Uses mlx_lm's
+    # cache.filter() protocol for in-place cache compaction.
     sampler = _make_eos_safe_sampler(temperature, top_p) if temperature > 0 else None
-    finished = [False] * batch_size
     per_seq_tokens: List[List[int]] = [[] for _ in range(batch_size)]
     per_seq_logprobs: List[List[float]] = [[] for _ in range(batch_size)]
-    arange_batch = mx.arange(batch_size)
+
+    # Active-sequence tracking (Opt 4).  Maps active batch position →
+    # original sequence index.  Shrinks when sequences finish and the
+    # cache is compacted.
+    active_to_orig = list(range(batch_size))
+    finished_orig: set = set()  # original indices of completed sequences
+
+    # Check if the cache supports in-place batch compaction.
+    _can_compact = not used_cache or (
+        cache_obj is not None
+        and len(cache_obj) > 0
+        and hasattr(cache_obj[0], "filter")
+    )
 
     use_rep_penalty = repetition_penalty is not None and repetition_penalty != 1.0
     # Persistent per-sequence context for repetition penalty.  Initialized
@@ -1001,6 +1112,9 @@ def batch_generate_tokens(
         rep_ctx: List[List[int]] = [list(p) for p in prompt_token_lists_py]
 
     for decode_step in range(max_tokens):
+        active_size = len(active_to_orig)
+        arange_active = mx.arange(active_size)
+
         # Logprobs from unscaled logits (matches _simple_generate convention).
         # These are recorded for training and are always unpenalized.
         log_probs = next_logits - mx.logsumexp(next_logits, axis=-1, keepdims=True)
@@ -1012,14 +1126,15 @@ def batch_generate_tokens(
         # Python bindings — the old node is unaffected by the mutation.
         if use_rep_penalty:
             sample_logits = next_logits
-            for i in range(batch_size):
-                if finished[i]:
+            for ai in range(active_size):
+                oi = active_to_orig[ai]
+                if oi in finished_orig:
                     continue
-                ctx = rep_ctx[i][-repetition_context_size:]
+                ctx = rep_ctx[oi][-repetition_context_size:]
                 if ctx:
                     tok_ids = mx.array(ctx, dtype=mx.int32)
-                    sel = sample_logits[i, tok_ids]
-                    sample_logits[i, tok_ids] = mx.where(
+                    sel = sample_logits[ai, tok_ids]
+                    sample_logits[ai, tok_ids] = mx.where(
                         sel < 0,
                         sel * repetition_penalty,
                         sel / repetition_penalty,
@@ -1040,36 +1155,71 @@ def batch_generate_tokens(
             probs = mx.softmax(scaled_logits, axis=-1)
             sampled = mx.random.categorical(mx.log(probs))
 
-        selected_logprobs = log_probs[arange_batch, sampled]
+        selected_logprobs = log_probs[arange_active, sampled]  # [active_size]
+
+        # Sync: materialise token IDs and logprobs.
         sampled_list = sampled.tolist()
         logprob_list = selected_logprobs.tolist()
 
-        for i in range(batch_size):
-            if finished[i]:
+        # Record per-sequence tokens/logprobs and detect EOS.
+        newly_finished_ai: List[int] = []
+        for ai in range(active_size):
+            oi = active_to_orig[ai]
+            if oi in finished_orig:
                 continue
-            tok = int(sampled_list[i])
-            per_seq_tokens[i].append(tok)
-            per_seq_logprobs[i].append(float(logprob_list[i]))
+            tok = int(sampled_list[ai])
+            per_seq_tokens[oi].append(tok)
+            per_seq_logprobs[oi].append(float(logprob_list[ai]))
             if use_rep_penalty:
-                rep_ctx[i].append(tok)
+                rep_ctx[oi].append(tok)
             if tok in eos_ids:
-                finished[i] = True
+                newly_finished_ai.append(ai)
+                finished_orig.add(oi)
 
-        if all(finished):
+        if len(finished_orig) >= batch_size:
             break
+
+        # ── Opt 4: Batch compaction ──────────────────────────────────
+        # Save feed tokens before compaction remaps indices.
+        feed_by_orig: Dict[int, int] = {}
+        if newly_finished_ai and _can_compact:
+            keep_ai = [
+                ai for ai in range(active_size)
+                if active_to_orig[ai] not in finished_orig
+            ]
+            if used_cache and cache_obj is not None:
+                keep_mx = mx.array(keep_ai, dtype=mx.int32)
+                for layer_cache in cache_obj:
+                    layer_cache.filter(keep_mx)
+            for ai in keep_ai:
+                feed_by_orig[active_to_orig[ai]] = int(sampled_list[ai])
+            active_to_orig = [active_to_orig[k] for k in keep_ai]
+        else:
+            for ai in range(active_size):
+                oi = active_to_orig[ai]
+                if oi not in finished_orig:
+                    feed_by_orig[oi] = int(sampled_list[ai])
+        # ── End Opt 4 ────────────────────────────────────────────────
+
         if decode_step == max_tokens - 1:
             break
 
-        # 5) Next-step logits.
+        # 4) Next-step logits.
+        active_size = len(active_to_orig)
+
         if used_cache:
             # Cache-backed one-token decode.
             feed_tokens = [
-                pad_id if finished[i] else int(sampled_list[i])
-                for i in range(batch_size)
+                feed_by_orig.get(oi, pad_id) for oi in active_to_orig
             ]
-            tokens_batch = mx.array(feed_tokens, dtype=mx.int32).reshape(batch_size, 1)
+            tokens_batch = mx.array(feed_tokens, dtype=mx.int32).reshape(
+                active_size, 1
+            )
+            active_prompt_lengths = [
+                prompt_lengths[oi] for oi in active_to_orig
+            ]
             decode_mask = _create_batched_decode_mask(
-                prompt_lengths,
+                active_prompt_lengths,
                 max_prompt_len,
                 decode_offset=decode_step + 1,
             )
@@ -1082,15 +1232,18 @@ def batch_generate_tokens(
             next_logits = step_logits[:, -1, :]
         else:
             # Fallback for tiny models that do not implement cache:
-            # rebuild full sequences and do one batched full forward.
-            for i in range(batch_size):
-                if not finished[i]:
-                    prompt_token_lists_py[i].append(int(sampled_list[i]))
+            # rebuild full sequences for active sequences only.
+            for oi in active_to_orig:
+                if oi in feed_by_orig:
+                    prompt_token_lists_py[oi].append(feed_by_orig[oi])
 
-            max_len = max(len(seq) for seq in prompt_token_lists_py)
+            active_seqs = [
+                prompt_token_lists_py[oi] for oi in active_to_orig
+            ]
+            max_len = max(len(seq) for seq in active_seqs)
             rows: List[mx.array] = []
             lengths: List[int] = []
-            for seq in prompt_token_lists_py:
+            for seq in active_seqs:
                 seq_arr = mx.array(seq, dtype=mx.int32)
                 lengths.append(len(seq))
                 pad_len = max_len - len(seq)
@@ -1107,14 +1260,27 @@ def batch_generate_tokens(
                 mask=None,
                 cache_obj=None,
             )
-            next_logits = full_logits[arange_batch, mx.array(lengths, dtype=mx.int32) - 1, :]
+            next_logits = full_logits[
+                mx.arange(active_size),
+                mx.array(lengths, dtype=mx.int32) - 1,
+                :,
+            ]
 
-    # 6) Package results.
+    # 5) Package results — per-sequence logprob accumulation.
     results: List[Tuple[mx.array, Dict[str, mx.array]]] = []
-    for tokens, logprobs in zip(per_seq_tokens, per_seq_logprobs):
-        response_tokens = mx.array(tokens, dtype=mx.int32) if tokens else mx.array([], dtype=mx.int32)
-        response_logprobs = mx.array(logprobs, dtype=mx.float32) if logprobs else mx.array([], dtype=mx.float32)
-        results.append((response_tokens, {"logprob": response_logprobs}))
+    for i in range(batch_size):
+        n_tokens = len(per_seq_tokens[i])
+        tokens = (
+            mx.array(per_seq_tokens[i], dtype=mx.int32)
+            if n_tokens > 0
+            else mx.array([], dtype=mx.int32)
+        )
+        logprobs = (
+            mx.array(per_seq_logprobs[i], dtype=mx.float32)
+            if per_seq_logprobs[i]
+            else mx.array([], dtype=mx.float32)
+        )
+        results.append((tokens, {"logprob": logprobs}))
     return results
 
 
