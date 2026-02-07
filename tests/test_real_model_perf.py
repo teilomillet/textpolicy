@@ -64,6 +64,23 @@ def _require_apple_silicon() -> None:
         pytest.skip("Timing threshold is calibrated for Apple Silicon only.")
 
 
+def _assert_no_lora(model: Any, label: str) -> None:
+    """Fail fast if a model has been mutated with LoRA adapters.
+
+    Guards benchmark tests against invalid baselines when test ordering
+    is randomized (e.g. ``pytest-randomly``).
+    """
+    from mlx.utils import tree_flatten
+
+    lora_names = [n for n, _ in tree_flatten(model.parameters()) if "lora" in n.lower()]
+    if lora_names:
+        pytest.fail(
+            f"{label} has {len(lora_names)} LoRA params; "
+            f"benchmark requires un-mutated model. "
+            f"A mutation fixture likely ran first — check test ordering."
+        )
+
+
 def _encode_prompt(tokenizer: Any, text: str) -> mx.array:
     if not hasattr(tokenizer, "encode"):
         pytest.skip("Tokenizer does not expose encode().")
@@ -413,6 +430,8 @@ def test_quantized_decode_step_faster(
 
     fp16_model, tokenizer_fp16 = real_model
     q4_model, tokenizer_q4, stats = quantized_model
+    _assert_no_lora(fp16_model, "real_model (FP16 baseline)")
+    _assert_no_lora(q4_model, "quantized_model (Q4 baseline)")
 
     # --- shared setup: prefill then measure single-token decode steps ---
     seed_token = int(_encode_prompt(tokenizer_fp16, "hello")[0].item())
@@ -463,6 +482,8 @@ def test_quantized_rollout_faster(
 
     fp16_model, tokenizer_fp16 = real_model
     q4_model, tokenizer_q4, stats = quantized_model
+    _assert_no_lora(fp16_model, "real_model (FP16 baseline)")
+    _assert_no_lora(q4_model, "quantized_model (Q4 baseline)")
 
     no_eos_fp16 = _NoEOSTokenizerProxy(tokenizer_fp16)
     no_eos_q4 = _NoEOSTokenizerProxy(tokenizer_q4)
