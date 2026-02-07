@@ -1,7 +1,7 @@
 """
 Real-model performance litmus tests (Issue #44).
 
-These tests intentionally use a real model (`Qwen/Qwen3-0.6B` by default)
+These tests intentionally use a real model (`arcee-ai/Trinity-Nano-Preview` by default)
 to prevent synthetic benchmark blind spots.
 """
 
@@ -34,7 +34,7 @@ from textpolicy.training.trainer import Trainer
 pytestmark = [pytest.mark.requires_model, pytest.mark.slow]
 
 _MODEL_ENV = "TEXTPOLICY_REAL_MODEL"
-_DEFAULT_MODEL = "Qwen/Qwen3-0.6B"
+_DEFAULT_MODEL = "arcee-ai/Trinity-Nano-Preview"
 _PROMPT_TEXTS = [
     "Summarize reinforcement learning in one sentence.",
     "List two risks of overfitting in language models.",
@@ -171,7 +171,7 @@ def real_model() -> Tuple[Any, Any]:
 def test_kv_cache_active(real_model: Tuple[Any, Any]) -> None:
     model, tokenizer = real_model
     cache_obj = _make_prompt_cache_if_available(model)
-    assert cache_obj is not None, "KV-cache should be available for Qwen3-0.6B."
+    assert cache_obj is not None, "KV-cache should be available for the test model."
 
     prompt = _encode_prompt(tokenizer, "Cache litmus test.")
     prompt_batch = prompt.reshape(1, -1)
@@ -191,7 +191,7 @@ def test_kv_cache_active(real_model: Tuple[Any, Any]) -> None:
 def test_cached_decode_faster(real_model: Tuple[Any, Any]) -> None:
     model, tokenizer = real_model
     cache_obj = _make_prompt_cache_if_available(model)
-    assert cache_obj is not None, "KV-cache should be available for Qwen3-0.6B."
+    assert cache_obj is not None, "KV-cache should be available for the test model."
 
     seed_token = int(_encode_prompt(tokenizer, "hello")[0].item())
     prompt_len = 128

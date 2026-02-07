@@ -9,14 +9,15 @@ This experiment composes:
 
 Usage:
     uv run python experiments/countdown_reasoning_lora.py --steps 500
-    uv run python experiments/countdown_reasoning_lora.py --model Qwen/Qwen3-0.6B --steps 10 --output results/test_reasoning
+    uv run python experiments/countdown_reasoning_lora.py --model arcee-ai/Trinity-Nano-Preview --steps 10 --output results/test_reasoning
 """
 
 import argparse
 import json
+import time
 from dataclasses import asdict, dataclass
 from pathlib import Path
-from typing import Optional, Union
+from typing import Dict, Optional, Union
 
 import mlx.core as mx
 import mlx.optimizers as optim
@@ -41,7 +42,7 @@ class ReasoningConfig:
     """Configuration for LoRA reasoning experiment."""
 
     # Model
-    model_id: str = "Qwen/Qwen3-0.6B"
+    model_id: str = "arcee-ai/Trinity-Nano-Preview"
 
     # TinyLoRA-style defaults
     lora_layers: int = 4
@@ -59,6 +60,7 @@ class ReasoningConfig:
     max_steps: int = 500
     max_grad_norm: float = 0.5
     compile_training: Union[bool, str] = False
+    profile_training: bool = False
 
     # Generation
     max_completion_tokens: int = 512
@@ -135,6 +137,47 @@ def print_summary(output_dir: Path) -> None:
     print("=" * 50)
 
 
+def print_amdahl_summary(
+    phase_totals: Dict[str, float],
+    trainer_phase_totals: Dict[str, float],
+) -> None:
+    total = sum(phase_totals.values())
+    if total <= 0.0:
+        return
+
+    print("\n" + "=" * 50)
+    print("AMDAHL BOTTLENECK SUMMARY (END-TO-END)")
+    print("=" * 50)
+    ranked = sorted(phase_totals.items(), key=lambda kv: kv[1], reverse=True)
+    for phase, seconds in ranked:
+        fraction = seconds / total
+        max_speedup = float("inf") if fraction >= 0.999999 else 1.0 / (1.0 - fraction)
+        name = phase.replace("_s", "")
+        speedup_str = "inf" if max_speedup == float("inf") else f"{max_speedup:.2f}x"
+        print(
+            f"  {name:16s} {seconds:8.2f}s  "
+            f"({fraction * 100:5.1f}%)  Amdahl limit if perfect: {speedup_str}"
+        )
+
+    if trainer_phase_totals:
+        trainer_total = trainer_phase_totals.get("total", 0.0)
+        if trainer_total > 0.0:
+            print("\n  Trainer-internal split (for train phase):")
+            t_ranked = sorted(
+                (
+                    (phase, secs)
+                    for phase, secs in trainer_phase_totals.items()
+                    if phase != "total"
+                ),
+                key=lambda kv: kv[1],
+                reverse=True,
+            )
+            for phase, seconds in t_ranked:
+                pct = (seconds / trainer_total) * 100.0
+                print(f"    {phase:16s} {seconds:8.2f}s  ({pct:5.1f}%)")
+    print("=" * 50)
+
+
 def run_experiment(config: ReasoningConfig) -> None:
     if config.episodes_per_step > _RUNNER_INTERNAL_MAX_EPISODES:
         raise ValueError(
@@ -174,6 +217,7 @@ def run_experiment(config: ReasoningConfig) -> None:
         hicra_alpha=config.hicra_alpha,
         entropy_weight=config.entropy_weight,
         compile_training=config.compile_training,
+        profile=config.profile_training,
         max_grad_norm=config.max_grad_norm,
         adapter_save_path=str(output_dir / "lora_adapters.safetensors"),
     )
@@ -228,47 +272,72 @@ def run_experiment(config: ReasoningConfig) -> None:
 
     print(f"\nStarting reasoning training for {config.max_steps} steps...")
     global_episode_count = 0
+    phase_totals: Dict[str, float] = {
+        "rollout_collect_s": 0.0,
+        "emergence_log_s": 0.0,
+        "train_s": 0.0,
+        "checkpoint_s": 0.0,
+    }
+    trainer_phase_totals: Dict[str, float] = {}
     for step in range(config.max_steps):
+        step_start = time.perf_counter()
+
         buffer.clear()
+        rollout_start = time.perf_counter()
         rollout_buffer = rollout.collect()
         for ep in rollout_buffer.episodes:
             buffer.add_episode_from_dict(ep.to_dict())
+        phase_totals["rollout_collect_s"] += time.perf_counter() - rollout_start
 
         new_episode = rollout_buffer.episodes[-1]
         example = problems[global_episode_count % len(problems)]
         global_episode_count += 1
 
+        emergence_start = time.perf_counter()
         step_stats = emergence.log_step(
             step=step,
             episodes=[new_episode],
             tokenizer=tokenizer,
             examples=[example],
         )
+        phase_totals["emergence_log_s"] += time.perf_counter() - emergence_start
 
+        train_start = time.perf_counter()
         metrics = trainer.train()
+        phase_totals["train_s"] += time.perf_counter() - train_start
+        for key, value in metrics.items():
+            if key.startswith("timing/") and key.endswith("_s"):
+                phase = key[len("timing/") : -2]
+                trainer_phase_totals[phase] = trainer_phase_totals.get(phase, 0.0) + float(value)
 
         if step % 10 == 0:
             print(
                 f"Step {step}: loss={metrics['loss']:.4f} "
                 f"reward={step_stats['mean_reward']:.3f} "
                 f"correct={step_stats['correct_count']}/{step_stats['total_count']} "
-                f"planning_ratio={step_stats['planning_token_ratio']:.4f}"
+                f"planning_ratio={step_stats['planning_token_ratio']:.4f} "
+                f"step_time={time.perf_counter() - step_start:.2f}s"
             )
 
         if step % 100 == 0 and step > 0:
+            checkpoint_start = time.perf_counter()
             save_checkpoint(model, output_dir, step)
+            phase_totals["checkpoint_s"] += time.perf_counter() - checkpoint_start
 
     emergence.finish()
     rollout.close()
+    checkpoint_start = time.perf_counter()
     save_checkpoint(model, output_dir, config.max_steps)
+    phase_totals["checkpoint_s"] += time.perf_counter() - checkpoint_start
     print_summary(output_dir)
+    print_amdahl_summary(phase_totals, trainer_phase_totals)
 
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(
         description="Run TinyLoRA + GTPO + HICRA on the Countdown task"
     )
-    parser.add_argument("--model", default="Qwen/Qwen3-0.6B", help="Model ID")
+    parser.add_argument("--model", default="arcee-ai/Trinity-Nano-Preview", help="Model ID")
     parser.add_argument("--steps", type=int, default=500, help="Training steps")
     parser.add_argument("--output", default="results/countdown_reasoning_lora", help="Output directory")
     parser.add_argument("--lr", type=float, default=5e-6, help="Learning rate")
@@ -292,6 +361,11 @@ if __name__ == "__main__":
         "--strategic-grams",
         default=None,
         help="Optional path to strategic grams JSON (defaults to built-ins)",
+    )
+    parser.add_argument(
+        "--profile-training",
+        action="store_true",
+        help="Enable trainer per-phase timing and Amdahl bottleneck summary",
     )
     args = parser.parse_args()
 
@@ -320,5 +394,6 @@ if __name__ == "__main__":
         hicra_alpha=args.hicra_alpha,
         strategic_grams_path=args.strategic_grams,
         compile_training=compile_mode,
+        profile_training=args.profile_training,
     )
     run_experiment(cfg)
