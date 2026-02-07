@@ -632,3 +632,315 @@ def test_create_policy_forwards_repetition_penalty():
         assert kwargs.get("repetition_penalty") == 1.5, (
             "repetition_penalty was not forwarded to generate_tokens"
         )
+
+
+# ── Opt 1: Same-prompt grouping tests ───────────────────────────────
+
+
+@pytest.mark.unit
+class TestGroupSizePromptCycling:
+    """Verify TextGenerationEnv.group_size controls prompt cycling."""
+
+    def test_group_size_1_cycles_every_episode(self):
+        """Default group_size=1 gives round-robin prompt cycling."""
+        from textpolicy.environment.text_generation import TextGenerationEnv
+
+        tok = _DummyTokenizer()
+        prompts = ["A", "B", "C"]
+
+        env = TextGenerationEnv(
+            prompts=prompts,
+            reward_fn=lambda prompt, completion, example, **kw: 0.0,
+            tokenizer=tok,
+            group_size=1,
+        )
+        seen = []
+        for _ in range(6):
+            _, info = env.reset()
+            seen.append(info["prompt_text"])
+            env.step("x")  # advance episode counter
+        assert seen == ["A", "B", "C", "A", "B", "C"]
+
+    def test_group_size_equals_batch_repeats_prompt(self):
+        """group_size=3 repeats each prompt 3 times before advancing."""
+        from textpolicy.environment.text_generation import TextGenerationEnv
+
+        tok = _DummyTokenizer()
+        prompts = ["A", "B"]
+
+        env = TextGenerationEnv(
+            prompts=prompts,
+            reward_fn=lambda prompt, completion, example, **kw: 0.0,
+            tokenizer=tok,
+            group_size=3,
+        )
+        seen = []
+        for _ in range(6):
+            _, info = env.reset()
+            seen.append(info["prompt_text"])
+            env.step("x")
+        assert seen == ["A", "A", "A", "B", "B", "B"]
+
+    def test_group_size_invalid_raises(self):
+        from textpolicy.environment.text_generation import TextGenerationEnv
+
+        tok = _DummyTokenizer()
+        with pytest.raises(ValueError, match="group_size must be >= 1"):
+            TextGenerationEnv(
+                prompts=["X"],
+                reward_fn=lambda prompt, completion, example, **kw: 0.0,
+                tokenizer=tok,
+                group_size=0,
+            )
+
+    def test_clone_preserves_group_size(self):
+        from textpolicy.environment.text_generation import TextGenerationEnv
+
+        tok = _DummyTokenizer()
+        env = TextGenerationEnv(
+            prompts=["A", "B"],
+            reward_fn=lambda prompt, completion, example, **kw: 0.0,
+            tokenizer=tok,
+            group_size=4,
+        )
+        cloned = env.clone()
+        assert cloned.group_size == 4
+
+
+# ── Opt 2: Shared KV-cache prefill tests ────────────────────────────
+
+
+@pytest.mark.unit
+class TestSharedPrefill:
+    """Verify that identical-prompt batches produce correct results."""
+
+    def test_identical_prompts_same_greedy_output(self):
+        """When all prompts are the same, all greedy outputs should be identical."""
+        model = _TinyLM()
+        tok = _DummyTokenizer()
+        prompt = mx.array([3, 4, 5], dtype=mx.int32)
+        out = batch_generate_tokens(
+            model, tok,
+            [prompt, prompt, prompt],
+            max_tokens=5,
+            temperature=0.0,
+        )
+        assert len(out) == 3
+        for resp, _ in out[1:]:
+            assert mx.array_equal(out[0][0], resp), (
+                "Identical prompts should produce identical greedy tokens"
+            )
+
+    def test_identical_prompts_logprobs_match(self):
+        """Logprobs should be identical across identical-prompt batch entries."""
+        model = _TinyLM()
+        tok = _DummyTokenizer()
+        prompt = mx.array([3, 4, 5], dtype=mx.int32)
+        out = batch_generate_tokens(
+            model, tok,
+            [prompt, prompt],
+            max_tokens=4,
+            temperature=0.0,
+        )
+        lp0 = out[0][1]["logprob"]
+        lp1 = out[1][1]["logprob"]
+        assert mx.allclose(lp0, lp1, atol=1e-5).item(), (
+            f"Logprobs should match for identical prompts.\n"
+            f"  Seq 0: {lp0.tolist()}\n  Seq 1: {lp1.tolist()}"
+        )
+
+    def test_identical_vs_solo_parity(self):
+        """Identical-prompt batch should produce same result as solo generation."""
+        model = _TinyLM()
+        tok = _DummyTokenizer()
+        prompt = mx.array([3, 4, 5], dtype=mx.int32)
+        solo = batch_generate_tokens(
+            model, tok, [prompt], max_tokens=5, temperature=0.0,
+        )
+        duo = batch_generate_tokens(
+            model, tok, [prompt, prompt], max_tokens=5, temperature=0.0,
+        )
+        assert mx.array_equal(solo[0][0], duo[0][0]), (
+            "Solo and identical-batch should produce the same tokens"
+        )
+
+
+# ── Opt 4: Batch compaction tests ────────────────────────────────────
+
+
+class _StaggeredEOSModel:
+    """Emits EOS when the first input token is even; preferred_id when odd.
+
+    This creates a mixed-EOS scenario: sequences with even-valued first
+    prompt tokens finish immediately while odd-valued ones run to
+    max_tokens, exercising batch compaction (Opt 4).
+
+    Robust to compaction: behaviour depends on input content, not batch
+    position, so it works correctly after finished sequences are removed.
+    """
+
+    def __init__(self, vocab_size: int = 32, eos_id: int = 2, preferred_id: int = 3):
+        self.vocab_size = vocab_size
+        self.eos_id = eos_id
+        self.preferred_id = preferred_id
+
+    def __call__(self, x, mask=None, cache=None):  # noqa: ARG002
+        bsz, seq_len = x.shape
+        first_tok = x[:, 0]  # [bsz] — first token determines behaviour
+        is_even = ((first_tok % 2) == 0).reshape(bsz, 1, 1)
+        vocab_idx = mx.arange(self.vocab_size).reshape(1, 1, self.vocab_size)
+        logits = mx.where(
+            is_even & (vocab_idx == self.eos_id),
+            mx.array(40.0),
+            mx.where(
+                vocab_idx == self.preferred_id,
+                mx.array(20.0),
+                mx.array(-20.0),
+            ),
+        )
+        return mx.broadcast_to(logits, (bsz, seq_len, self.vocab_size))
+
+
+@pytest.mark.unit
+class TestBatchCompaction:
+    """Verify that batch compaction correctly handles staggered EOS."""
+
+    def test_staggered_eos_correct_lengths(self):
+        """Even-first-token seq stops at 1 token; odd-first-token runs to max."""
+        model = _StaggeredEOSModel(eos_id=2, preferred_id=3)
+        tok = _DummyTokenizer()
+        out = batch_generate_tokens(
+            model, tok,
+            # First token 6 (even) → EOS; first token 7 (odd) → preferred
+            [mx.array([6, 6], dtype=mx.int32), mx.array([7, 8], dtype=mx.int32)],
+            max_tokens=6,
+            temperature=0.0,
+        )
+        assert len(out) == 2
+        # Seq 0 (even): should have 1 token (EOS)
+        assert out[0][0].shape[0] == 1
+        assert int(out[0][0][0].item()) == 2
+        # Seq 1 (odd): should have max_tokens tokens (never EOS)
+        assert out[1][0].shape[0] == 6
+        assert all(t == 3 for t in out[1][0].tolist())
+
+    def test_staggered_logprobs_correct_lengths(self):
+        """Logprob arrays must match token lengths after compaction."""
+        model = _StaggeredEOSModel(eos_id=2, preferred_id=3)
+        tok = _DummyTokenizer()
+        out = batch_generate_tokens(
+            model, tok,
+            # Even first token → EOS (1 token); odd first token → 8 tokens
+            [mx.array([6], dtype=mx.int32), mx.array([7], dtype=mx.int32)],
+            max_tokens=8,
+            temperature=0.0,
+        )
+        for resp, info in out:
+            assert info["logprob"].shape[0] == resp.shape[0]
+
+    def test_staggered_three_sequences(self):
+        """Batch of 3: even-first seqs finish early, odd-first run to max.
+
+        Uses equal-length prompts to avoid left-padding changing the first
+        token (pad_id=0 is even and would trigger EOS for shorter prompts).
+        """
+        model = _StaggeredEOSModel(eos_id=2, preferred_id=3)
+        tok = _DummyTokenizer()
+        out = batch_generate_tokens(
+            model, tok,
+            [
+                mx.array([4, 10], dtype=mx.int32),   # even → EOS
+                mx.array([7, 8], dtype=mx.int32),    # odd → preferred
+                mx.array([9, 11], dtype=mx.int32),   # odd → preferred
+            ],
+            max_tokens=5,
+            temperature=0.0,
+        )
+        assert len(out) == 3
+        assert out[0][0].shape[0] == 1   # EOS on step 1
+        assert out[1][0].shape[0] == 5   # full generation
+        assert out[2][0].shape[0] == 5   # full generation
+
+
+# ── Opt 3 & 4: Vectorised EOS and early exit tests ──────────────────
+
+
+@pytest.mark.unit
+class TestVectorisedEOSAndEarlyExit:
+    """Verify vectorised EOS detection and early-exit behaviour."""
+
+    def test_early_eos_stops_all_sequences(self):
+        """AlwaysEOSModel should cause immediate stop for all sequences."""
+        model = _AlwaysEOSModel(eos_id=2)
+        tok = _DummyTokenizer()
+        out = batch_generate_tokens(
+            model, tok,
+            [mx.array([3, 4], dtype=mx.int32), mx.array([5, 6], dtype=mx.int32)],
+            max_tokens=10,
+            temperature=0.0,
+        )
+        for resp, info in out:
+            assert resp.shape[0] == 1, "Should stop after 1 token (EOS)"
+            assert int(resp[0].item()) == 2
+
+    def test_mixed_eos_timing(self):
+        """Sequences that hit EOS should stop; others continue to max_tokens."""
+        # AlwaysEOSModel emits EOS immediately for all sequences — test
+        # that result packaging is correct with identical-length outputs.
+        model = _AlwaysEOSModel(eos_id=2)
+        tok = _DummyTokenizer()
+        out = batch_generate_tokens(
+            model, tok,
+            [mx.array([3], dtype=mx.int32)] * 4,
+            max_tokens=8,
+            temperature=0.0,
+        )
+        for resp, info in out:
+            # All should have exactly 1 token (EOS on first step)
+            assert resp.shape[0] == 1
+            assert info["logprob"].shape[0] == 1
+
+
+# ── Clone cache helper tests ────────────────────────────────────────
+
+
+@pytest.mark.unit
+class TestCloneSingleCacheToBatch:
+    """Unit tests for _clone_single_cache_to_batch."""
+
+    def test_batch_size_1_is_noop(self):
+        from textpolicy.generation.mlx_generation import _clone_single_cache_to_batch
+
+        class FakeCache:
+            keys = mx.zeros((1, 2, 4, 8))
+            values = mx.ones((1, 2, 4, 8))
+
+        cache = [FakeCache()]
+        result = _clone_single_cache_to_batch(cache, batch_size=1)
+        assert result is cache  # should be the exact same object
+
+    def test_tiles_keys_and_values(self):
+        from textpolicy.generation.mlx_generation import _clone_single_cache_to_batch
+
+        class FakeCache:
+            keys = mx.ones((1, 2, 4, 8))
+            values = mx.ones((1, 2, 4, 8)) * 2.0
+
+        cache = [FakeCache()]
+        result = _clone_single_cache_to_batch(cache, batch_size=3)
+        assert result[0].keys.shape == (3, 2, 4, 8)
+        assert result[0].values.shape == (3, 2, 4, 8)
+        # Each batch entry should match the original
+        assert mx.allclose(result[0].keys[0], result[0].keys[2]).item()
+        assert mx.allclose(result[0].values[0], result[0].values[1]).item()
+
+    def test_handles_unpopulated_cache(self):
+        from textpolicy.generation.mlx_generation import _clone_single_cache_to_batch
+
+        class EmptyCache:
+            keys = None
+            values = None
+
+        cache = [EmptyCache()]
+        result = _clone_single_cache_to_batch(cache, batch_size=4)
+        assert result[0].keys is None

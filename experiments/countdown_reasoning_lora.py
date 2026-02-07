@@ -249,6 +249,7 @@ def run_experiment(config: ReasoningConfig) -> None:
             max_tokens=config.max_completion_tokens,
             tokenizer=tokenizer,
             examples=problems,
+            group_size=config.episodes_per_step,
         )
 
     policy_fn = create_policy(
