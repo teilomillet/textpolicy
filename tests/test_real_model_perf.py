@@ -197,6 +197,30 @@ def _get_model_memory_bytes(model: Any) -> int:
     return sum(p.nbytes for _, p in tree_flatten(model.parameters()))
 
 
+def _load_and_quantize_model() -> Tuple[Any, Any, int, int]:
+    """Load a fresh model and quantize to 4-bit.
+
+    Returns ``(model, tokenizer, fp16_bytes, q4_bytes)``.
+    Raises on failure — callers should catch and ``pytest.skip``.
+    """
+    from mlx_lm import load as mlx_lm_load
+
+    model_name = os.environ.get(_MODEL_ENV, _DEFAULT_MODEL)
+    tokenizer_config, model_config = _get_eos_configs_for_model(model_name, None)
+    model, tokenizer, config = mlx_lm_load(
+        path_or_hf_repo=model_name,
+        tokenizer_config=tokenizer_config,
+        model_config=model_config,
+        lazy=False,
+        return_config=True,
+    )
+    _prepare_tokenizer(tokenizer, verbose=False)
+    fp16_bytes = _get_model_memory_bytes(model)
+    model = apply_quantization_to_model(model, config, bits=4, group_size=64)
+    q4_bytes = _get_model_memory_bytes(model)
+    return model, tokenizer, fp16_bytes, q4_bytes
+
+
 @pytest.fixture(scope="module")
 def quantized_model() -> Tuple[Any, Any, dict]:
     """Independent 4-bit quantized model load for benchmark comparisons.
@@ -205,32 +229,10 @@ def quantized_model() -> Tuple[Any, Any, dict]:
     FP16 ``real_model`` fixture stays unmodified for timing baselines.
     """
     try:
-        from mlx_lm import load as mlx_lm_load
-    except ImportError:
-        pytest.skip("mlx_lm is required for quantized model tests.")
-
-    model_name = os.environ.get(_MODEL_ENV, _DEFAULT_MODEL)
-    try:
-        tokenizer_config, model_config = _get_eos_configs_for_model(model_name, None)
-        model, tokenizer, config = mlx_lm_load(
-            path_or_hf_repo=model_name,
-            tokenizer_config=tokenizer_config,
-            model_config=model_config,
-            lazy=False,
-            return_config=True,
-        )
-        _prepare_tokenizer(tokenizer, verbose=False)
+        model, tokenizer, fp16_bytes, q4_bytes = _load_and_quantize_model()
     except Exception as exc:
-        pytest.skip(f"Could not load model '{model_name}': {exc}")
+        pytest.skip(f"Could not load/quantize model: {exc}")
 
-    fp16_bytes = _get_model_memory_bytes(model)
-
-    try:
-        model = apply_quantization_to_model(model, config, bits=4, group_size=64)
-    except Exception as exc:
-        pytest.skip(f"Quantization failed: {exc}")
-
-    q4_bytes = _get_model_memory_bytes(model)
     stats = {
         "fp16_bytes": fp16_bytes,
         "q4_bytes": q4_bytes,
@@ -240,11 +242,17 @@ def quantized_model() -> Tuple[Any, Any, dict]:
 
 
 @pytest.fixture(scope="module")
-def quantized_model_with_qlora(
-    quantized_model: Tuple[Any, Any, dict],
-) -> Tuple[Any, Any]:
-    """4-bit quantized model with LoRA adapters for training tests (QLoRA)."""
-    model, tokenizer, _stats = quantized_model
+def quantized_model_with_qlora() -> Tuple[Any, Any]:
+    """Independent 4-bit quantized model with LoRA adapters (QLoRA).
+
+    Loads its own model copy so that in-place LoRA mutation cannot
+    contaminate the ``quantized_model`` fixture used by timing benchmarks.
+    """
+    try:
+        model, tokenizer, _, _ = _load_and_quantize_model()
+    except Exception as exc:
+        pytest.skip(f"Could not load/quantize model for QLoRA: {exc}")
+
     apply_lora(model, lora_layers=4, lora_rank=2, lora_scale=8.0)
     freeze_base(model)
     return model, tokenizer
@@ -444,13 +452,6 @@ def test_quantized_model_generates_valid_text(
     assert not bool(mx.any(mx.isnan(logprobs)).item()), "NaN in logprobs."
     assert not bool(mx.any(mx.isinf(logprobs)).item()), "Inf in logprobs."
 
-    fp16_mb = stats["fp16_bytes"] / 1e6
-    q4_mb = stats["q4_bytes"] / 1e6
-    print(
-        f"\n  Memory: FP16={fp16_mb:.1f}MB → Q4={q4_mb:.1f}MB "
-        f"({stats['compression_ratio']:.2f}x compression)"
-    )
-
 
 @pytest.mark.apple_silicon
 def test_quantized_decode_step_faster(
@@ -496,14 +497,6 @@ def test_quantized_decode_step_faster(
     q4_ms = _setup_and_measure(q4_model)
     speedup = fp16_ms / q4_ms
 
-    fp16_mb = stats["fp16_bytes"] / 1e6
-    q4_mb = stats["q4_bytes"] / 1e6
-    print(
-        f"\n  Decode: FP16={fp16_ms:.2f}ms, Q4={q4_ms:.2f}ms "
-        f"({speedup:.2f}x speedup)"
-        f"\n  Memory: FP16={fp16_mb:.1f}MB → Q4={q4_mb:.1f}MB"
-    )
-
     assert speedup >= 1.3, (
         f"Expected ≥1.3x decode speedup from quantization "
         f"(FP16={fp16_ms:.2f}ms, Q4={q4_ms:.2f}ms, speedup={speedup:.2f}x)."
@@ -540,18 +533,13 @@ def test_quantized_rollout_faster(
     q4_ms = _median_ms(rollout_q4, repeats=4, warmup=1)
     speedup = fp16_ms / q4_ms
 
-    print(
-        f"\n  Rollout: FP16={fp16_ms:.1f}ms, Q4={q4_ms:.1f}ms "
-        f"({speedup:.2f}x speedup)"
-    )
-
     assert speedup >= 1.2, (
         f"Expected ≥1.2x rollout speedup from quantization "
         f"(FP16={fp16_ms:.1f}ms, Q4={q4_ms:.1f}ms, speedup={speedup:.2f}x)."
     )
 
 
-def test_qlora_training_reduces_loss(
+def test_qlora_training_loss_finite(
     quantized_model_with_qlora: Tuple[Any, Any],
 ) -> None:
     """L4: QLoRA training on a 4-bit model produces finite, reasonable losses."""
@@ -569,5 +557,3 @@ def test_qlora_training_reduces_loss(
     assert math.isfinite(loss_2), f"Step 2 loss is not finite: {loss_2}"
     assert -10.0 < loss_1 < 100.0, f"Step 1 loss out of range: {loss_1}"
     assert -10.0 < loss_2 < 100.0, f"Step 2 loss out of range: {loss_2}"
-
-    print(f"\n  QLoRA losses: step1={loss_1:.4f}, step2={loss_2:.4f}")
