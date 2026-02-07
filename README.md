@@ -73,3 +73,4 @@ Examples:
 - 08: GRPO training with rollout + buffer
 - 09–10: length reduction (GRPO/GSPO)
 - 11: LoRA/QLoRA configuration
+- 12: TinyLoRA + GTPO + HICRA reasoning run (`experiments/countdown_reasoning_lora.py`)
