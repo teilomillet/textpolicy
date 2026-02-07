@@ -33,7 +33,9 @@ from .lora import (
     extract_params,
     merge_weights,
     create_lora_setup,
-    create_qlora_setup
+    create_qlora_setup,
+    detect_moe_model,
+    get_moe_config,
 )
 
 # LoRA utility functions (advanced use only)
@@ -59,10 +61,14 @@ __all__ = [
     # LoRA functions
     "apply_lora",
     "freeze_base",
-    "extract_params", 
+    "extract_params",
     "merge_weights",
     "create_lora_setup",
     "create_qlora_setup",
+
+    # MoE detection
+    "detect_moe_model",
+    "get_moe_config",
     
     # Advanced LoRA utilities
     "save_adapters",

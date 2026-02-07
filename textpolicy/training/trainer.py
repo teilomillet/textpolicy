@@ -122,7 +122,14 @@ class Trainer:
         # LoRA management - detect auto-reload models
         self.auto_save_lora = auto_save_lora or self._detect_auto_reload_lora(model)
         self._has_lora = self._detect_lora_model(model)
-        
+
+        # MoE detection — purely observability, no behavioral changes.
+        from textpolicy.generation.lora import detect_moe_model, get_moe_config
+        self._is_moe = detect_moe_model(model)
+        if self._is_moe:
+            moe_cfg = get_moe_config(model)
+            logger.info("MoE model detected: %s", moe_cfg)
+
         # Resolve compile_training: "auto" checks model param count.
         # Compilation amortises tracing overhead over many ops, so it only
         # helps for models above ~1M parameters.  TinyLM (50K) is 4x slower
