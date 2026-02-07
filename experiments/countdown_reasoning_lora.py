@@ -63,7 +63,7 @@ class ReasoningConfig:
     profile_training: bool = False
 
     # Generation
-    max_completion_tokens: int = 512
+    max_completion_tokens: int = 256
     temperature: float = 0.7
     top_p: float = 0.9
     repetition_penalty: float = 1.1

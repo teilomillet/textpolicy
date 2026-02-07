@@ -891,6 +891,8 @@ def batch_generate_tokens(
     max_tokens: int = 50,
     temperature: float = 0.7,
     top_p: float = 0.9,
+    repetition_penalty: Optional[float] = None,
+    repetition_context_size: int = 20,
 ) -> List[Tuple[mx.array, Dict[str, mx.array]]]:
     """Generate responses for multiple prompts in a single batched pass.
 
@@ -916,6 +918,10 @@ def batch_generate_tokens(
         max_tokens: Maximum new tokens to generate per sequence.
         temperature: Sampling temperature (>0).
         top_p: Nucleus sampling threshold.
+        repetition_penalty: Penalty factor for repeating tokens (>1.0
+            discourages repetition).  ``None`` or ``1.0`` disables.
+        repetition_context_size: Number of recent tokens to consider for
+            repetition penalty.  Default ``20`` (matches ``mlx_lm``).
 
     Returns:
         List of N ``(response_tokens, {'logprob': logprobs})`` tuples.
@@ -981,16 +987,44 @@ def batch_generate_tokens(
     per_seq_logprobs: List[List[float]] = [[] for _ in range(batch_size)]
     arange_batch = mx.arange(batch_size)
 
+    use_rep_penalty = repetition_penalty is not None and repetition_penalty != 1.0
+
     for decode_step in range(max_tokens):
         # Logprobs from unscaled logits (matches _simple_generate convention).
+        # These are recorded for training and are always unpenalized.
         log_probs = next_logits - mx.logsumexp(next_logits, axis=-1, keepdims=True)
 
-        if temperature <= 0:
-            sampled = mx.argmax(log_probs, axis=-1)
-        elif sampler is not None:
-            sampled = sampler(log_probs)
+        # Apply repetition penalty for sampling only (paper: arXiv 1909.05858).
+        # MLX arrays are immutable values so __setitem__ creates new arrays
+        # without aliasing next_logits.
+        if use_rep_penalty:
+            sample_logits = next_logits
+            for i in range(batch_size):
+                if finished[i]:
+                    continue
+                ctx = (prompt_token_lists_py[i] + per_seq_tokens[i])[
+                    -repetition_context_size:
+                ]
+                if ctx:
+                    tok_ids = mx.array(ctx, dtype=mx.int32)
+                    sel = sample_logits[i, tok_ids]
+                    sample_logits[i, tok_ids] = mx.where(
+                        sel < 0,
+                        sel * repetition_penalty,
+                        sel / repetition_penalty,
+                    )
+            sample_log_probs = sample_logits - mx.logsumexp(
+                sample_logits, axis=-1, keepdims=True
+            )
         else:
-            scaled_logits = next_logits / temperature
+            sample_log_probs = log_probs
+
+        if temperature <= 0:
+            sampled = mx.argmax(sample_log_probs, axis=-1)
+        elif sampler is not None:
+            sampled = sampler(sample_log_probs)
+        else:
+            scaled_logits = sample_log_probs / temperature
             probs = mx.softmax(scaled_logits, axis=-1)
             sampled = mx.random.categorical(mx.log(probs))
 
@@ -1097,6 +1131,7 @@ def create_batched_policy(
     max_tokens = params.get("max_tokens", 50)
     temperature = params.get("temperature", 0.8)
     top_p = params.get("top_p", 0.95)
+    rep_penalty = params.get("repetition_penalty", None)
 
     def batched_policy_fn(
         prompt_tokens_list: List[mx.array],
@@ -1115,6 +1150,7 @@ def create_batched_policy(
             max_tokens=max_tokens,
             temperature=temp,
             top_p=top_p,
+            repetition_penalty=rep_penalty,
         )
 
     # Attach metadata so rollout coordination can derive batched policy automatically.

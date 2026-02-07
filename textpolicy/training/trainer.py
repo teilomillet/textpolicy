@@ -772,7 +772,9 @@ class Trainer:
         loss, grads = self.loss_and_grad_fn(batch_data)
 
         if timer is not None:
-            mx.eval(loss)
+            # Eval both loss AND grads so the backward pass cost is attributed
+            # here, not to the subsequent grad_clip phase.
+            mx.eval(loss, grads)
             timer.stop("loss_and_grad")
 
         # ── Phase: grad_clip ───────────────────────────────────────────
@@ -783,8 +785,6 @@ class Trainer:
             grads = self._clip_gradients(grads, self.max_grad_norm)
 
         if timer is not None:
-            # Force clipped gradients to materialize so their cost isn't
-            # attributed to optimizer_update.
             mx.eval(grads)
             timer.stop("grad_clip")
 
