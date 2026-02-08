@@ -19,8 +19,10 @@ Hypotheses tested:
     H8: Trainer step completes with finite loss and non-zero grads
 
   TestCompileInteraction:
-    H9: gradient_checkpointing=True + compile_training=True -> _compiled=False
-    H10: gradient_checkpointing=True + compile_training="auto" -> _compiled=False
+    H9: on MLX >= 0.30.6, checkpointing + compile_training=True stays compiled
+    H10: on MLX >= 0.30.6, checkpointing + compile_training="auto" stays compiled
+    H10b: on MLX < 0.30.6, checkpointing + compile_training=True raises
+    H10c: on MLX < 0.30.6, checkpointing + compile_training="auto" falls back
 
 References:
     Issue #55 -- O(n^1.89) training scaling and memory wall
@@ -418,7 +420,7 @@ class TestCorrectnessWithTrainer:
 
 @pytest.mark.unit
 class TestCompileInteraction:
-    """Validate compile/checkpoint incompatibility handling."""
+    """Validate compile/checkpoint interaction and version gating."""
 
     def _make_model(self):
         mx.random.seed(42)
@@ -498,6 +500,52 @@ class TestCompileInteraction:
         assert trainer._compiled is True
         assert trainer._gradient_checkpointing is False
         assert not is_gradient_checkpointing_active(model)
+
+    def test_checkpoint_compile_true_rejects_old_mlx(self, monkeypatch):
+        """H10b: old MLX rejects explicit checkpoint+compile requests."""
+        from textpolicy.training import Trainer
+        from textpolicy.algorithms import grpo
+
+        model = self._make_model()
+        monkeypatch.setattr(mx, "__version__", "0.30.5")
+
+        with pytest.raises(
+            ValueError, match=r"requires MLX >= 0\.30\.6"
+        ):
+            Trainer(
+                model=model,
+                loss_fn=grpo.policy_loss,
+                optimizer=optim.Adam(learning_rate=1e-3),
+                advantage_fn=grpo.compute_advantages,
+                compile_training=True,
+                gradient_checkpointing=True,
+            )
+
+    def test_checkpoint_auto_compile_falls_back_on_old_mlx(self, monkeypatch):
+        """H10c: old MLX disables auto-compile when checkpointing is enabled."""
+        from textpolicy.training import Trainer
+        from textpolicy.algorithms import grpo
+
+        # Use a large enough model that auto would compile without version gate.
+        mx.random.seed(42)
+        model = TinyLoRAModel(dim=256, num_layers=8, vocab_size=2048)
+        mx.eval(model.parameters())
+
+        n_params = sum(p.size for _, p in tree_flatten(model.parameters()))
+        assert n_params >= 1_000_000, f"Model too small: {n_params}"
+
+        monkeypatch.setattr(mx, "__version__", "0.30.5")
+        trainer = Trainer(
+            model=model,
+            loss_fn=grpo.policy_loss,
+            optimizer=optim.Adam(learning_rate=1e-3),
+            advantage_fn=grpo.compute_advantages,
+            compile_training="auto",
+            gradient_checkpointing=True,
+        )
+
+        assert trainer._compiled is False
+        assert is_gradient_checkpointing_active(model)
 
 
 # ---------------------------------------------------------------------------

@@ -68,6 +68,25 @@ Causal attention is O(n^2), so halving sequence length reduces attention
 compute by ~4x. Sorting is enabled by default and has negligible overhead
 (Python list sort on episode count).
 
+To reproduce sorted-vs-unsorted impact on your machine:
+
+```bash
+uv run python scripts/benchmark_sequence_packing.py
+```
+
+Useful variants:
+
+```bash
+# Full-batch control (disable micro-batching)
+uv run python scripts/benchmark_sequence_packing.py --micro-batch-size none
+
+# Custom workload shape
+uv run python scripts/benchmark_sequence_packing.py \
+  --episodes 192 \
+  --prompt-min 64 --prompt-max 448 \
+  --response-min 16 --response-max 320
+```
+
 ### Combined Usage
 
 The two features compose naturally — gradient checkpointing reduces per-layer
