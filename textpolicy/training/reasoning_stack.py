@@ -466,6 +466,10 @@ def build_gtpo_transform(
 # ---------------------------------------------------------------------------
 
 
+_LEGACY_HICRA_ALPHA_DEFAULT = 0.2
+_LEGACY_ENTROPY_WEIGHT_DEFAULT = 0.1
+
+
 def create_tinylora_reasoning_setup(
     model: nn.Module,
     tokenizer: Any,
@@ -480,6 +484,8 @@ def create_tinylora_reasoning_setup(
     alpha_2: float = 0.1,
     reward_threshold: float = 0.5,
     hicra_gamma: float = 0.3,
+    hicra_alpha: float = _LEGACY_HICRA_ALPHA_DEFAULT,
+    entropy_weight: float = _LEGACY_ENTROPY_WEIGHT_DEFAULT,
     compile_training: Union[bool, str] = "auto",
     gradient_checkpointing: Union[bool, int] = False,
     micro_batch_size: Optional[int] = None,
@@ -525,15 +531,27 @@ def create_tinylora_reasoning_setup(
         adapter_save_path=adapter_save_path,
     )
 
+    uses_legacy_simplified_params = (
+        hicra_alpha != _LEGACY_HICRA_ALPHA_DEFAULT
+        or entropy_weight != _LEGACY_ENTROPY_WEIGHT_DEFAULT
+    )
     if advantage_transform_fn is None:
-        advantage_transform_fn = build_gtpo_transform(
-            alpha_1=alpha_1,
-            alpha_2=alpha_2,
-            reward_threshold=reward_threshold,
-            tokenizer=tokenizer,
-            strategic_grams=strategic_grams,
-            hicra_gamma=hicra_gamma,
-        )
+        if uses_legacy_simplified_params:
+            advantage_transform_fn = build_gtpo_hicra_transform(
+                tokenizer,
+                strategic_grams=strategic_grams,
+                hicra_alpha=hicra_alpha,
+                entropy_weight=entropy_weight,
+            )
+        else:
+            advantage_transform_fn = build_gtpo_transform(
+                alpha_1=alpha_1,
+                alpha_2=alpha_2,
+                reward_threshold=reward_threshold,
+                tokenizer=tokenizer,
+                strategic_grams=strategic_grams,
+                hicra_gamma=hicra_gamma,
+            )
 
     trainer = Trainer(
         model=lora_model,
