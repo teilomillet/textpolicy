@@ -25,6 +25,7 @@ import math
 import pytest
 import mlx.core as mx
 import mlx.nn as nn
+import mlx.optimizers as optim
 
 from textpolicy.algorithms.grpo import (
     compute_gtpo_shaped_rewards,
@@ -678,6 +679,278 @@ class TestNumericalVerification:
         for i in range(4, 6):
             assert abs(float(shaped[i]) - (-1.0)) < 1e-4, \
                 f"Uniform entropy O- token {i}: expected -1.0, got {float(shaped[i])}"
+
+
+# ---------------------------------------------------------------------------
+# H9: Trainer integration for faithful GTPO
+# ---------------------------------------------------------------------------
+
+@pytest.mark.integration
+class TestGTPOFaithfulTrainerIntegration:
+    """Validate that faithful GTPO works through the Trainer via advantage_transform_fn.
+
+    The decomposition:
+    - advantage_transform_fn → build_gtpo_faithful_transform (Eq. 3, 5, 6)
+    - loss_fn → grpo.policy_loss (Eq. 7, PPO clipping)
+
+    Hypotheses:
+      H9a: Trainer trains with faithful GTPO (uncompiled) — finite loss
+      H9b: Trainer trains with faithful GTPO (compiled) — compile-safety proof
+      H9c: Transform output differs from standard GRPO advantages
+      H9d: Variable-length episodes handled correctly
+      H9e: functools.partial(policy_loss, clip_ratio=0.2) works
+      H9f: Missing episode_lengths raises ValueError
+      H9g: Missing token_entropies raises ValueError
+      H9h: Negative alpha values rejected by builder
+      H9i: Works with micro-batching (micro_batch_size=2)
+    """
+
+    def _make_model(self, vocab_size=16, dim=8):
+        """Minimal causal LM: embedding + head → [batch, seq_len, vocab_size]."""
+        class TinyLM(nn.Module):
+            def __init__(self):
+                super().__init__()
+                self.embed = nn.Embedding(vocab_size, dim)
+                self.head = nn.Linear(dim, vocab_size)
+            def __call__(self, x):
+                return self.head(self.embed(x))
+
+        model = TinyLM()
+        mx.eval(model.parameters())
+        return model
+
+    def _make_batch(self, num_episodes=3, prompt_len=3, response_len=2, vocab_size=16):
+        """Build a GRPO-style batch with rewards for faithful GTPO."""
+        import mlx.core as mx
+        obs = mx.random.randint(0, vocab_size, shape=(num_episodes, prompt_len + response_len))
+        act = mx.random.randint(0, vocab_size, shape=(num_episodes, response_len))
+        total_tokens = num_episodes * response_len
+        logprob = -mx.abs(mx.random.normal((total_tokens,)))
+        # Binary rewards — first episode positive, rest negative
+        rewards_list = [1.0] + [0.0] * (num_episodes - 1)
+        rewards = mx.array(rewards_list, dtype=mx.float32)
+        mx.eval(obs, act, logprob, rewards)
+        return {
+            "obs": obs,
+            "act": act,
+            "logprob": logprob,
+            "rewards": rewards,
+            "episode_lengths": [response_len] * num_episodes,
+            "prompt_lengths": [prompt_len] * num_episodes,
+        }
+
+    def test_h9a_trainer_trains_uncompiled(self):
+        """H9a: Trainer produces finite loss with faithful GTPO (uncompiled)."""
+        from functools import partial
+        from textpolicy.training import Trainer, build_gtpo_faithful_transform
+        from textpolicy.algorithms import grpo
+
+        model = self._make_model()
+        transform = build_gtpo_faithful_transform(alpha_1=1.0, alpha_2=0.1)
+
+        trainer = Trainer(
+            model=model,
+            advantage_fn=grpo.compute_advantages,
+            loss_fn=partial(grpo.policy_loss, clip_ratio=0.2),
+            optimizer=optim.Adam(learning_rate=1e-3),
+            compile_training=False,
+            advantage_transform_fn=transform,
+        )
+
+        batch = self._make_batch()
+        metrics = trainer.train(batch)
+
+        assert "loss" in metrics
+        assert math.isfinite(metrics["loss"]), f"Loss should be finite, got {metrics['loss']}"
+
+    def test_h9b_trainer_trains_compiled(self):
+        """H9b: Trainer produces finite loss with faithful GTPO (compiled).
+
+        This proves all operations in _GTPOFaithfulTransform are compile-safe:
+        no mx.eval(), no .item(), no bool() on arrays inside the traced graph.
+        """
+        from functools import partial
+        from textpolicy.training import Trainer, build_gtpo_faithful_transform
+        from textpolicy.algorithms import grpo
+
+        model = self._make_model()
+        transform = build_gtpo_faithful_transform(alpha_1=1.0, alpha_2=0.1)
+
+        trainer = Trainer(
+            model=model,
+            advantage_fn=grpo.compute_advantages,
+            loss_fn=partial(grpo.policy_loss, clip_ratio=0.2),
+            optimizer=optim.Adam(learning_rate=1e-3),
+            compile_training=True,
+            advantage_transform_fn=transform,
+        )
+
+        batch = self._make_batch()
+        metrics = trainer.train(batch)
+
+        assert "loss" in metrics
+        assert math.isfinite(metrics["loss"]), f"Loss should be finite, got {metrics['loss']}"
+        assert trainer._compiled is True
+
+    def test_h9c_transform_differs_from_grpo(self):
+        """H9c: Faithful GTPO advantages differ from standard GRPO advantages."""
+        from textpolicy.training import build_gtpo_faithful_transform
+        from textpolicy.algorithms.grpo import compute_advantages
+
+        transform = build_gtpo_faithful_transform(alpha_1=1.0, alpha_2=0.1)
+
+        rewards = mx.array([1.0, 1.0, 0.0, 0.0])
+        episode_lengths = [2, 2, 2, 2]
+        # Non-uniform entropy to create asymmetry
+        token_entropies = mx.array([5.0, 1.0, 1.0, 5.0, 4.0, 0.5, 0.5, 4.0])
+
+        # Standard GRPO: uniform per-episode advantages
+        grpo_advantages = compute_advantages(rewards)
+        expanded = mx.concatenate([mx.repeat(grpo_advantages[i:i+1], 2) for i in range(4)])
+
+        # Faithful GTPO via transform
+        batch_data = {
+            "rewards": rewards,
+            "token_entropies": token_entropies,
+            "episode_lengths": episode_lengths,
+        }
+        faithful_advantages = transform(expanded, batch_data)
+        mx.eval(expanded, faithful_advantages)
+
+        # GTPO should produce non-uniform per-token advantages within an episode
+        assert not mx.allclose(expanded, faithful_advantages, atol=1e-4), \
+            "Faithful GTPO advantages should differ from standard GRPO"
+
+    def test_h9d_variable_length_episodes(self):
+        """H9d: Variable-length episodes handled correctly through Trainer."""
+        from functools import partial
+        from textpolicy.training import Trainer, build_gtpo_faithful_transform
+        from textpolicy.algorithms import grpo
+
+        model = self._make_model()
+        transform = build_gtpo_faithful_transform(alpha_1=1.0, alpha_2=0.1)
+
+        trainer = Trainer(
+            model=model,
+            advantage_fn=grpo.compute_advantages,
+            loss_fn=partial(grpo.policy_loss, clip_ratio=0.2),
+            optimizer=optim.Adam(learning_rate=1e-3),
+            compile_training=False,
+            advantage_transform_fn=transform,
+        )
+
+        # Variable-length episodes: 3, 1, 2 tokens
+        vocab_size = 16
+        prompt_len = 3
+        max_response_len = 3
+        episode_lengths = [3, 1, 2]
+        total_tokens = sum(episode_lengths)
+
+        obs = mx.random.randint(0, vocab_size, shape=(3, prompt_len + max_response_len))
+        act = mx.random.randint(0, vocab_size, shape=(3, max_response_len))
+        logprob = -mx.abs(mx.random.normal((total_tokens,)))
+        rewards = mx.array([1.0, 0.0, 0.5], dtype=mx.float32)
+        mx.eval(obs, act, logprob, rewards)
+
+        batch = {
+            "obs": obs,
+            "act": act,
+            "logprob": logprob,
+            "rewards": rewards,
+            "episode_lengths": episode_lengths,
+            "prompt_lengths": [prompt_len] * 3,
+        }
+
+        metrics = trainer.train(batch)
+        assert math.isfinite(metrics["loss"]), f"Loss should be finite, got {metrics['loss']}"
+
+    def test_h9e_partial_policy_loss(self):
+        """H9e: functools.partial(policy_loss, clip_ratio=0.2) works as loss_fn."""
+        from functools import partial
+        from textpolicy.training import Trainer, build_gtpo_faithful_transform
+        from textpolicy.algorithms import grpo
+
+        model = self._make_model()
+        transform = build_gtpo_faithful_transform(alpha_1=1.0, alpha_2=0.1)
+
+        # Use partial with a custom clip_ratio
+        loss_fn = partial(grpo.policy_loss, clip_ratio=0.3)
+
+        trainer = Trainer(
+            model=model,
+            advantage_fn=grpo.compute_advantages,
+            loss_fn=loss_fn,
+            optimizer=optim.Adam(learning_rate=1e-3),
+            compile_training=False,
+            advantage_transform_fn=transform,
+        )
+
+        batch = self._make_batch()
+        metrics = trainer.train(batch)
+        assert math.isfinite(metrics["loss"])
+
+    def test_h9f_missing_episode_lengths_raises(self):
+        """H9f: Missing episode_lengths in batch_data raises ValueError."""
+        from textpolicy.training import build_gtpo_faithful_transform
+
+        transform = build_gtpo_faithful_transform(alpha_1=1.0, alpha_2=0.1)
+        advantages = mx.array([0.5, -0.5, 0.3, -0.3])
+        batch_data = {
+            "rewards": mx.array([1.0, 0.0]),
+            "token_entropies": mx.array([2.0, 1.0, 3.0, 0.5]),
+            # episode_lengths intentionally omitted
+        }
+
+        with pytest.raises(ValueError, match="episode_lengths"):
+            transform(advantages, batch_data)
+
+    def test_h9g_missing_token_entropies_raises(self):
+        """H9g: Missing token_entropies in batch_data raises ValueError."""
+        from textpolicy.training import build_gtpo_faithful_transform
+
+        transform = build_gtpo_faithful_transform(alpha_1=1.0, alpha_2=0.1)
+        advantages = mx.array([0.5, -0.5, 0.3, -0.3])
+        batch_data = {
+            "rewards": mx.array([1.0, 0.0]),
+            "episode_lengths": [2, 2],
+            # token_entropies intentionally omitted
+        }
+
+        with pytest.raises(ValueError, match="token_entropies"):
+            transform(advantages, batch_data)
+
+    def test_h9h_negative_alpha_rejected(self):
+        """H9h: Negative alpha values are rejected by the builder."""
+        from textpolicy.training import build_gtpo_faithful_transform
+
+        with pytest.raises(ValueError, match="alpha_1"):
+            build_gtpo_faithful_transform(alpha_1=-0.1)
+
+        with pytest.raises(ValueError, match="alpha_2"):
+            build_gtpo_faithful_transform(alpha_2=-0.5)
+
+    def test_h9i_micro_batching(self):
+        """H9i: Works with micro_batch_size=2."""
+        from functools import partial
+        from textpolicy.training import Trainer, build_gtpo_faithful_transform
+        from textpolicy.algorithms import grpo
+
+        model = self._make_model()
+        transform = build_gtpo_faithful_transform(alpha_1=1.0, alpha_2=0.1)
+
+        trainer = Trainer(
+            model=model,
+            advantage_fn=grpo.compute_advantages,
+            loss_fn=partial(grpo.policy_loss, clip_ratio=0.2),
+            optimizer=optim.Adam(learning_rate=1e-3),
+            compile_training=False,
+            micro_batch_size=2,
+            advantage_transform_fn=transform,
+        )
+
+        batch = self._make_batch(num_episodes=4, response_len=2)
+        metrics = trainer.train(batch)
+        assert math.isfinite(metrics["loss"]), f"Loss should be finite, got {metrics['loss']}"
 
 
 if __name__ == "__main__":
