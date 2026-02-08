@@ -169,6 +169,17 @@ class Trainer:
                 f"got {compile_training!r}"
             )
 
+        # Validate micro_batch_size before any model mutation so a failed
+        # constructor doesn't leave the model in a partially-modified state
+        # (e.g. checkpointing applied but Trainer not created).
+        if micro_batch_size is not None:
+            if not isinstance(micro_batch_size, int) or micro_batch_size <= 0:
+                raise ValueError(
+                    f"micro_batch_size must be a positive integer, "
+                    f"got {micro_batch_size!r}"
+                )
+        self._micro_batch_size = micro_batch_size
+
         # Gradient checkpointing: apply before loss_and_grad_fn creation.
         # Verified compatible with mx.compile on MLX >= 0.30.6 (explicit
         # positional args pattern preserves gradients through compile).
@@ -179,14 +190,6 @@ class Trainer:
             logger.info(
                 "Gradient checkpointing applied to %d layers", n_layers
             )
-
-        # Validate micro_batch_size.
-        if micro_batch_size is not None and micro_batch_size <= 0:
-            raise ValueError(
-                f"micro_batch_size must be a positive integer, "
-                f"got {micro_batch_size}"
-            )
-        self._micro_batch_size = micro_batch_size
 
         self._compiled = should_compile
         if should_compile:

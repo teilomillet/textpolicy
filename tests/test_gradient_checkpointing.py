@@ -706,6 +706,52 @@ class TestMicroBatching:
                 micro_batch_size=-1,
             )
 
+    def test_micro_batch_float_raises(self):
+        """H14d: micro_batch_size=1.5 raises ValueError (must be int)."""
+        from textpolicy.training import Trainer
+        from textpolicy.algorithms import grpo
+
+        mx.random.seed(42)
+        model = TinyLoRAModel(dim=8, num_layers=3, vocab_size=16)
+        mx.eval(model.parameters())
+
+        with pytest.raises(ValueError, match="positive integer"):
+            Trainer(
+                model=model,
+                loss_fn=grpo.policy_loss,
+                optimizer=optim.Adam(learning_rate=1e-3),
+                advantage_fn=grpo.compute_advantages,
+                compile_training=False,
+                micro_batch_size=1.5,
+            )
+
+    def test_invalid_micro_batch_does_not_mutate_model(self):
+        """H14e: Failed Trainer init does not leave checkpointing active."""
+        from textpolicy.training import Trainer
+        from textpolicy.algorithms import grpo
+
+        mx.random.seed(42)
+        model = TinyLoRAModel(dim=8, num_layers=3, vocab_size=16)
+        mx.eval(model.parameters())
+
+        assert not is_gradient_checkpointing_active(model)
+
+        with pytest.raises(ValueError):
+            Trainer(
+                model=model,
+                loss_fn=grpo.policy_loss,
+                optimizer=optim.Adam(learning_rate=1e-3),
+                advantage_fn=grpo.compute_advantages,
+                compile_training=False,
+                gradient_checkpointing=True,
+                micro_batch_size=0,
+            )
+
+        # Model must NOT have checkpointing active after failed init
+        assert not is_gradient_checkpointing_active(model), (
+            "Failed Trainer init left model mutated with checkpointing active"
+        )
+
     def test_micro_batch_ge_episodes_uses_full_path(self):
         """H14: micro_batch_size >= num_episodes uses full-batch path."""
         from textpolicy.training import Trainer
