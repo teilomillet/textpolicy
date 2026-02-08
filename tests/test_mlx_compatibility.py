@@ -758,6 +758,44 @@ class TestTrainerWithMLX:
 
 
 @pytest.mark.unit
+class TestGenerationPackageAPI:
+    """Verify generation package exports match documented public API."""
+
+    def test_reload_functions_importable_from_package(self):
+        """Documented in docs/10_lora_qlora.md as Core APIs — must be importable."""
+        from textpolicy.generation import (
+            create_reloadable_policy,
+            create_training_loop_with_reload,
+            create_auto_reload_setup,
+        )
+        assert callable(create_reloadable_policy)
+        assert callable(create_training_loop_with_reload)
+        assert callable(create_auto_reload_setup)
+
+    def test_lora_memory_functions_importable_from_package(self):
+        """Memory planning functions must be importable from package level."""
+        from textpolicy.generation import (
+            compute_lora_memory_savings,
+            apply_quantization_to_model,
+        )
+        assert callable(compute_lora_memory_savings)
+        assert callable(apply_quantization_to_model)
+
+    def test_all_exports_listed_in_all(self):
+        """Every exported name must appear in __all__."""
+        import textpolicy.generation as gen
+        expected = [
+            "create_reloadable_policy",
+            "create_training_loop_with_reload",
+            "create_auto_reload_setup",
+            "compute_lora_memory_savings",
+            "apply_quantization_to_model",
+        ]
+        for name in expected:
+            assert name in gen.__all__, f"{name} missing from generation.__all__"
+
+
+@pytest.mark.unit
 class TestLoRAWithMLX:
     """Test LoRA functions with MLX."""
 

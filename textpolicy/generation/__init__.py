@@ -38,10 +38,19 @@ from .lora import (
     get_moe_config,
 )
 
-# LoRA utility functions (advanced use only)
+# LoRA adapter reloading
 from .reload import (
     save_adapters,
-    reload_model
+    reload_model,
+    create_reloadable_policy,
+    create_training_loop_with_reload,
+    create_auto_reload_setup,
+)
+
+# LoRA memory planning
+from .lora import (
+    compute_lora_memory_savings,
+    apply_quantization_to_model,
 )
 
 __all__ = [
@@ -70,7 +79,14 @@ __all__ = [
     "detect_moe_model",
     "get_moe_config",
     
-    # Advanced LoRA utilities
+    # LoRA adapter reloading
     "save_adapters",
     "reload_model",
+    "create_reloadable_policy",
+    "create_training_loop_with_reload",
+    "create_auto_reload_setup",
+
+    # LoRA memory planning
+    "compute_lora_memory_savings",
+    "apply_quantization_to_model",
 ]
