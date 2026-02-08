@@ -12,6 +12,7 @@ TextPolicy primitives so they remain easy to test and safe to evolve.
 
 from __future__ import annotations
 
+import warnings
 from typing import Any, Callable, Dict, List, Optional, Sequence, Tuple, Union
 
 import mlx.core as mx  # type: ignore
@@ -48,6 +49,8 @@ _DEFAULT_TINYLORA_CONFIG: Dict[str, Any] = {
     "lora_scale": 8.0,
     "lora_dropout": 0.0,
 }
+_LEGACY_HICRA_ALPHA_DEFAULT = 0.2
+_LEGACY_ENTROPY_WEIGHT_DEFAULT = 0.1
 
 
 def _flatten_padded_token_rows(
@@ -482,8 +485,8 @@ def create_tinylora_reasoning_setup(
     alpha_2: float = 0.1,
     reward_threshold: float = 0.5,
     hicra_gamma: float = 0.3,
-    hicra_alpha: float = 0.2,
-    entropy_weight: float = 0.1,
+    hicra_alpha: float = _LEGACY_HICRA_ALPHA_DEFAULT,
+    entropy_weight: float = _LEGACY_ENTROPY_WEIGHT_DEFAULT,
     compile_training: Union[bool, str] = "auto",
     gradient_checkpointing: Union[bool, int] = False,
     micro_batch_size: Optional[int] = None,
@@ -499,7 +502,9 @@ def create_tinylora_reasoning_setup(
     -> advantages`` callable via ``advantage_transform_fn``.  When ``None``
     (the default), a GTPO transform (arXiv 2508.04349 Eq. 3, 5, 6) is built
     from the ``alpha_1``, ``alpha_2``, ``reward_threshold``, ``hicra_gamma``,
-    and ``strategic_grams`` parameters.
+    and ``strategic_grams`` parameters.  For backward compatibility, setting
+    non-default ``hicra_alpha`` or ``entropy_weight`` (without injecting a
+    transform) switches to the legacy simplified GTPO+HICRA transform.
 
     TinyLoRA-style here means a compact LoRA default configuration
     (small rank + fewer adapted layers).  Exact TinyLoRA internals from
@@ -545,12 +550,13 @@ def create_tinylora_reasoning_setup(
             Only used when ``advantage_transform_fn`` is ``None``.
         hicra_gamma: HICRA entropy boost factor for GTPO fusion (default 0.3).
             Only used when ``advantage_transform_fn`` is ``None``.
-        hicra_alpha: Blend weight for the *simplified* GTPO+HICRA transform
-            (default 0.2).  Only used when an explicit simplified transform
-            is injected via ``advantage_transform_fn``.
-        entropy_weight: Simplified GTPO entropy re-weighting coefficient beta
-            (default 0.1).  Only used when an explicit simplified transform
-            is injected via ``advantage_transform_fn``.
+        hicra_alpha: Legacy simplified GTPO+HICRA blend weight (default 0.2).
+            When ``advantage_transform_fn`` is ``None`` and either this value
+            or ``entropy_weight`` is changed from defaults, the helper falls
+            back to ``build_gtpo_hicra_transform`` for backward compatibility.
+            Ignored when a custom transform is provided.
+        entropy_weight: Legacy simplified GTPO entropy re-weighting coefficient
+            beta (default 0.1). Behaves like ``hicra_alpha`` above.
         compile_training: ``True``, ``False``, or ``"auto"`` for mx.compile.
         gradient_checkpointing: Re-compute activations during backward pass
             instead of caching them.  ``True`` uses sqrt(n) layer selection
@@ -588,14 +594,41 @@ def create_tinylora_reasoning_setup(
         adapter_save_path=adapter_save_path,
     )
 
+    uses_legacy_simplified_params = (
+        hicra_alpha != _LEGACY_HICRA_ALPHA_DEFAULT
+        or entropy_weight != _LEGACY_ENTROPY_WEIGHT_DEFAULT
+    )
     if advantage_transform_fn is None:
-        advantage_transform_fn = build_gtpo_transform(
-            alpha_1=alpha_1,
-            alpha_2=alpha_2,
-            reward_threshold=reward_threshold,
-            tokenizer=tokenizer,
-            strategic_grams=strategic_grams,
-            hicra_gamma=hicra_gamma,
+        if uses_legacy_simplified_params:
+            warnings.warn(
+                "Non-default hicra_alpha/entropy_weight requested without an "
+                "explicit advantage_transform_fn; using legacy "
+                "build_gtpo_hicra_transform(...) for backward compatibility. "
+                "Inject a transform explicitly to silence this warning.",
+                FutureWarning,
+                stacklevel=2,
+            )
+            advantage_transform_fn = build_gtpo_hicra_transform(
+                tokenizer,
+                strategic_grams=strategic_grams,
+                hicra_alpha=hicra_alpha,
+                entropy_weight=entropy_weight,
+            )
+        else:
+            advantage_transform_fn = build_gtpo_transform(
+                alpha_1=alpha_1,
+                alpha_2=alpha_2,
+                reward_threshold=reward_threshold,
+                tokenizer=tokenizer,
+                strategic_grams=strategic_grams,
+                hicra_gamma=hicra_gamma,
+            )
+    elif uses_legacy_simplified_params:
+        warnings.warn(
+            "hicra_alpha/entropy_weight are ignored when advantage_transform_fn "
+            "is provided.",
+            UserWarning,
+            stacklevel=2,
         )
 
     trainer = Trainer(

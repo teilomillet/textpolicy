@@ -378,3 +378,120 @@ class TestTransformInjection:
             "when advantage_transform_fn is None.  Found unconditional transform "
             "construction — the injected transform would be ignored."
         )
+
+    def test_default_setup_builds_gtpo_transform(self, monkeypatch):
+        """Default setup should use build_gtpo_transform."""
+        import textpolicy.training.reasoning_stack as rs
+
+        calls = {}
+
+        def fake_create_lora_setup(**kwargs):
+            calls["create_lora_setup"] = kwargs
+            return object(), {"memory_savings_percent": 95.0}
+
+        def fake_build_gtpo_transform(**kwargs):
+            calls["build_gtpo_transform"] = kwargs
+            return "gtpo-transform"
+
+        def fake_build_gtpo_hicra_transform(*args, **kwargs):
+            calls["build_gtpo_hicra_transform"] = (args, kwargs)
+            return "hicra-transform"
+
+        class FakeTrainer:
+            def __init__(self, **kwargs):
+                calls["trainer_kwargs"] = kwargs
+
+        monkeypatch.setattr(rs, "create_lora_setup", fake_create_lora_setup)
+        monkeypatch.setattr(rs, "build_gtpo_transform", fake_build_gtpo_transform)
+        monkeypatch.setattr(rs, "build_gtpo_hicra_transform", fake_build_gtpo_hicra_transform)
+        monkeypatch.setattr(rs, "Trainer", FakeTrainer)
+
+        rs.create_tinylora_reasoning_setup(
+            model=object(),
+            tokenizer=object(),
+            optimizer=object(),
+        )
+
+        assert "build_gtpo_transform" in calls
+        assert "build_gtpo_hicra_transform" not in calls
+        assert calls["trainer_kwargs"]["advantage_transform_fn"] == "gtpo-transform"
+
+    def test_non_default_legacy_params_use_simplified_transform(self, monkeypatch):
+        """Non-default hicra_alpha/entropy_weight should activate legacy transform."""
+        import textpolicy.training.reasoning_stack as rs
+
+        calls = {}
+
+        def fake_create_lora_setup(**kwargs):
+            calls["create_lora_setup"] = kwargs
+            return object(), {"memory_savings_percent": 95.0}
+
+        def fake_build_gtpo_transform(**kwargs):
+            calls["build_gtpo_transform"] = kwargs
+            return "gtpo-transform"
+
+        def fake_build_gtpo_hicra_transform(*args, **kwargs):
+            calls["build_gtpo_hicra_transform"] = (args, kwargs)
+            return "hicra-transform"
+
+        class FakeTrainer:
+            def __init__(self, **kwargs):
+                calls["trainer_kwargs"] = kwargs
+
+        monkeypatch.setattr(rs, "create_lora_setup", fake_create_lora_setup)
+        monkeypatch.setattr(rs, "build_gtpo_transform", fake_build_gtpo_transform)
+        monkeypatch.setattr(rs, "build_gtpo_hicra_transform", fake_build_gtpo_hicra_transform)
+        monkeypatch.setattr(rs, "Trainer", FakeTrainer)
+
+        with pytest.warns(FutureWarning, match="legacy"):
+            rs.create_tinylora_reasoning_setup(
+                model=object(),
+                tokenizer="tok",
+                optimizer=object(),
+                hicra_alpha=0.5,
+                entropy_weight=0.2,
+            )
+
+        assert "build_gtpo_transform" not in calls
+        assert "build_gtpo_hicra_transform" in calls
+        _, hicra_kwargs = calls["build_gtpo_hicra_transform"]
+        assert hicra_kwargs["hicra_alpha"] == 0.5
+        assert hicra_kwargs["entropy_weight"] == 0.2
+        assert calls["trainer_kwargs"]["advantage_transform_fn"] == "hicra-transform"
+
+    def test_legacy_params_warn_and_are_ignored_with_custom_transform(self, monkeypatch):
+        """Legacy params are ignored when a transform is explicitly injected."""
+        import textpolicy.training.reasoning_stack as rs
+
+        calls = {}
+
+        def fake_create_lora_setup(**kwargs):
+            calls["create_lora_setup"] = kwargs
+            return object(), {"memory_savings_percent": 95.0}
+
+        def fail_build_gtpo_transform(**kwargs):  # pragma: no cover
+            raise AssertionError("build_gtpo_transform should not be called")
+
+        def fail_build_gtpo_hicra_transform(*args, **kwargs):  # pragma: no cover
+            raise AssertionError("build_gtpo_hicra_transform should not be called")
+
+        class FakeTrainer:
+            def __init__(self, **kwargs):
+                calls["trainer_kwargs"] = kwargs
+
+        monkeypatch.setattr(rs, "create_lora_setup", fake_create_lora_setup)
+        monkeypatch.setattr(rs, "build_gtpo_transform", fail_build_gtpo_transform)
+        monkeypatch.setattr(rs, "build_gtpo_hicra_transform", fail_build_gtpo_hicra_transform)
+        monkeypatch.setattr(rs, "Trainer", FakeTrainer)
+
+        injected = object()
+        with pytest.warns(UserWarning, match="ignored"):
+            rs.create_tinylora_reasoning_setup(
+                model=object(),
+                tokenizer=object(),
+                optimizer=object(),
+                advantage_transform_fn=injected,
+                hicra_alpha=0.7,
+            )
+
+        assert calls["trainer_kwargs"]["advantage_transform_fn"] is injected
