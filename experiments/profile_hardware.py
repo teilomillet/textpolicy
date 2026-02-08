@@ -491,6 +491,250 @@ def analyze_bottlenecks(results: List[ProbeResult]) -> List[BottleneckAnalysis]:
     return analyses
 
 
+# ── Analytical Memory Model ──────────────────────────────────────────────────
+
+
+@dataclass
+class ModelArchitecture:
+    """Architecture parameters extracted from model.args."""
+
+    num_layers: int
+    num_full_attn_layers: int
+    num_sliding_attn_layers: int
+    sliding_window: int
+    num_attention_heads: int
+    num_kv_heads: int
+    head_dim: int
+    hidden_size: int
+    intermediate_size: int
+    moe_intermediate_size: int
+    num_experts_per_tok: int
+    vocab_size: int
+    bytes_per_param: int = 2  # bfloat16
+
+
+def extract_architecture(model: Any) -> ModelArchitecture:
+    """Extract architecture parameters from a loaded MLX model.
+
+    Works with any model that has a `.args` attribute (all mlx_lm models).
+    Specifically calibrated for arcee-ai/Trinity-Nano-Preview (afmoe).
+    """
+    args = getattr(model, "args", None)
+    if args is None:
+        raise ValueError("Model has no .args attribute — cannot extract architecture")
+
+    layer_types = getattr(args, "layer_types", None)
+    if layer_types is None:
+        layer_types = ["full_attention"] * args.num_hidden_layers
+
+    num_full = sum(1 for lt in layer_types if "full" in lt)
+    num_sliding = sum(1 for lt in layer_types if "sliding" in lt)
+
+    return ModelArchitecture(
+        num_layers=args.num_hidden_layers,
+        num_full_attn_layers=num_full,
+        num_sliding_attn_layers=num_sliding,
+        sliding_window=getattr(args, "sliding_window", None) or 131072,
+        num_attention_heads=args.num_attention_heads,
+        num_kv_heads=getattr(
+            args, "num_key_value_heads", args.num_attention_heads
+        ),
+        head_dim=getattr(
+            args, "head_dim", args.hidden_size // args.num_attention_heads
+        ),
+        hidden_size=args.hidden_size,
+        intermediate_size=args.intermediate_size,
+        moe_intermediate_size=getattr(args, "moe_intermediate_size", 0),
+        num_experts_per_tok=getattr(args, "num_experts_per_tok", 0),
+        vocab_size=args.vocab_size,
+    )
+
+
+def _raw_activation_gb(
+    arch: ModelArchitecture, G: int, seq_len: int
+) -> float:
+    """Compute raw activation memory in GB from architecture (before calibration).
+
+    Memory components:
+    1. KV cache (generation): G × L × 2 × Hkv × d × seq × 2 bytes
+    2. Linear activations (forward + backward tape): ~6 × D × seq per layer
+    3. Attention scores (the O(n²) term):
+       - Full attention: G × H × seq² × 4 bytes (float32 softmax)
+       - Sliding window: G × H × seq × min(seq, W) × 4 bytes
+    """
+    L = arch.num_layers
+    H = arch.num_attention_heads
+    Hkv = arch.num_kv_heads
+    d = arch.head_dim
+    D = arch.hidden_size
+    W = arch.sliding_window
+
+    kv_cache = G * L * 2 * Hkv * d * seq_len * 2
+    linear = G * L * 6 * D * seq_len * 2
+    full_attn = G * H * seq_len * seq_len * 4 * arch.num_full_attn_layers
+    context = min(seq_len, W)
+    sliding_attn = G * H * seq_len * context * 4 * arch.num_sliding_attn_layers
+
+    return (kv_cache + linear + full_attn + sliding_attn) / (1024**3)
+
+
+def predict_peak_memory_gb(
+    arch: ModelArchitecture,
+    base_memory_gb: float,
+    G: int,
+    seq_len: int,
+    calibration_offset: float = 0.0,
+    calibration_scale: float = 1.0,
+) -> float:
+    """Predict peak memory for a (G, seq_len) configuration.
+
+    Formula:  peak = (base_memory + offset) + scale × raw_activation(G, seq_len)
+
+    The offset captures runtime overhead (MLX framework, gradient tape baseline).
+    The scale adjusts for unknowns in the activation formula.
+    The raw_activation formula captures the O(n²) attention scaling from
+    first principles.
+    """
+    return (
+        base_memory_gb
+        + calibration_offset
+        + calibration_scale * _raw_activation_gb(arch, G, seq_len)
+    )
+
+
+def calibrate_analytical_model(
+    arch: ModelArchitecture,
+    base_memory_gb: float,
+    results: List[ProbeResult],
+) -> Tuple[float, float]:
+    """Fit (base_offset, scale) from empirical probe measurements.
+
+    The formula is:  predicted = (base_memory + offset) + scale × raw_activation
+
+    The offset absorbs runtime overhead (MLX framework, Python, gradient tape
+    baseline, OS) that isn't captured by the model weight footprint.
+    The scale adjusts for unknowns in the activation formula.
+
+    With 2+ data points: fits both offset and scale via least-squares.
+    With 1 data point: fixes scale=1.0, solves for offset.
+    With 0 data points: returns defaults (offset=0, scale=1.0).
+    """
+    ok = [r for r in results if r.status == "OK"]
+    if not ok:
+        return 0.0, 1.0
+
+    raws = [_raw_activation_gb(arch, r.group_size, r.seq_length) for r in ok]
+    measured = [r.peak_memory_mb / 1024 - base_memory_gb for r in ok]
+
+    if len(ok) == 1:
+        # One data point: fix scale=1.0, solve for offset
+        return max(0.0, measured[0] - raws[0]), 1.0
+
+    # Least-squares fit: measured_i = offset + scale * raw_i
+    # This is standard linear regression: y = a + b*x
+    n = len(ok)
+    sum_x = sum(raws)
+    sum_y = sum(measured)
+    sum_xy = sum(x * y for x, y in zip(raws, measured))
+    sum_xx = sum(x * x for x in raws)
+
+    denom = n * sum_xx - sum_x * sum_x
+    if abs(denom) < 1e-12:
+        # Degenerate case: all same raw value
+        avg_measured = sum_y / n
+        return max(0.0, avg_measured - raws[0]), 1.0
+
+    scale = (n * sum_xy - sum_x * sum_y) / denom
+    offset = (sum_y - scale * sum_x) / n
+
+    # Clamp to physically meaningful range
+    scale = max(0.1, scale)
+    offset = max(0.0, offset)
+
+    return offset, scale
+
+
+@dataclass
+class OptimalConfig:
+    """A memory-constrained optimal configuration."""
+
+    label: str
+    group_size: int
+    max_seq_len: int
+    predicted_peak_gb: float
+    estimated_step_time_s: float
+    estimated_run_hours: float
+    strategy: str  # "quality", "balanced", "time"
+
+
+def find_optimal_configs(
+    arch: ModelArchitecture,
+    base_memory_gb: float,
+    memory_budget_gb: float,
+    calibration_offset: float,
+    calibration_scale: float,
+    a: Optional[float],
+    b: Optional[float],
+    reference_steps: int,
+) -> List[OptimalConfig]:
+    """Solve for optimal (G, seq_len) configs under the memory constraint.
+
+    Tests three strategies:
+    - Quality (G=16): more GRPO comparisons per group → better advantages
+    - Balanced (G=8): the GRPO default
+    - Time-optimal (G=4): faster steps, can fit longer sequences
+    """
+    configs: List[OptimalConfig] = []
+
+    for label, G, strategy in [
+        ("Quality-optimal (G=16)", 16, "quality"),
+        ("Balanced (G=8)", 8, "balanced"),
+        ("Time-optimal (G=4)", 4, "time"),
+    ]:
+        # Binary search for max seq_len fitting memory budget
+        lo, hi = 64, 16384
+        max_seq = lo
+        while lo <= hi:
+            mid = (lo + hi) // 2
+            pred = predict_peak_memory_gb(
+                arch, base_memory_gb, G, mid, calibration_offset, calibration_scale
+            )
+            if pred <= memory_budget_gb:
+                max_seq = mid
+                lo = mid + 1
+            else:
+                hi = mid - 1
+
+        pred_peak = predict_peak_memory_gb(
+            arch, base_memory_gb, G, max_seq, calibration_offset, calibration_scale
+        )
+
+        # Extrapolate step time from empirical scaling fit.
+        # Generation scales ~linearly with G; training scales with seq².
+        step_time = 0.0
+        if a is not None and b is not None:
+            train_time = extrapolate_time(a, b, max_seq)
+            # Generation time scales roughly linearly with G and seq_len
+            gen_time_est = 0.06 * G * max_seq / 256  # rough baseline
+            step_time = gen_time_est + train_time
+
+        run_hours = (step_time * reference_steps) / 3600 if step_time > 0 else 0.0
+
+        configs.append(
+            OptimalConfig(
+                label=label,
+                group_size=G,
+                max_seq_len=max_seq,
+                predicted_peak_gb=pred_peak,
+                estimated_step_time_s=step_time,
+                estimated_run_hours=run_hours,
+                strategy=strategy,
+            )
+        )
+
+    return configs
+
+
 # ── Recommendation engine ───────────────────────────────────────────────────
 
 
@@ -633,6 +877,10 @@ def format_human_output(
     reference_steps: int,
     bottleneck_analyses: List[BottleneckAnalysis],
     steps_per_probe: int = 2,
+    optimal_configs: Optional[List[OptimalConfig]] = None,
+    arch: Optional[ModelArchitecture] = None,
+    calibration_offset: Optional[float] = None,
+    calibration_scale: Optional[float] = None,
 ) -> str:
     """Format the profiling results as a human-readable report."""
     lines: List[str] = []
@@ -861,6 +1109,91 @@ def format_human_output(
             )
             lines.append(row)
 
+    # ── Analytical Memory Model ──────────────────────────────────
+    cal_off = calibration_offset or 0.0
+    cal_sc = calibration_scale or 1.0
+    if arch is not None and calibration_scale is not None:
+        lines.append("  " + "=" * 56)
+        lines.append("  ANALYTICAL MEMORY MODEL")
+        lines.append("  " + "=" * 56)
+        lines.append("")
+        lines.append(
+            f"  Architecture: {arch.num_layers} layers "
+            f"({arch.num_full_attn_layers} full attn + "
+            f"{arch.num_sliding_attn_layers} sliding, window={arch.sliding_window})"
+        )
+        lines.append(
+            f"  Attention: {arch.num_attention_heads} heads, "
+            f"{arch.num_kv_heads} KV heads (GQA "
+            f"{arch.num_attention_heads // max(1, arch.num_kv_heads)}:1), "
+            f"head_dim={arch.head_dim}"
+        )
+        if arch.num_experts_per_tok > 0:
+            lines.append(
+                f"  MoE: top-{arch.num_experts_per_tok}, "
+                f"expert FFN dim={arch.moe_intermediate_size}"
+            )
+        lines.append(
+            f"  Calibration: offset={cal_off:.2f} GB, scale={cal_sc:.3f}"
+        )
+        lines.append("")
+
+        # Predicted vs measured comparison
+        if ok_results:
+            lines.append("  Predicted vs Measured Memory:")
+            lines.append("  " + "-" * 50)
+            pred_header = (
+                f"  {'Seq Len':>8} | {'Predicted':>10} | {'Measured':>10} | {'Error':>8}"
+            )
+            lines.append(pred_header)
+            lines.append("  " + "-" * len(pred_header.strip()))
+            for r in ok_results:
+                pred = predict_peak_memory_gb(
+                    arch,
+                    model_memory_mb / 1024,
+                    r.group_size,
+                    r.seq_length,
+                    cal_off,
+                    cal_sc,
+                )
+                meas = r.peak_memory_mb / 1024
+                err = ((pred - meas) / meas * 100) if meas > 0 else 0
+                lines.append(
+                    f"  {r.seq_length:>8} | {pred:>8.1f} GB | {meas:>8.1f} GB | "
+                    f"{err:>+6.1f}%"
+                )
+            lines.append("")
+
+        # Optimal configs
+        if optimal_configs:
+            lines.append("  Memory-Constrained Optimal Configs:")
+            lines.append(
+                f"  (budget: {total_memory_gb * 0.9:.0f} GB = "
+                f"90% of {total_memory_gb:.0f} GB physical RAM)"
+            )
+            lines.append("  " + "-" * 50)
+            cfg_header = (
+                f"  {'Strategy':>25} | {'G':>3} | {'Max Seq':>8} | "
+                f"{'Peak Mem':>9} | {'Est. Run':>12}"
+            )
+            lines.append(cfg_header)
+            lines.append("  " + "-" * len(cfg_header.strip()))
+            for oc in optimal_configs:
+                if oc.estimated_run_hours > 0:
+                    if oc.estimated_run_hours < 1:
+                        run_str = f"{oc.estimated_run_hours * 60:.0f} min"
+                    else:
+                        run_str = f"{oc.estimated_run_hours:.1f} hrs"
+                else:
+                    run_str = "--"
+                lines.append(
+                    f"  {oc.label:>25} | {oc.group_size:>3} | "
+                    f"{oc.max_seq_len:>6}  | "
+                    f"{oc.predicted_peak_gb:>7.1f} GB | "
+                    f"{run_str:>12}"
+                )
+            lines.append("")
+
     # Recommendation
     lines.append("")
     lines.append("=" * 60)
@@ -909,9 +1242,13 @@ def build_json_output(
     recommendation: Recommendation,
     reference_steps: int,
     bottleneck_analyses: List[BottleneckAnalysis],
+    optimal_configs: Optional[List[OptimalConfig]] = None,
+    arch: Optional[ModelArchitecture] = None,
+    calibration_offset: Optional[float] = None,
+    calibration_scale: Optional[float] = None,
 ) -> Dict[str, Any]:
     """Build the machine-readable JSON output."""
-    return {
+    out: Dict[str, Any] = {
         "hardware": hw_info,
         "model": model_id,
         "model_memory_mb": model_memory_mb,
@@ -922,6 +1259,16 @@ def build_json_output(
         "recommendation": asdict(recommendation),
         "reference_steps": reference_steps,
     }
+    if arch is not None:
+        out["architecture"] = asdict(arch)
+    if calibration_offset is not None or calibration_scale is not None:
+        out["calibration"] = {
+            "offset_gb": calibration_offset,
+            "scale": calibration_scale,
+        }
+    if optimal_configs:
+        out["optimal_configs"] = [asdict(oc) for oc in optimal_configs]
+    return out
 
 
 # ── Main pipeline ────────────────────────────────────────────────────────────
@@ -1037,6 +1384,22 @@ def run_profile(config: ProfileConfig) -> None:
     a, b = fit_scaling_exponent(results)
     bottleneck_analyses = analyze_bottlenecks(results)
 
+    # 5b. Analytical memory model
+    print("\nBuilding analytical memory model...")
+    arch = extract_architecture(model)
+    base_memory_gb = model_memory_mb / 1024
+    cal_offset, cal_scale = calibrate_analytical_model(arch, base_memory_gb, results)
+    print(f"  Calibration: offset={cal_offset:.2f} GB, scale={cal_scale:.3f}")
+
+    # Use 90% of physical RAM as budget (leave room for OS + other processes)
+    memory_budget_gb = total_memory_gb * 0.9
+    optimal_configs = find_optimal_configs(
+        arch, base_memory_gb, memory_budget_gb, cal_offset, cal_scale,
+        a, b, config.reference_run_steps,
+    )
+    for oc in optimal_configs:
+        print(f"  {oc.label}: max {oc.max_seq_len} tokens")
+
     # 6. Recommendation
     recommendation = build_recommendation(
         results, total_memory_gb, config.reference_run_steps, bottleneck_analyses
@@ -1055,6 +1418,10 @@ def run_profile(config: ProfileConfig) -> None:
             recommendation=recommendation,
             reference_steps=config.reference_run_steps,
             bottleneck_analyses=bottleneck_analyses,
+            optimal_configs=optimal_configs,
+            arch=arch,
+            calibration_offset=cal_offset,
+            calibration_scale=cal_scale,
         )
         json_str = json.dumps(output, indent=2)
 
@@ -1079,6 +1446,10 @@ def run_profile(config: ProfileConfig) -> None:
             reference_steps=config.reference_run_steps,
             bottleneck_analyses=bottleneck_analyses,
             steps_per_probe=config.steps_per_probe,
+            optimal_configs=optimal_configs,
+            arch=arch,
+            calibration_offset=cal_offset,
+            calibration_scale=cal_scale,
         )
         print(report)
 
