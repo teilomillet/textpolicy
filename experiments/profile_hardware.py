@@ -663,7 +663,7 @@ def calibrate_analytical_model(
     arch: ModelArchitecture,
     base_memory_gb: float,
     results: List[ProbeResult],
-) -> Tuple[float, float]:
+) -> Tuple[float, float, Dict[str, Any]]:
     """Fit (base_offset, scale) from empirical probe measurements.
 
     The formula is:  predicted = (base_memory + offset) + scale × raw_activation
@@ -672,20 +672,56 @@ def calibrate_analytical_model(
     baseline, OS) that isn't captured by the model weight footprint.
     The scale adjusts for unknowns in the activation formula.
 
-    With 2+ data points: fits both offset and scale via least-squares.
+    With 3+ data points: fits offset+scale via least-squares.
+    With <=2 points or poor fit: falls back to a conservative calibration.
     With 1 data point: fixes scale=1.0, solves for offset.
     With 0 data points: returns defaults (offset=0, scale=1.0).
     """
+    def _fit_errors(
+        offset_gb: float, scale_value: float
+    ) -> Tuple[float, float, float]:
+        """Return (mape_pct, max_abs_error_gb, max_underpredict_gb)."""
+        if not raws:
+            return 0.0, 0.0, 0.0
+        preds = [offset_gb + scale_value * x for x in raws]
+        abs_err = [abs(p - m) for p, m in zip(preds, measured)]
+        under = [max(0.0, m - p) for p, m in zip(preds, measured)]
+        mape_terms = []
+        for p, m in zip(preds, measured):
+            # Stabilize denominator for tiny values (~<256MB activation delta).
+            denom = max(abs(m), 0.25)
+            mape_terms.append(abs(p - m) / denom)
+        mape_pct = 100.0 * sum(mape_terms) / len(mape_terms)
+        return mape_pct, max(abs_err), max(under)
+
     ok = [r for r in results if r.status == "OK"]
     if not ok:
-        return 0.0, 1.0
+        return 0.0, 1.0, {
+            "method": "default_no_data",
+            "fallback_used": True,
+            "num_points": 0,
+            "fit_mape_pct": 0.0,
+            "max_abs_error_gb": 0.0,
+            "max_underpredict_gb": 0.0,
+            "reasons": ["No successful probes available for calibration."],
+        }
 
     raws = [_raw_activation_gb(arch, r.group_size, r.seq_length) for r in ok]
     measured = [r.peak_memory_mb / 1024 - base_memory_gb for r in ok]
 
     if len(ok) == 1:
         # One data point: fix scale=1.0, solve for offset
-        return max(0.0, measured[0] - raws[0]), 1.0
+        offset = max(0.0, measured[0] - raws[0])
+        mape_pct, max_abs_err, max_under = _fit_errors(offset, 1.0)
+        return offset, 1.0, {
+            "method": "single_point",
+            "fallback_used": True,
+            "num_points": 1,
+            "fit_mape_pct": mape_pct,
+            "max_abs_error_gb": max_abs_err,
+            "max_underpredict_gb": max_under,
+            "reasons": ["Only one successful probe; using conservative single-point fit."],
+        }
 
     # Least-squares fit: measured_i = offset + scale * raw_i
     # This is standard linear regression: y = a + b*x
@@ -699,7 +735,17 @@ def calibrate_analytical_model(
     if abs(denom) < 1e-12:
         # Degenerate case: all same raw value
         avg_measured = sum_y / n
-        return max(0.0, avg_measured - raws[0]), 1.0
+        offset = max(0.0, avg_measured - raws[0])
+        mape_pct, max_abs_err, max_under = _fit_errors(offset, 1.0)
+        return offset, 1.0, {
+            "method": "degenerate_single_scale",
+            "fallback_used": True,
+            "num_points": n,
+            "fit_mape_pct": mape_pct,
+            "max_abs_error_gb": max_abs_err,
+            "max_underpredict_gb": max_under,
+            "reasons": ["Degenerate regression (insufficient x-variance); using scale=1."],
+        }
 
     scale = (n * sum_xy - sum_x * sum_y) / denom
     offset = (sum_y - scale * sum_x) / n
@@ -708,7 +754,81 @@ def calibrate_analytical_model(
     scale = max(0.1, scale)
     offset = max(0.0, offset)
 
-    return offset, scale
+    mape_pct, max_abs_err, max_under = _fit_errors(offset, scale)
+    fallback_reasons: List[str] = []
+    if n < 3:
+        fallback_reasons.append("Fewer than 3 successful probes.")
+    if mape_pct > 15.0:
+        fallback_reasons.append(f"High fit error ({mape_pct:.1f}% MAPE).")
+    if max_under > 0.5:
+        fallback_reasons.append(
+            f"Model underpredicts observed memory by up to {max_under:.2f} GB."
+        )
+
+    if fallback_reasons:
+        # Conservative fallback:
+        # 1) keep slope at least 1.0 to avoid shallow extrapolation
+        # 2) raise offset so predictions are >= all observed points
+        # 3) add extra safety margin for out-of-sample uncertainty
+        conservative_scale = max(1.0, scale)
+        conservative_offset = max(
+            0.0,
+            max(m - conservative_scale * x for x, m in zip(raws, measured)),
+        )
+        margin_gb = max(0.25, 0.05 * max(0.0, max(measured)))
+        conservative_offset += margin_gb
+        cons_mape, cons_abs, cons_under = _fit_errors(
+            conservative_offset, conservative_scale
+        )
+        return conservative_offset, conservative_scale, {
+            "method": "conservative_fallback",
+            "fallback_used": True,
+            "num_points": n,
+            "fit_mape_pct": cons_mape,
+            "max_abs_error_gb": cons_abs,
+            "max_underpredict_gb": cons_under,
+            "base_fit_mape_pct": mape_pct,
+            "base_max_underpredict_gb": max_under,
+            "reasons": fallback_reasons,
+        }
+
+    return offset, scale, {
+        "method": "least_squares",
+        "fallback_used": False,
+        "num_points": n,
+        "fit_mape_pct": mape_pct,
+        "max_abs_error_gb": max_abs_err,
+        "max_underpredict_gb": max_under,
+        "reasons": [],
+    }
+
+
+def _build_empirical_oom_boundaries(results: List[ProbeResult]) -> Dict[int, int]:
+    """Return earliest OOM seq_length per observed group size."""
+    boundaries: Dict[int, int] = {}
+    for r in results:
+        if r.status != "OOM":
+            continue
+        prev = boundaries.get(r.group_size)
+        if prev is None or r.seq_length < prev:
+            boundaries[r.group_size] = r.seq_length
+    return boundaries
+
+
+def _empirical_seq_cap_for_group(
+    group_size: int, oom_boundaries: Dict[int, int]
+) -> Optional[int]:
+    """Infer a safe seq cap for a target group size from observed OOM boundaries.
+
+    If we observed OOM at group size G0 and target G >= G0, enforce seq_len < OOM_G0.
+    """
+    cap: Optional[int] = None
+    for observed_g, observed_oom_seq in oom_boundaries.items():
+        if group_size < observed_g:
+            continue
+        candidate = max(1, observed_oom_seq - 1)
+        cap = candidate if cap is None else min(cap, candidate)
+    return cap
 
 
 @dataclass
@@ -733,6 +853,7 @@ def find_optimal_configs(
     a: Optional[float],
     b: Optional[float],
     reference_steps: int,
+    oom_boundaries: Optional[Dict[int, int]] = None,
 ) -> List[OptimalConfig]:
     """Solve for optimal (G, seq_len) configs under the memory constraint.
 
@@ -750,7 +871,11 @@ def find_optimal_configs(
     ]:
         # Binary search for max seq_len fitting memory budget
         lo, hi = 64, 16384
-        max_seq = lo
+        max_seq = 0
+        if oom_boundaries:
+            cap = _empirical_seq_cap_for_group(G, oom_boundaries)
+            if cap is not None:
+                hi = min(hi, cap)
         while lo <= hi:
             mid = (lo + hi) // 2
             pred = predict_peak_memory_gb(
@@ -762,14 +887,17 @@ def find_optimal_configs(
             else:
                 hi = mid - 1
 
-        pred_peak = predict_peak_memory_gb(
-            arch, base_memory_gb, G, max_seq, calibration_offset, calibration_scale
-        )
+        if max_seq > 0:
+            pred_peak = predict_peak_memory_gb(
+                arch, base_memory_gb, G, max_seq, calibration_offset, calibration_scale
+            )
+        else:
+            pred_peak = base_memory_gb + calibration_offset
 
         # Extrapolate step time from empirical scaling fit.
         # Generation scales ~linearly with G; training scales with seq².
         step_time = 0.0
-        if a is not None and b is not None:
+        if max_seq > 0 and a is not None and b is not None:
             train_time = extrapolate_time(a, b, max_seq)
             # Generation time scales roughly linearly with G and seq_len
             gen_time_est = 0.06 * G * max_seq / 256  # rough baseline
@@ -938,6 +1066,8 @@ def format_human_output(
     arch: Optional[ModelArchitecture] = None,
     calibration_offset: Optional[float] = None,
     calibration_scale: Optional[float] = None,
+    calibration_diagnostics: Optional[Dict[str, Any]] = None,
+    oom_boundaries: Optional[Dict[int, int]] = None,
 ) -> str:
     """Format the profiling results as a human-readable report."""
     lines: List[str] = []
@@ -1138,20 +1268,25 @@ def format_human_output(
             t = extrapolate_time(a, b, seq_len)
             run_hours = (t * reference_steps) / 3600
             mem_est = extrapolate_memory(results, seq_len)
-            feasible = "YES"
-
-            failed_at = [r for r in results if r.seq_length <= seq_len and r.status != "OK"]
-            if failed_at:
-                feasible = "NO"
-            elif mem_est and mem_est > total_memory_gb * 1024:
-                feasible = f"NO (est. >{total_memory_gb:.0f}GB)"
-            elif run_hours > 48:
-                feasible = "NO (>48h)"
-
-            measured = [r for r in ok_results if r.seq_length == seq_len]
-            if measured:
-                t = measured[0].train_time_s
+            measured_ok = next((r for r in ok_results if r.seq_length == seq_len), None)
+            if measured_ok is not None:
+                t = measured_ok.train_time_s
                 run_hours = (t * reference_steps) / 3600
+
+            if measured_ok is not None:
+                # Exact successful measurement at this target is authoritative.
+                feasible = "YES (measured)"
+            else:
+                feasible = "YES"
+                failed_at = [
+                    r for r in results if r.seq_length <= seq_len and r.status != "OK"
+                ]
+                if failed_at:
+                    feasible = "NO"
+                elif mem_est is not None and mem_est > total_memory_gb * 1024:
+                    feasible = f"NO (est. >{total_memory_gb:.0f}GB)"
+                elif run_hours > 48:
+                    feasible = "NO (>48h)"
 
             if run_hours < 1:
                 time_str = f"{run_hours * 60:.0f} min"
@@ -1193,6 +1328,21 @@ def format_human_output(
         lines.append(
             f"  Calibration: offset={cal_off:.2f} GB, scale={cal_sc:.3f}"
         )
+        if calibration_diagnostics:
+            method = str(calibration_diagnostics.get("method", "unknown"))
+            fit_mape_pct = calibration_diagnostics.get("fit_mape_pct")
+            lines.append(f"  Calibration mode: {method}")
+            if isinstance(fit_mape_pct, (int, float)):
+                lines.append(f"  Fit error (MAPE): {fit_mape_pct:.1f}%")
+            reasons = calibration_diagnostics.get("reasons", [])
+            if reasons:
+                lines.append("  Guardrail triggers:")
+                for reason in reasons:
+                    lines.append(f"    - {reason}")
+        if oom_boundaries:
+            lines.append("  Empirical OOM boundaries:")
+            for g, seq in sorted(oom_boundaries.items()):
+                lines.append(f"    - G={g}: observed OOM at seq_length={seq}")
         lines.append("")
 
         # Predicted vs measured comparison
@@ -1303,6 +1453,8 @@ def build_json_output(
     arch: Optional[ModelArchitecture] = None,
     calibration_offset: Optional[float] = None,
     calibration_scale: Optional[float] = None,
+    calibration_diagnostics: Optional[Dict[str, Any]] = None,
+    oom_boundaries: Optional[Dict[int, int]] = None,
 ) -> Dict[str, Any]:
     """Build the machine-readable JSON output."""
     out: Dict[str, Any] = {
@@ -1323,6 +1475,10 @@ def build_json_output(
             "offset_gb": calibration_offset,
             "scale": calibration_scale,
         }
+    if calibration_diagnostics is not None:
+        out["calibration_diagnostics"] = calibration_diagnostics
+    if oom_boundaries:
+        out["empirical_oom_boundaries"] = oom_boundaries
     if optimal_configs:
         out["optimal_configs"] = [asdict(oc) for oc in optimal_configs]
     return out
@@ -1358,6 +1514,9 @@ def run_profile(config: ProfileConfig) -> None:
             "lora_scale": 8.0,
             "lora_dropout": 0.0,
         },
+        # Profiling should measure compute/memory behavior, not disk writes.
+        # Disable auto-reload to avoid per-step adapter save I/O.
+        auto_reload=False,
         compile_training=False,
         profile=True,
         max_grad_norm=0.5,
@@ -1447,14 +1606,32 @@ def run_profile(config: ProfileConfig) -> None:
     print("\nBuilding analytical memory model...")
     arch = extract_architecture(model)
     base_memory_gb = model_memory_mb / 1024
-    cal_offset, cal_scale = calibrate_analytical_model(arch, base_memory_gb, results)
-    print(f"  Calibration: offset={cal_offset:.2f} GB, scale={cal_scale:.3f}")
+    cal_offset, cal_scale, cal_diag = calibrate_analytical_model(
+        arch, base_memory_gb, results
+    )
+    print(
+        f"  Calibration: offset={cal_offset:.2f} GB, scale={cal_scale:.3f} "
+        f"({cal_diag.get('method', 'unknown')})"
+    )
+    fit_mape_pct = cal_diag.get("fit_mape_pct")
+    if isinstance(fit_mape_pct, (int, float)):
+        print(f"  Fit error (MAPE): {fit_mape_pct:.1f}%")
+    reasons = cal_diag.get("reasons", [])
+    if reasons:
+        print("  Guardrail triggers:")
+        for reason in reasons:
+            print(f"    - {reason}")
 
     # Use 90% of physical RAM as budget (leave room for OS + other processes)
     memory_budget_gb = total_memory_gb * 0.9
+    oom_boundaries = _build_empirical_oom_boundaries(results)
+    if oom_boundaries:
+        print("  Applying empirical OOM boundaries:")
+        for g, seq in sorted(oom_boundaries.items()):
+            print(f"    - G={g}: seq_length < {seq}")
     optimal_configs = find_optimal_configs(
         arch, base_memory_gb, memory_budget_gb, cal_offset, cal_scale,
-        a, b, config.reference_run_steps,
+        a, b, config.reference_run_steps, oom_boundaries=oom_boundaries,
     )
     for oc in optimal_configs:
         print(f"  {oc.label}: max {oc.max_seq_len} tokens")
@@ -1481,6 +1658,8 @@ def run_profile(config: ProfileConfig) -> None:
             arch=arch,
             calibration_offset=cal_offset,
             calibration_scale=cal_scale,
+            calibration_diagnostics=cal_diag,
+            oom_boundaries=oom_boundaries,
         )
         json_str = json.dumps(output, indent=2)
 
@@ -1509,6 +1688,8 @@ def run_profile(config: ProfileConfig) -> None:
             arch=arch,
             calibration_offset=cal_offset,
             calibration_scale=cal_scale,
+            calibration_diagnostics=cal_diag,
+            oom_boundaries=oom_boundaries,
         )
         print(report)
 
