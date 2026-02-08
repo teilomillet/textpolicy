@@ -27,6 +27,7 @@ from textpolicy.algorithms.grpo import (
 )
 from textpolicy.algorithms.hicra import (
     apply_hicra_amplification,
+    boost_entropy_with_planning,
     identify_planning_tokens,
 )
 from textpolicy.generation.lora import create_lora_setup
@@ -243,6 +244,12 @@ class _GTPOFaithfulTransform:
     completely replacing the standard GRPO advantages.  All operations are
     compile-safe (no ``mx.eval`` or ``.item()``).
 
+    Optionally fuses HICRA planning-token amplification by boosting the
+    entropy array before GTPO processes it (via ``boost_entropy_with_planning``).
+    When ``hicra_gamma > 0``, planning tokens receive artificially higher
+    entropy so GTPO's O+/O- machinery naturally assigns them more credit
+    (O+) or less blame (O-).
+
     The PPO clipped objective (Eq. 7) is handled by the Trainer's ``loss_fn``
     (e.g. ``grpo.policy_loss``).
     """
@@ -254,11 +261,49 @@ class _GTPOFaithfulTransform:
         alpha_2: float = 0.1,
         reward_threshold: float = 0.5,
         eps: float = 1e-8,
+        tokenizer: Any = None,
+        strategic_grams: Optional[List[str]] = None,
+        hicra_gamma: float = 0.0,
     ) -> None:
         self.alpha_1 = alpha_1
         self.alpha_2 = alpha_2
         self.reward_threshold = reward_threshold
         self.eps = eps
+        self.tokenizer = tokenizer
+        self.grams = (
+            list(strategic_grams)
+            if strategic_grams is not None
+            else (list(_DEFAULT_STRATEGIC_GRAMS) if tokenizer is not None else None)
+        )
+        self.hicra_gamma = hicra_gamma
+
+    def _flatten_actions(self, batch_data: Dict[str, Any]) -> mx.array:
+        episode_lengths = batch_data.get("episode_lengths")
+        actions = batch_data.get("act")
+        if actions is None:
+            raise ValueError(
+                "batch_data must include 'act' for HICRA token matching."
+            )
+        return _flatten_padded_token_rows(
+            actions,
+            episode_lengths,
+            field_name="act",
+        )
+
+    def prepare_batch(self, batch_data: Dict[str, Any]) -> None:
+        """Eagerly compute planning_mask for compile-safe training.
+
+        Called by the Trainer before ``mx.compile``-traced execution.
+        Short-circuits when HICRA fusion is disabled (``hicra_gamma == 0``).
+        """
+        if self.hicra_gamma == 0.0 or self.tokenizer is None or not self.grams:
+            return
+        if batch_data.get("planning_mask") is not None:
+            return
+        token_ids = self._flatten_actions(batch_data)
+        batch_data["planning_mask"] = identify_planning_tokens(
+            token_ids, self.tokenizer, self.grams
+        )
 
     def __call__(self, advantages: mx.array, batch_data: Dict[str, Any]) -> mx.array:
         episode_lengths = batch_data.get("episode_lengths")
@@ -289,6 +334,19 @@ class _GTPOFaithfulTransform:
             field_name="token_entropies",
         )
 
+        # Optional HICRA fusion: boost entropies at planning positions
+        if self.hicra_gamma > 0.0 and self.tokenizer is not None:
+            planning_mask = batch_data.get("planning_mask")
+            if planning_mask is not None:
+                planning_mask = _flatten_padded_token_rows(
+                    planning_mask,
+                    episode_lengths,
+                    field_name="planning_mask",
+                )
+            flat_entropies = boost_entropy_with_planning(
+                flat_entropies, planning_mask, gamma=self.hicra_gamma,
+            ) if planning_mask is not None else flat_entropies
+
         # Eq. 3 + Eq. 5: entropy-shaped token-level rewards
         shaped_rewards, is_positive = compute_gtpo_shaped_rewards(
             rewards,
@@ -314,6 +372,9 @@ def build_gtpo_faithful_transform(
     alpha_2: float = 0.1,
     reward_threshold: float = 0.5,
     eps: float = 1e-8,
+    tokenizer: Any = None,
+    strategic_grams: Optional[List[str]] = None,
+    hicra_gamma: float = 0.0,
 ) -> Callable[[mx.array, Dict[str, Any]], mx.array]:
     """
     Build a Trainer-compatible transform for paper-faithful GTPO.
@@ -325,10 +386,16 @@ def build_gtpo_faithful_transform(
     PPO clipping (Eq. 7) is handled by the Trainer's ``loss_fn`` — use
     ``functools.partial(grpo.policy_loss, clip_ratio=0.2)`` or similar.
 
+    **HICRA Fusion (optional):**  When ``hicra_gamma > 0`` and a tokenizer
+    is provided, the transform boosts entropy at planning token positions
+    *before* GTPO processes it.  GTPO's O+/O- machinery then naturally
+    assigns planning tokens more credit (O+) or less blame (O-).
+
     Expected batch_data keys (auto-populated by the Trainer):
     - ``'rewards'``: episode-level rewards [num_episodes]
     - ``'token_entropies'``: per-token entropy [total_tokens] (auto-computed)
     - ``'episode_lengths'``: token count per episode
+    - ``'act'``: token IDs (required when ``hicra_gamma > 0``)
 
     Example::
 
@@ -343,6 +410,7 @@ def build_gtpo_faithful_transform(
             optimizer=optimizer,
             advantage_transform_fn=build_gtpo_faithful_transform(
                 alpha_1=1.0, alpha_2=0.1,
+                tokenizer=tokenizer, hicra_gamma=0.3,
             ),
         )
 
@@ -351,20 +419,36 @@ def build_gtpo_faithful_transform(
         alpha_2: Entropy-shaped weight (default 0.1).
         reward_threshold: Threshold for O+/O- partition (default 0.5).
         eps: Numerical stability constant (Remark 2.1).
+        tokenizer: HF-compatible tokenizer (required when ``hicra_gamma > 0``).
+        strategic_grams: Planning phrases for HICRA (defaults to built-in list
+                        when tokenizer is provided).
+        hicra_gamma: Entropy boost factor for HICRA fusion (default 0.0 = disabled).
 
     Returns:
         A callable ``(advantages, batch_data) -> advantages``.
+
+    Raises:
+        ValueError: If ``hicra_gamma < 0``, or ``hicra_gamma > 0`` without tokenizer.
     """
     if alpha_1 < 0.0:
         raise ValueError(f"alpha_1 must be >= 0, got {alpha_1}.")
     if alpha_2 < 0.0:
         raise ValueError(f"alpha_2 must be >= 0, got {alpha_2}.")
+    if hicra_gamma < 0.0:
+        raise ValueError(f"hicra_gamma must be >= 0, got {hicra_gamma}.")
+    if hicra_gamma > 0.0 and tokenizer is None:
+        raise ValueError(
+            "hicra_gamma > 0 requires a tokenizer for planning token identification."
+        )
 
     return _GTPOFaithfulTransform(
         alpha_1=alpha_1,
         alpha_2=alpha_2,
         reward_threshold=reward_threshold,
         eps=eps,
+        tokenizer=tokenizer,
+        strategic_grams=strategic_grams,
+        hicra_gamma=hicra_gamma,
     )
 
 

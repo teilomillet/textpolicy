@@ -240,6 +240,67 @@ def apply_hicra_amplification(
 
 
 # ---------------------------------------------------------------------------
+# 2b. Entropy boosting — inject planning signal into entropy for GTPO fusion
+# ---------------------------------------------------------------------------
+
+def boost_entropy_with_planning(
+    token_entropies: mx.array,
+    planning_mask: mx.array,
+    gamma: float = 0.3,
+) -> mx.array:
+    """
+    Boost token entropies at planning positions for GTPO fusion.
+
+    Instead of applying HICRA as a post-processing step on advantages,
+    this function injects the planning signal *upstream* into the entropy
+    array.  When GTPO's O+/O- machinery (Eq. 3, 5) processes the boosted
+    entropies, planning tokens naturally receive:
+
+    - **More credit in O+** (Eq. 3): higher H → larger ``H_i,t / ΣH`` share
+    - **Less blame in O-** (Eq. 5): higher H → smaller ``1/H`` penalty
+
+    Formula:
+        H_boosted(t) = H(t) + gamma * planning_mask(t) * mean(H)
+
+    The mean(H) scaling makes the boost magnitude adapt to the entropy
+    distribution of the current batch, avoiding fragile absolute thresholds.
+
+    The planning mask is detached via ``mx.stop_gradient`` to prevent the
+    model from gaming entropy through token content (same rationale as
+    Remark 2.5 in the GTPO paper).
+
+    All operations are pure MLX and ``mx.compile``-safe.
+
+    Args:
+        token_entropies: Flat 1D per-token entropy [total_tokens].
+        planning_mask: Binary mask [total_tokens], float32 (0.0 or 1.0).
+                      Must be the same shape as *token_entropies*.
+        gamma: Boost factor (default 0.3).  0 disables boosting.
+
+    Returns:
+        Boosted entropies [total_tokens], same shape as input.
+
+    Raises:
+        ValueError: If shapes don't match.
+    """
+    if token_entropies.shape != planning_mask.shape:
+        raise ValueError(
+            f"Shape mismatch: token_entropies {token_entropies.shape} vs "
+            f"planning_mask {planning_mask.shape}. Both must match."
+        )
+
+    if gamma == 0.0:
+        return token_entropies
+
+    # Detach mask from gradient to prevent gaming (Remark 2.5)
+    mask = mx.stop_gradient(planning_mask)
+
+    # H_boosted(t) = H(t) + gamma * mask(t) * mean(H)
+    mean_entropy = mx.mean(token_entropies)
+    return token_entropies + gamma * mask * mean_entropy
+
+
+# ---------------------------------------------------------------------------
 # 3. Convenience composition
 # ---------------------------------------------------------------------------
 

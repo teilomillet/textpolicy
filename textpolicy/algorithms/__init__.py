@@ -55,6 +55,7 @@ from .gspo import (
 from .hicra import (
     identify_planning_tokens,
     apply_hicra_amplification,
+    boost_entropy_with_planning,
     compute_advantages_hicra,
 )
 
@@ -102,5 +103,6 @@ __all__ = [
     # HICRA: Planning token amplification (Issue #11)
     "identify_planning_tokens",
     "apply_hicra_amplification",
+    "boost_entropy_with_planning",
     "compute_advantages_hicra",
 ]
