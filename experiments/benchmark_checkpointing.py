@@ -40,7 +40,7 @@ from textpolicy.tasks.countdown import (
 )
 from textpolicy.algorithms.grpo import compute_advantages, policy_loss
 from textpolicy.generation.lora import create_lora_setup
-from textpolicy.training import Trainer
+from textpolicy.training import Trainer, build_gtpo_transform
 from textpolicy.training.gradient_checkpointing import _get_layers
 from textpolicy.utils.memory import clear_memory, get_memory_stats
 
@@ -104,12 +104,16 @@ def run_single_probe(
         auto_reload=False,
     )
 
-    # 2. Trainer (no GTPO transform needed for checkpointing benchmarks)
+    # 2. GTPO transform (matches countdown reasoning workload for representative benchmarks)
+    transform = build_gtpo_transform(tokenizer=tokenizer, hicra_gamma=0.3)
+
+    # 3. Trainer
     trainer = Trainer(
         model=lora_model,
         advantage_fn=compute_advantages,
         loss_fn=policy_loss,
         optimizer=optimizer,
+        advantage_transform_fn=transform,
         compile_training=False,
         gradient_checkpointing=gradient_checkpointing,
         profile=True,

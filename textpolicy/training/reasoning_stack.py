@@ -12,20 +12,27 @@ LoRA setup + transform + Trainer directly (see ``experiments/`` for examples).
 
 from __future__ import annotations
 
-from typing import Any, Callable, Dict, List, Optional, Sequence
+import warnings
+from typing import Any, Callable, Dict, List, Optional, Sequence, Tuple, Union
 
 import mlx.core as mx  # type: ignore
+import mlx.nn as nn  # type: ignore
+import mlx.optimizers as optim  # type: ignore
 
 from textpolicy.algorithms.grpo import (
     apply_entropy_weighting,
+    compute_advantages,
     compute_gtpo_shaped_rewards,
     normalize_gtpo_advantages,
+    policy_loss,
 )
 from textpolicy.algorithms.hicra import (
     apply_hicra_amplification,
     boost_entropy_with_planning,
     identify_planning_tokens,
 )
+from textpolicy.generation.lora import create_lora_setup
+from textpolicy.training.trainer import Trainer
 
 
 _DEFAULT_STRATEGIC_GRAMS = [
@@ -452,5 +459,94 @@ def build_gtpo_transform(
         strategic_grams=strategic_grams,
         hicra_gamma=hicra_gamma,
     )
+
+
+# ---------------------------------------------------------------------------
+# Deprecated convenience wrapper — will be removed in a future release.
+# ---------------------------------------------------------------------------
+
+
+def create_tinylora_reasoning_setup(
+    model: nn.Module,
+    tokenizer: Any,
+    optimizer: optim.Optimizer,
+    *,
+    lora_config: Optional[Dict[str, Any]] = None,
+    advantage_transform_fn: Optional[
+        Callable[[mx.array, Dict[str, Any]], mx.array]
+    ] = None,
+    strategic_grams: Optional[List[str]] = None,
+    alpha_1: float = 1.0,
+    alpha_2: float = 0.1,
+    reward_threshold: float = 0.5,
+    hicra_gamma: float = 0.3,
+    compile_training: Union[bool, str] = "auto",
+    gradient_checkpointing: Union[bool, int] = False,
+    micro_batch_size: Optional[int] = None,
+    auto_reload: bool = True,
+    adapter_save_path: str = "./lora_adapters.safetensors",
+    max_grad_norm: Optional[float] = 0.5,
+    **trainer_kwargs: Any,
+) -> Tuple[Trainer, Dict[str, float]]:
+    """Create a Trainer wired for LoRA — **deprecated**, will be removed.
+
+    Prefer composing the three steps directly::
+
+        lora_model, stats = create_lora_setup(model, lora_config=...)
+        transform = build_gtpo_transform(...)
+        trainer = Trainer(model=lora_model, ..., advantage_transform_fn=transform)
+
+    See ``experiments/countdown_reasoning_lora.py`` for the full pattern.
+    """
+    warnings.warn(
+        "create_tinylora_reasoning_setup() is deprecated and will be removed "
+        "in a future release. Compose the steps directly: "
+        "create_lora_setup() → build_gtpo_transform() → Trainer(). "
+        "See experiments/countdown_reasoning_lora.py for the pattern.",
+        DeprecationWarning,
+        stacklevel=2,
+    )
+
+    _DEFAULT_LORA_CONFIG: Dict[str, Any] = {
+        "lora_layers": 4,
+        "lora_rank": 2,
+        "lora_scale": 8.0,
+        "lora_dropout": 0.0,
+    }
+
+    merged_lora_config = dict(_DEFAULT_LORA_CONFIG)
+    if lora_config:
+        merged_lora_config.update(lora_config)
+
+    lora_model, memory_stats = create_lora_setup(
+        model=model,
+        lora_config=merged_lora_config,
+        auto_reload=auto_reload,
+        adapter_save_path=adapter_save_path,
+    )
+
+    if advantage_transform_fn is None:
+        advantage_transform_fn = build_gtpo_transform(
+            alpha_1=alpha_1,
+            alpha_2=alpha_2,
+            reward_threshold=reward_threshold,
+            tokenizer=tokenizer,
+            strategic_grams=strategic_grams,
+            hicra_gamma=hicra_gamma,
+        )
+
+    trainer = Trainer(
+        model=lora_model,
+        advantage_fn=compute_advantages,
+        loss_fn=policy_loss,
+        optimizer=optimizer,
+        max_grad_norm=max_grad_norm,
+        compile_training=compile_training,
+        gradient_checkpointing=gradient_checkpointing,
+        micro_batch_size=micro_batch_size,
+        advantage_transform_fn=advantage_transform_fn,
+        **trainer_kwargs,
+    )
+    return trainer, memory_stats
 
 

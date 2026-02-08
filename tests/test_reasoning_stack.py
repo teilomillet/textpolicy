@@ -272,6 +272,11 @@ class TestReasoningStackPublicAPI:
         from textpolicy.training import build_gtpo_hicra_transform
         assert callable(build_gtpo_hicra_transform)
 
+    def test_create_tinylora_importable_but_deprecated(self):
+        """create_tinylora_reasoning_setup must still be importable (deprecated)."""
+        from textpolicy.training import create_tinylora_reasoning_setup
+        assert callable(create_tinylora_reasoning_setup)
+
     def test_build_gtpo_transform_importable(self):
         """build_gtpo_transform (canonical GTPO builder) must be importable."""
         from textpolicy.training import build_gtpo_transform

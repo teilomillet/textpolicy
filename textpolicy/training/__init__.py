@@ -43,12 +43,14 @@ try:
     from .reasoning_stack import (
         build_gtpo_hicra_transform,
         build_gtpo_transform,
+        create_tinylora_reasoning_setup,
     )
 
     __all__.extend(
         [
             "build_gtpo_hicra_transform",
             "build_gtpo_transform",
+            "create_tinylora_reasoning_setup",
         ]
     )
 except Exception:
