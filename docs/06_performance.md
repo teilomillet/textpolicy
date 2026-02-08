@@ -56,6 +56,18 @@ trainer = Trainer(
 )
 ```
 
+### Sequence Packing (Length-Sorted Trimming)
+
+When `micro_batch_size` is set, episodes are automatically sorted by total
+sequence length so that similarly-sized episodes are processed together.
+Each micro-batch chunk is then trimmed to its local maximum length instead
+of the global maximum, reducing wasted compute on padding tokens.
+
+This is most effective when episode lengths vary widely (e.g., 50-500 tokens).
+Causal attention is O(n^2), so halving sequence length reduces attention
+compute by ~4x. Sorting is enabled by default and has negligible overhead
+(Python list sort on episode count).
+
 ### Combined Usage
 
 The two features compose naturally — gradient checkpointing reduces per-layer

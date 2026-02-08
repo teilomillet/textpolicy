@@ -11,6 +11,7 @@ This trainer achieves maximum efficiency through:
 """
 
 import logging
+import re
 from typing import Callable, Dict, Any, Optional, Union, List, cast
 
 logger = logging.getLogger(__name__)
@@ -21,6 +22,15 @@ from textpolicy.buffer import Buffer
 from textpolicy.rollout import RolloutCoordinator
 from textpolicy.utils.timing import Timer
 from .metrics import TrainingMetrics
+
+
+def _mlx_version_at_least(version: str, minimum: tuple[int, int, int]) -> bool:
+    """Return True if ``version`` is >= ``minimum`` for ``major.minor.patch``."""
+    match = re.match(r"^\s*(\d+)\.(\d+)\.(\d+)", version)
+    if match is None:
+        return False
+    current = tuple(int(part) for part in match.groups())
+    return current >= minimum
 
 
 class Trainer:
@@ -204,6 +214,30 @@ class Trainer:
                 "gradient_checkpointing must be bool or a positive integer "
                 f"stride, got {gradient_checkpointing!r}"
             )
+
+        # Guard compile+checkpoint combo by MLX version.
+        # Explicit compile request should fail loudly on unsupported versions.
+        # Auto compile falls back to uncompiled mode for compatibility.
+        _MIN_MLX_COMPILE_CHECKPOINT = (0, 30, 6)
+        mlx_version = str(getattr(mx, "__version__", "unknown"))
+        if gradient_checkpointing and should_compile:
+            if not _mlx_version_at_least(mlx_version, _MIN_MLX_COMPILE_CHECKPOINT):
+                min_str = ".".join(str(v) for v in _MIN_MLX_COMPILE_CHECKPOINT)
+                if compile_training == "auto":
+                    logger.warning(
+                        "gradient_checkpointing=True with compile_training='auto' "
+                        "requires MLX >= %s (found %s). Falling back to "
+                        "compile_training=False.",
+                        min_str,
+                        mlx_version,
+                    )
+                    should_compile = False
+                else:
+                    raise ValueError(
+                        "gradient_checkpointing=True with compile_training=True "
+                        f"requires MLX >= {min_str}, found {mlx_version!r}. "
+                        "Set compile_training=False or upgrade MLX."
+                    )
 
         # Fail fast with a clear message instead of surfacing a low-level MLX
         # grad error on the first training step.
@@ -701,16 +735,29 @@ class Trainer:
                     # per-call logits shape to [M, max_seq_len, vocab]
                     # instead of [N, ...]. Observed peak-memory savings in
                     # end-to-end training depend on MLX autograd scheduling.
+                    #
+                    # Length-sorted trimming: when _pack_episodes sorts
+                    # episodes by length, each chunk's episodes are similarly
+                    # sized. Trimming to chunk-local max instead of global
+                    # max reduces wasted padding — especially beneficial
+                    # since causal attention is O(n^2) in sequence length.
                     all_logprobs = []
                     all_entropies = []
                     for start in range(0, num_episodes, M):
                         end = min(start + M, num_episodes)
+                        # Trim to chunk-local max lengths (pure slice, no copy)
+                        chunk_prompt_lens = prompt_lengths[start:end]
+                        chunk_episode_lens = episode_lengths[start:end]
+                        chunk_max_obs = max(
+                            p + r for p, r in zip(chunk_prompt_lens, chunk_episode_lens)
+                        )
+                        chunk_max_act = max(chunk_episode_lens) if any(chunk_episode_lens) else 0
                         chunk_out = compute_logprobs_batched(
                             self.model,
-                            observations[start:end],
-                            actions[start:end],
-                            prompt_lengths[start:end],
-                            episode_lengths[start:end],
+                            observations[start:end, :chunk_max_obs],
+                            actions[start:end, :chunk_max_act],
+                            chunk_prompt_lens,
+                            chunk_episode_lens,
                             return_token_entropies=return_token_entropies,
                         )
                         if return_token_entropies:
