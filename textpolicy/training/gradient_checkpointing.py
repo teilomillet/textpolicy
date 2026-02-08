@@ -28,8 +28,8 @@ created subclass whose class-level ``__call__`` invokes
 ``mx.checkpoint``.  This preserves the parameter tree structure
 (no extra ``inner.`` prefix) and all attribute access.
 
-Incompatibility: ``mx.checkpoint`` inside ``mx.compile`` fails.  When
-gradient checkpointing is enabled, the Trainer forces compilation off.
+Compatible with ``mx.compile`` on MLX >= 0.30.6 when using explicit
+positional args (our implementation pattern).
 
 References:
     Issue #55 — O(n^1.89) training scaling and memory wall

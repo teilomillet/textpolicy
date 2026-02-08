@@ -80,8 +80,8 @@ class Trainer:
                 ``True`` always compiles.  ``False`` never compiles.
             gradient_checkpointing: When True, wraps each transformer layer's
                 forward pass with ``mx.checkpoint`` to trade ~30% more compute
-                for ~60% less activation memory. Incompatible with
-                ``mx.compile`` — compilation is forced off with a warning.
+                for ~60% less activation memory. Compatible with
+                ``mx.compile`` on MLX >= 0.30.6.
             micro_batch_size: When set, processes at most this many episodes
                 per model forward pass during logprob extraction, reducing
                 peak activation memory by factor ``N / micro_batch_size``.
@@ -169,25 +169,24 @@ class Trainer:
                 f"got {compile_training!r}"
             )
 
-        # Gradient checkpointing: incompatible with mx.compile.
-        # mx.checkpoint inside mx.compile raises an error, so we force
-        # compilation off when checkpointing is requested.
+        # Gradient checkpointing: apply before loss_and_grad_fn creation.
+        # Verified compatible with mx.compile on MLX >= 0.30.6 (explicit
+        # positional args pattern preserves gradients through compile).
         self._gradient_checkpointing = gradient_checkpointing
-        self._micro_batch_size = micro_batch_size
         if gradient_checkpointing:
-            if should_compile:
-                logger.warning(
-                    "gradient_checkpointing=True is incompatible with "
-                    "mx.compile — forcing compilation off. To silence this "
-                    "warning, set compile_training=False explicitly."
-                )
-                should_compile = False
-
             from .gradient_checkpointing import apply_gradient_checkpointing
             n_layers = apply_gradient_checkpointing(model)
             logger.info(
                 "Gradient checkpointing applied to %d layers", n_layers
             )
+
+        # Validate micro_batch_size.
+        if micro_batch_size is not None and micro_batch_size <= 0:
+            raise ValueError(
+                f"micro_batch_size must be a positive integer, "
+                f"got {micro_batch_size}"
+            )
+        self._micro_batch_size = micro_batch_size
 
         self._compiled = should_compile
         if should_compile:

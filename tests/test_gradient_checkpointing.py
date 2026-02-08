@@ -425,8 +425,12 @@ class TestCompileInteraction:
         mx.eval(model.parameters())
         return model
 
-    def test_checkpoint_forces_compile_off(self):
-        """H9: gradient_checkpointing=True + compile_training=True -> _compiled=False."""
+    def test_checkpoint_compatible_with_compile(self):
+        """H9: gradient_checkpointing=True + compile_training=True both stay on.
+
+        mx.checkpoint with explicit positional args is compatible with
+        mx.compile on MLX >= 0.30.6. Compilation should NOT be forced off.
+        """
         from textpolicy.training import Trainer
         from textpolicy.algorithms import grpo
 
@@ -441,14 +445,14 @@ class TestCompileInteraction:
             gradient_checkpointing=True,
         )
 
-        assert trainer._compiled is False, (
-            "Compilation must be disabled when gradient_checkpointing=True"
+        assert trainer._compiled is True, (
+            "Compilation should remain on with gradient_checkpointing=True"
         )
         assert trainer._gradient_checkpointing is True
         assert is_gradient_checkpointing_active(model)
 
-    def test_checkpoint_forces_auto_compile_off(self):
-        """H10: gradient_checkpointing=True + compile_training='auto' -> _compiled=False."""
+    def test_checkpoint_with_auto_compile(self):
+        """H10: gradient_checkpointing=True + compile_training='auto' both work."""
         from textpolicy.training import Trainer
         from textpolicy.algorithms import grpo
 
@@ -469,8 +473,8 @@ class TestCompileInteraction:
             gradient_checkpointing=True,
         )
 
-        assert trainer._compiled is False, (
-            "Auto-compile must be overridden when gradient_checkpointing=True"
+        assert trainer._compiled is True, (
+            "Auto-compile should stay on with gradient_checkpointing=True"
         )
         assert is_gradient_checkpointing_active(model)
 
@@ -663,6 +667,44 @@ class TestMicroBatching:
         assert "loss" in metrics
         assert not mx.isinf(mx.array(metrics["loss"])).item()
         assert not mx.isnan(mx.array(metrics["loss"])).item()
+
+    def test_micro_batch_zero_raises(self):
+        """H14b: micro_batch_size=0 raises ValueError."""
+        from textpolicy.training import Trainer
+        from textpolicy.algorithms import grpo
+
+        mx.random.seed(42)
+        model = TinyLoRAModel(dim=8, num_layers=3, vocab_size=16)
+        mx.eval(model.parameters())
+
+        with pytest.raises(ValueError, match="positive integer"):
+            Trainer(
+                model=model,
+                loss_fn=grpo.policy_loss,
+                optimizer=optim.Adam(learning_rate=1e-3),
+                advantage_fn=grpo.compute_advantages,
+                compile_training=False,
+                micro_batch_size=0,
+            )
+
+    def test_micro_batch_negative_raises(self):
+        """H14c: micro_batch_size=-1 raises ValueError."""
+        from textpolicy.training import Trainer
+        from textpolicy.algorithms import grpo
+
+        mx.random.seed(42)
+        model = TinyLoRAModel(dim=8, num_layers=3, vocab_size=16)
+        mx.eval(model.parameters())
+
+        with pytest.raises(ValueError, match="positive integer"):
+            Trainer(
+                model=model,
+                loss_fn=grpo.policy_loss,
+                optimizer=optim.Adam(learning_rate=1e-3),
+                advantage_fn=grpo.compute_advantages,
+                compile_training=False,
+                micro_batch_size=-1,
+            )
 
     def test_micro_batch_ge_episodes_uses_full_path(self):
         """H14: micro_batch_size >= num_episodes uses full-batch path."""
