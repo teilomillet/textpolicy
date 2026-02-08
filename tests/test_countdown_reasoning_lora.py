@@ -44,12 +44,59 @@ class TestReasoningConfig:
         restored = ReasoningConfig(**asdict(cfg))
         assert asdict(restored) == asdict(cfg)
 
-    def test_rejects_episodes_per_step_exceeding_runner_limit(self):
+    def test_allows_episodes_per_step_above_legacy_runner_limit(self):
         from experiments.countdown_reasoning_lora import ReasoningConfig, run_experiment
 
-        cfg = ReasoningConfig(episodes_per_step=11, batch_size=8)
-        with pytest.raises(ValueError, match="silently evicted"):
-            run_experiment(cfg)
+        with tempfile.TemporaryDirectory() as tmpdir:
+            with (
+                patch("experiments.countdown_reasoning_lora.load_model") as mock_load_model,
+                patch(
+                    "experiments.countdown_reasoning_lora.create_tinylora_reasoning_setup"
+                ) as mock_create_setup,
+                patch("experiments.countdown_reasoning_lora.create_policy"),
+                patch(
+                    "experiments.countdown_reasoning_lora.generate_countdown_problems"
+                ) as mock_generate_problems,
+                patch(
+                    "experiments.countdown_reasoning_lora.RolloutCoordinator"
+                ) as mock_rollout_cls,
+                patch(
+                    "experiments.countdown_reasoning_lora.EmergenceLogger"
+                ) as mock_emergence_cls,
+                patch("experiments.countdown_reasoning_lora.save_checkpoint"),
+            ):
+                mock_model = MagicMock()
+                mock_tokenizer = MagicMock()
+                mock_load_model.return_value = (mock_model, mock_tokenizer)
+
+                mock_trainer = MagicMock()
+                mock_trainer.model = mock_model
+                mock_create_setup.return_value = (
+                    mock_trainer,
+                    {"memory_savings_percent": 95.0},
+                )
+
+                mock_generate_problems.return_value = [{"target": 15, "numbers": [10, 5, 3]}]
+                mock_rollout_cls.return_value = MagicMock()
+                mock_emergence_cls.return_value = MagicMock()
+
+                cfg = ReasoningConfig(
+                    max_steps=0,
+                    output_dir=tmpdir,
+                    num_problems=1,
+                    episodes_per_step=11,
+                    batch_size=8,
+                )
+                run_experiment(cfg)
+
+                rollout_kwargs = mock_rollout_cls.call_args.kwargs
+                assert rollout_kwargs["max_steps"] == 11
+                assert rollout_kwargs["max_episodes"] == 11
+                assert rollout_kwargs["batch_size"] == 8
+
+                # No training loop work should run when max_steps=0.
+                mock_trainer.train.assert_not_called()
+                assert (Path(tmpdir) / "config.json").exists()
 
     def test_rejects_batch_size_exceeding_episodes_per_step(self):
         from experiments.countdown_reasoning_lora import ReasoningConfig, run_experiment

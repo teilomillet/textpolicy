@@ -215,3 +215,6 @@ artefacts/
 
 # Experiment results
 results/
+
+# Model adapter artifacts from profiling/training runs
+*.safetensors
