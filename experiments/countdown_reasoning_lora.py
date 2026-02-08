@@ -17,7 +17,14 @@ import json
 import time
 from dataclasses import asdict, dataclass
 from pathlib import Path
-from typing import Dict, Optional, Union
+from typing import Any, Dict, List, Optional, Union
+
+try:
+    import wandb
+
+    HAS_WANDB = True
+except ImportError:
+    HAS_WANDB = False
 
 import mlx.core as mx
 import mlx.optimizers as optim
@@ -34,7 +41,10 @@ from textpolicy.tasks.countdown import (
     format_countdown_prompt,
     generate_countdown_problems,
 )
-from textpolicy.training import create_tinylora_reasoning_setup
+from textpolicy.training import (
+    build_gtpo_faithful_transform,
+    create_tinylora_reasoning_setup,
+)
 
 
 @dataclass
@@ -54,6 +64,13 @@ class ReasoningConfig:
     entropy_weight: float = 0.1
     hicra_alpha: float = 0.2
     strategic_grams_path: Optional[str] = None
+
+    # Paper-faithful GTPO (arXiv 2508.04349 Eq. 3, 5, 6)
+    faithful: bool = False
+    alpha_1: float = 1.0
+    alpha_2: float = 0.1
+    reward_threshold: float = 0.5
+    hicra_gamma: float = 0.3
 
     # Training
     learning_rate: float = 5e-6
@@ -80,6 +97,10 @@ class ReasoningConfig:
 
     # Output
     output_dir: str = "results/countdown_reasoning_lora"
+
+    # Wandb (opt-in: set wandb_project to enable)
+    wandb_project: Optional[str] = None
+    wandb_run_name: Optional[str] = None
 
 
 # Memory optimization quick-reference:
@@ -206,6 +227,198 @@ def print_amdahl_summary(
     print("=" * 50)
 
 
+def init_wandb(config: ReasoningConfig) -> bool:
+    """Initialize wandb run if configured. Returns True if wandb is active."""
+    if not config.wandb_project or not HAS_WANDB:
+        if config.wandb_project and not HAS_WANDB:
+            print("Warning: --wandb-project set but wandb not installed. pip install wandb")
+        return False
+
+    tags = ["gtpo", "hicra", "tinylora", "countdown"]
+    if config.faithful:
+        tags.append("faithful-gtpo")
+    else:
+        tags.append("simplified-gtpo")
+
+    wandb.init(
+        project=config.wandb_project,
+        name=config.wandb_run_name,
+        config=asdict(config),
+        tags=tags,
+        notes=(
+            "GTPO (arXiv 2508.04349) + HICRA (arXiv 2509.03646) "
+            "with TinyLoRA adapters (arXiv 2602.04118) on Countdown task."
+        ),
+    )
+
+    # Group metrics by prefix for dashboard panels.
+    for prefix in ["entropy", "reward", "hicra", "train", "policy", "accuracy", "completions"]:
+        wandb.define_metric(f"{prefix}/*", step_metric="step")
+
+    return True
+
+
+def compute_episode_stats(episodes: List[Any]) -> Dict[str, Any]:
+    """Compute per-rollout distribution stats from raw episodes.
+
+    Returns min/max lengths, reward extremes, and reward-diversity fraction
+    recommended by TRL GRPOTrainer and the GTPO paper (arXiv 2508.04349
+    Appendix E.1: entropy consolidation, E.2: response length analysis).
+    """
+    rewards: List[float] = []
+    lengths: List[int] = []
+    planning_ratios: List[float] = []
+
+    for ep in episodes:
+        if isinstance(ep, dict):
+            rew = ep.get("rew", [])
+            act = ep.get("act", [])
+        else:
+            rew = ep.rew
+            act = ep.act
+        reward_val = float(rew[0]) if rew else 0.0
+        comp_len = len(act[0]) if act else 0
+        rewards.append(reward_val)
+        lengths.append(comp_len)
+
+    stats: Dict[str, Any] = {}
+    if lengths:
+        stats["min_length"] = min(lengths)
+        stats["max_length"] = max(lengths)
+    if rewards:
+        stats["reward_min"] = min(rewards)
+        stats["reward_max"] = max(rewards)
+        # frac_zero_std: fraction of the group with identical reward → no
+        # advantage signal.  When high, effective batch size shrinks
+        # (TRL GRPOTrainer metric: frac_reward_zero_std).
+        if len(rewards) > 1:
+            reward_set = set(rewards)
+            stats["frac_zero_std"] = 1.0 if len(reward_set) == 1 else 0.0
+        else:
+            stats["frac_zero_std"] = 1.0
+    return stats
+
+
+def log_wandb_step(
+    step: int,
+    step_stats: Dict[str, Any],
+    train_metrics: Dict[str, Any],
+    episode_stats: Dict[str, Any],
+    config: ReasoningConfig,
+    use_wandb: bool,
+) -> None:
+    """Log structured metrics to wandb for a single training step."""
+    if not use_wandb:
+        return
+
+    log: Dict[str, Any] = {"step": step}
+
+    # ── Entropy dynamics (GTPO collapse detection) ────────────────────
+    # arXiv 2508.04349 Appendix E.1: track entropy consolidation via
+    # coefficient of variation.  A declining ratio signals the entropy
+    # distribution is converging across successful sequences.
+    log["entropy/mean"] = step_stats["entropy_mean"]
+    log["entropy/std"] = step_stats["entropy_std"]
+    ent_mean = step_stats["entropy_mean"]
+    if ent_mean > 0:
+        log["entropy/collapse_indicator"] = step_stats["entropy_std"] / ent_mean
+
+    # ── Reward signal ─────────────────────────────────────────────────
+    log["reward/mean"] = step_stats["mean_reward"]
+    log["reward/std"] = step_stats["std_reward"]
+    if "reward_min" in episode_stats:
+        log["reward/min"] = episode_stats["reward_min"]
+        log["reward/max"] = episode_stats["reward_max"]
+    if "frac_zero_std" in episode_stats:
+        log["reward/frac_zero_std"] = episode_stats["frac_zero_std"]
+
+    # ── HICRA planning token coverage ─────────────────────────────────
+    # arXiv 2509.03646 tracks planning ratio distribution, not just mean.
+    log["hicra/planning_token_ratio"] = step_stats["planning_token_ratio"]
+
+    # ── Training loss + gradient norm ─────────────────────────────────
+    log["train/loss"] = train_metrics["loss"]
+    if "grad_norm" in train_metrics:
+        log["train/grad_norm"] = train_metrics["grad_norm"]
+    log["train/learning_rate"] = config.learning_rate
+
+    # ── Accuracy ──────────────────────────────────────────────────────
+    total = step_stats["total_count"]
+    log["accuracy/correct"] = step_stats["correct_count"]
+    log["accuracy/total"] = total
+    if total > 0:
+        log["accuracy/rate"] = step_stats["correct_count"] / total
+
+    # ── Completion lengths ────────────────────────────────────────────
+    # TRL GRPOTrainer logs mean/min/max (arXiv 2508.04349 Appendix E.2).
+    log["completions/mean_length"] = step_stats["mean_completion_length"]
+    if "min_length" in episode_stats:
+        log["completions/min_length"] = episode_stats["min_length"]
+        log["completions/max_length"] = episode_stats["max_length"]
+
+    # ── Policy metrics (only present on metrics_interval steps) ───────
+    if "clip_fraction" in train_metrics:
+        log["policy/clip_fraction"] = train_metrics["clip_fraction"]
+        log["policy/clip_fraction_lower"] = train_metrics["clip_fraction_lower"]
+        log["policy/clip_fraction_upper"] = train_metrics["clip_fraction_upper"]
+        log["policy/kl_divergence"] = train_metrics["kl_divergence"]
+        log["policy/mean_ratio"] = train_metrics["mean_ratio"]
+        log["policy/mean_advantage"] = train_metrics["mean_advantage"]
+        log["policy/std_advantage"] = train_metrics["std_advantage"]
+
+    wandb.log(log)
+
+
+def log_wandb_completions(
+    step: int,
+    episodes: List[Any],
+    tokenizer: Any,
+    use_wandb: bool,
+) -> None:
+    """Log a wandb.Table of decoded completions for qualitative inspection."""
+    if not use_wandb or step % 10 != 0:
+        return
+
+    rows = []
+    for ep in episodes:
+        if isinstance(ep, dict):
+            obs = ep.get("obs", [])
+            act = ep.get("act", [])
+            rew = ep.get("rew", [])
+        else:
+            obs = ep.obs
+            act = ep.act
+            rew = ep.rew
+
+        prompt_tokens = obs[0] if obs else []
+        completion_tokens = act[0] if act else []
+        reward_val = float(rew[0]) if rew else 0.0
+
+        # Flatten if nested
+        if isinstance(prompt_tokens, (list, tuple)) and prompt_tokens and isinstance(prompt_tokens[0], (list, tuple)):
+            prompt_tokens = [t for sub in prompt_tokens for t in sub]
+        if isinstance(completion_tokens, (list, tuple)) and completion_tokens and isinstance(completion_tokens[0], (list, tuple)):
+            completion_tokens = [t for sub in completion_tokens for t in sub]
+
+        prompt_text = tokenizer.decode(prompt_tokens) if prompt_tokens else ""
+        completion_text = tokenizer.decode(completion_tokens) if completion_tokens else ""
+
+        rows.append([
+            step,
+            prompt_text[:200],
+            completion_text[:500],
+            reward_val,
+            reward_val >= 1.0,
+            len(completion_tokens),
+        ])
+
+    table = wandb.Table(
+        columns=["step", "prompt", "completion", "reward", "correct", "length"],
+        data=rows,
+    )
+    wandb.log({"completions/samples": table}, step=step)
+
+
 def run_experiment(config: ReasoningConfig) -> None:
     if config.batch_size > config.episodes_per_step:
         raise ValueError(
@@ -229,6 +442,31 @@ def run_experiment(config: ReasoningConfig) -> None:
         )
 
     optimizer = optim.Adam(learning_rate=config.learning_rate)
+
+    # Build advantage transform: faithful GTPO or simplified GTPO+HICRA.
+    advantage_transform_fn = None
+    if config.faithful:
+        advantage_transform_fn = build_gtpo_faithful_transform(
+            alpha_1=config.alpha_1,
+            alpha_2=config.alpha_2,
+            reward_threshold=config.reward_threshold,
+            tokenizer=tokenizer,
+            strategic_grams=strategic_grams,
+            hicra_gamma=config.hicra_gamma,
+        )
+        print(
+            f"Using paper-faithful GTPO (Eq. 3,5,6): "
+            f"α₁={config.alpha_1}, α₂={config.alpha_2}, "
+            f"threshold={config.reward_threshold}, γ_hicra={config.hicra_gamma}"
+        )
+
+    # When wandb is configured, enable policy metrics (clip fraction, KL, etc.)
+    # via metrics_fn injection through **trainer_kwargs.
+    trainer_kwargs: Dict[str, Any] = {}
+    if config.wandb_project:
+        trainer_kwargs["metrics_fn"] = grpo.compute_metrics
+        trainer_kwargs["metrics_interval"] = 1
+
     trainer, memory_stats = create_tinylora_reasoning_setup(
         model=base_model,
         tokenizer=tokenizer,
@@ -239,6 +477,7 @@ def run_experiment(config: ReasoningConfig) -> None:
             "lora_scale": config.lora_scale,
             "lora_dropout": config.lora_dropout,
         },
+        advantage_transform_fn=advantage_transform_fn,
         strategic_grams=strategic_grams,
         hicra_alpha=config.hicra_alpha,
         entropy_weight=config.entropy_weight,
@@ -248,6 +487,7 @@ def run_experiment(config: ReasoningConfig) -> None:
         profile=config.profile_training,
         max_grad_norm=config.max_grad_norm,
         adapter_save_path=str(output_dir / "lora_adapters.safetensors"),
+        **trainer_kwargs,
     )
     model = trainer.model
 
@@ -307,6 +547,7 @@ def run_experiment(config: ReasoningConfig) -> None:
     buffer = Buffer(max_episodes=config.episodes_per_step)
     trainer.link_buffer(buffer, data_selector_fn=grpo.select_recent_data)
     emergence = EmergenceLogger(output_dir=output_dir / "emergence")
+    use_wandb = init_wandb(config)
 
     print(f"\nStarting reasoning training for {config.max_steps} steps...")
     global_episode_count = 0
@@ -353,6 +594,10 @@ def run_experiment(config: ReasoningConfig) -> None:
                 phase = key[len("timing/") : -2]
                 trainer_phase_totals[phase] = trainer_phase_totals.get(phase, 0.0) + float(value)
 
+        ep_stats = compute_episode_stats(rollout_buffer.episodes) if use_wandb else {}
+        log_wandb_step(step, step_stats, metrics, ep_stats, config, use_wandb)
+        log_wandb_completions(step, rollout_buffer.episodes, tokenizer, use_wandb)
+
         if step % 10 == 0:
             cumulative_total = sum(phase_totals.values()) or 1e-9
             rollout_pct = phase_totals["rollout_collect_s"] / cumulative_total * 100
@@ -378,6 +623,8 @@ def run_experiment(config: ReasoningConfig) -> None:
     phase_totals["checkpoint_s"] += time.perf_counter() - checkpoint_start
     print_summary(output_dir)
     print_amdahl_summary(phase_totals, trainer_phase_totals, rollout_phase_totals)
+    if use_wandb:
+        wandb.finish()
 
 
 if __name__ == "__main__":
@@ -436,6 +683,17 @@ if __name__ == "__main__":
         action="store_true",
         help="Enable trainer per-phase timing and Amdahl bottleneck summary",
     )
+    parser.add_argument(
+        "--faithful",
+        action="store_true",
+        help="Use paper-faithful GTPO (Eq. 3,5,6 from arXiv 2508.04349) with HICRA fusion",
+    )
+    parser.add_argument("--alpha-1", type=float, default=1.0, help="Faithful GTPO: base reward weight")
+    parser.add_argument("--alpha-2", type=float, default=0.1, help="Faithful GTPO: entropy-shaped weight")
+    parser.add_argument("--reward-threshold", type=float, default=0.5, help="Faithful GTPO: O+/O- partition threshold")
+    parser.add_argument("--hicra-gamma", type=float, default=0.3, help="Faithful GTPO: HICRA entropy boost factor")
+    parser.add_argument("--wandb-project", default=None, help="Wandb project name (enables wandb logging)")
+    parser.add_argument("--wandb-run-name", default=None, help="Wandb run name (optional)")
     args = parser.parse_args()
 
     compile_mode: Union[bool, str]
@@ -467,5 +725,12 @@ if __name__ == "__main__":
         gradient_checkpointing=args.gradient_checkpointing,
         micro_batch_size=args.micro_batch_size,
         profile_training=args.profile_training,
+        faithful=args.faithful,
+        alpha_1=args.alpha_1,
+        alpha_2=args.alpha_2,
+        reward_threshold=args.reward_threshold,
+        hicra_gamma=args.hicra_gamma,
+        wandb_project=args.wandb_project,
+        wandb_run_name=args.wandb_run_name,
     )
     run_experiment(cfg)

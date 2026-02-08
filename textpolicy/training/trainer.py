@@ -281,6 +281,7 @@ class Trainer:
         # Training state
         self.metrics = TrainingMetrics()
         self._step_count = 0
+        self._last_grad_norm: Optional[float] = None
     
     def _detect_lora_model(self, model: nn.Module) -> bool:
         """
@@ -978,6 +979,8 @@ class Trainer:
             timer.start("metrics")
 
         metrics: Dict[str, float] = {'loss': loss.item(), 'step': self._step_count}
+        if self._last_grad_norm is not None:
+            metrics['grad_norm'] = self._last_grad_norm
         if self.metrics_fn is not None and self._step_count % self.metrics_interval == 0:
             # Compute new logprobs using the same pipeline as training to ensure consistency
             # This properly handles GRPO data structure with format conversion
@@ -1171,6 +1174,7 @@ class Trainer:
         # Force eval so we can branch in Python.  Safe here — this runs
         # outside mx.compile, after the grad barrier at line 777.
         mx.eval(total_norm)
+        self._last_grad_norm = total_norm.item()
 
         if total_norm.item() <= max_norm:
             return grads  # skip scaling traversal
