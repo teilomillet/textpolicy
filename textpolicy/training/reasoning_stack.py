@@ -94,6 +94,116 @@ def _flatten_padded_token_rows(
     return mx.concatenate(pieces)
 
 
+class _GTPOHICRATransform:
+    """Trainer transform with optional eager batch preparation.
+
+    ``identify_planning_tokens`` is intentionally eager/Pythonic and uses
+    token decoding. The ``prepare_batch`` hook computes ``planning_mask``
+    outside ``mx.compile`` so ``__call__`` stays compile-safe.
+    """
+
+    def __init__(
+        self,
+        tokenizer: Any,
+        *,
+        strategic_grams: Optional[List[str]] = None,
+        hicra_alpha: float = 0.2,
+        entropy_weight: float = 0.1,
+    ) -> None:
+        self.tokenizer = tokenizer
+        self.grams = list(strategic_grams or _DEFAULT_STRATEGIC_GRAMS)
+        self.hicra_alpha = hicra_alpha
+        self.entropy_weight = entropy_weight
+
+    def _flatten_actions(self, batch_data: Dict[str, Any]) -> mx.array:
+        episode_lengths = batch_data.get("episode_lengths")
+        actions = batch_data.get("act")
+        if actions is None:
+            raise ValueError(
+                "batch_data must include 'act' for HICRA token matching."
+            )
+        return _flatten_padded_token_rows(
+            actions,
+            episode_lengths,
+            field_name="act",
+        )
+
+    def prepare_batch(self, batch_data: Dict[str, Any]) -> None:
+        """Eagerly compute planning_mask for compile-safe training."""
+        if self.hicra_alpha == 0.0 or not self.grams:
+            return
+        if batch_data.get("planning_mask") is not None:
+            return
+        token_ids = self._flatten_actions(batch_data)
+        batch_data["planning_mask"] = identify_planning_tokens(
+            token_ids, self.tokenizer, self.grams
+        )
+
+    def __call__(self, advantages: mx.array, batch_data: Dict[str, Any]) -> mx.array:
+        episode_lengths = batch_data.get("episode_lengths")
+        token_ids = self._flatten_actions(batch_data)
+        if token_ids.shape != advantages.shape:
+            raise ValueError(
+                f"Flattened action token shape {token_ids.shape} does not match "
+                f"advantages shape {advantages.shape}."
+            )
+
+        transformed = advantages
+        token_entropies = batch_data.get("token_entropies")
+        if token_entropies is not None and self.entropy_weight > 0.0:
+            flat_entropies = _flatten_padded_token_rows(
+                token_entropies,
+                episode_lengths,
+                field_name="token_entropies",
+            )
+            if flat_entropies.shape != transformed.shape:
+                raise ValueError(
+                    f"Flattened token_entropies shape {flat_entropies.shape} does "
+                    f"not match advantages shape {transformed.shape}."
+                )
+            transformed = apply_entropy_weighting(
+                transformed,
+                flat_entropies,
+                entropy_weight=self.entropy_weight,
+            )
+
+        if self.hicra_alpha == 0.0 or not self.grams:
+            return transformed
+
+        planning_mask = batch_data.get("planning_mask")
+        if planning_mask is None:
+            try:
+                planning_mask = identify_planning_tokens(
+                    token_ids, self.tokenizer, self.grams
+                )
+            except ValueError as exc:
+                if "Attempting to eval an array" in str(exc):
+                    raise ValueError(
+                        "HICRA planning_mask must be prepared outside mx.compile. "
+                        "Use Trainer.train() with a transform that exposes "
+                        "prepare_batch()."
+                    ) from exc
+                raise
+            batch_data["planning_mask"] = planning_mask
+        else:
+            planning_mask = _flatten_padded_token_rows(
+                planning_mask,
+                episode_lengths,
+                field_name="planning_mask",
+            )
+
+        if planning_mask.shape != transformed.shape:
+            raise ValueError(
+                f"HICRA planning_mask shape {planning_mask.shape} does not match "
+                f"advantages shape {transformed.shape}."
+            )
+        return apply_hicra_amplification(
+            transformed,
+            planning_mask,
+            alpha=self.hicra_alpha,
+        )
+
+
 def build_gtpo_hicra_transform(
     tokenizer: Any,
     *,
@@ -116,58 +226,12 @@ def build_gtpo_hicra_transform(
     if hicra_alpha < 0.0:
         raise ValueError(f"hicra_alpha must be >= 0, got {hicra_alpha}.")
 
-    grams = list(strategic_grams or _DEFAULT_STRATEGIC_GRAMS)
-
-    def transform(advantages: mx.array, batch_data: Dict[str, Any]) -> mx.array:
-        episode_lengths = batch_data.get("episode_lengths")
-        actions = batch_data.get("act")
-        if actions is None:
-            raise ValueError("batch_data must include 'act' for HICRA token matching.")
-
-        token_ids = _flatten_padded_token_rows(
-            actions,
-            episode_lengths,
-            field_name="act",
-        )
-        if token_ids.shape != advantages.shape:
-            raise ValueError(
-                f"Flattened action token shape {token_ids.shape} does not match "
-                f"advantages shape {advantages.shape}."
-            )
-
-        transformed = advantages
-        token_entropies = batch_data.get("token_entropies")
-        if token_entropies is not None and entropy_weight > 0.0:
-            flat_entropies = _flatten_padded_token_rows(
-                token_entropies,
-                episode_lengths,
-                field_name="token_entropies",
-            )
-            if flat_entropies.shape != transformed.shape:
-                raise ValueError(
-                    f"Flattened token_entropies shape {flat_entropies.shape} does "
-                    f"not match advantages shape {transformed.shape}."
-                )
-            transformed = apply_entropy_weighting(
-                transformed, flat_entropies, entropy_weight=entropy_weight
-            )
-
-        if hicra_alpha == 0.0 or not grams:
-            return transformed
-
-        planning_mask = identify_planning_tokens(token_ids, tokenizer, grams)
-        if planning_mask.shape != transformed.shape:
-            raise ValueError(
-                f"HICRA planning_mask shape {planning_mask.shape} does not match "
-                f"advantages shape {transformed.shape}."
-            )
-        return apply_hicra_amplification(
-            transformed,
-            planning_mask,
-            alpha=hicra_alpha,
-        )
-
-    return transform
+    return _GTPOHICRATransform(
+        tokenizer,
+        strategic_grams=strategic_grams,
+        hicra_alpha=hicra_alpha,
+        entropy_weight=entropy_weight,
+    )
 
 
 def create_tinylora_reasoning_setup(
@@ -193,6 +257,38 @@ def create_tinylora_reasoning_setup(
     TinyLoRA-style here means a compact LoRA default configuration
     (small rank + fewer adapted layers).  Exact TinyLoRA internals from
     the paper are not re-implemented in this helper.
+
+    Args:
+        model: Base language model (will be wrapped with LoRA adapters).
+        tokenizer: Tokenizer matching the model.
+        optimizer: MLX optimizer instance (e.g. ``optim.Adam``).
+        lora_config: Override default LoRA hyper-parameters (rank, alpha, layers).
+        strategic_grams: Path or list of strategic n-grams for HICRA.
+        hicra_alpha: Blend weight for HICRA credit assignment (default 0.2).
+        entropy_weight: GTPO entropy re-weighting coefficient beta (default 0.1).
+        compile_training: ``True``, ``False``, or ``"auto"`` for mx.compile.
+        gradient_checkpointing: Re-compute activations during backward pass
+            instead of caching them — reduces peak memory at the cost of
+            ~20-30 %% extra compute.
+        micro_batch_size: Process at most *N* episodes per forward/backward
+            pass, accumulating gradients across micro-batches.  Reduces peak
+            activation memory roughly by a factor of N.
+        auto_reload: Auto-reload adapters for the rollout policy.
+        adapter_save_path: Where to persist LoRA adapter weights.
+        max_grad_norm: Clip gradient norm (``None`` to disable).
+        **trainer_kwargs: Forwarded to :class:`Trainer`.
+
+    Memory Optimization:
+        For long sequences or memory-constrained hardware, enabling both
+        ``gradient_checkpointing=True`` and ``micro_batch_size=4`` can cut
+        peak memory by ~34 %% and total step time by ~35 %% (benchmarked at
+        seq_length=1024).  Start with ``micro_batch_size=4`` and adjust
+        based on your hardware.  See ``docs/06_performance.md`` for full
+        benchmark numbers.
+
+    Returns:
+        Tuple of ``(trainer, memory_stats)`` where *memory_stats* contains
+        LoRA setup diagnostics (trainable params, frozen params, etc.).
     """
     merged_lora_config = dict(_DEFAULT_TINYLORA_CONFIG)
     if lora_config:
@@ -225,4 +321,3 @@ def create_tinylora_reasoning_setup(
         **trainer_kwargs,
     )
     return trainer, memory_stats
-

@@ -191,6 +191,20 @@ class Trainer:
                 "Gradient checkpointing applied to %d layers", n_layers
             )
 
+        if self._micro_batch_size is not None:
+            logger.info(
+                "Micro-batch size: %d episodes per forward pass",
+                self._micro_batch_size,
+            )
+
+        if not gradient_checkpointing and micro_batch_size is None:
+            logger.info(
+                "Tip: memory optimization available but not enabled. "
+                "For long sequences or limited RAM, consider "
+                "gradient_checkpointing=True and micro_batch_size=4. "
+                "See docs/06_performance.md"
+            )
+
         self._compiled = should_compile
         if should_compile:
             self.loss_and_grad_fn = mx.compile(nn.value_and_grad(model, self._loss_fn))
@@ -772,7 +786,23 @@ class Trainer:
                 # This avoids the .item() call and keeps operations on GPU
                 episode_advantage = mx.repeat(advantages[i:i+1], length)
                 expanded.append(episode_advantage)
-            return mx.concatenate(expanded)
+        return mx.concatenate(expanded)
+
+    def _prepare_advantage_transform_batch(
+        self, batch_data: Dict[str, Any]
+    ) -> None:
+        """Allow transforms to precompute compile-unsafe batch fields eagerly.
+
+        Some transforms (e.g. HICRA planning-mask extraction) need Python
+        tokenization logic that is not valid under ``mx.compile`` tracing.
+        If the transform exposes ``prepare_batch(batch_data)``, call it here
+        before entering ``loss_and_grad_fn``.
+        """
+        if self.advantage_transform_fn is None:
+            return
+        prepare_fn = getattr(self.advantage_transform_fn, "prepare_batch", None)
+        if callable(prepare_fn):
+            prepare_fn(batch_data)
     
     def train(self, rollout_data: Optional[Union[Buffer, Dict[str, Any]]] = None) -> Dict[str, float]:
         """
@@ -818,6 +848,10 @@ class Trainer:
         else:
             # Manual mode with preprocessed data
             batch_data = rollout_data
+
+        # Let transforms eagerly precompute compile-unsafe fields
+        # (e.g. planning_mask token matching for HICRA).
+        self._prepare_advantage_transform_batch(batch_data)
 
         if timer is not None:
             # Eval all array values in the batch to flush pending work from

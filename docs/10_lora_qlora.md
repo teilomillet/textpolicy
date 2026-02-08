@@ -112,3 +112,12 @@ model, tokenizer = reload_model(
 - Keep adapter files small and save them frequently.
 - For rollouts, use a reloadable policy to ensure the generator uses updated adapters.
 
+## Memory and long sequences
+
+LoRA and QLoRA reduce *parameter* memory (only adapter weights are updated),
+but *activation* memory still grows linearly with sequence length during
+training.  For long sequences or tight memory budgets, combine LoRA with
+gradient checkpointing and micro-batching — see
+[Performance and Memory Optimization](06_performance.md#training-memory-optimization)
+for benchmark numbers and usage examples.
+

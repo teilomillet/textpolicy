@@ -82,6 +82,13 @@ class ReasoningConfig:
     output_dir: str = "results/countdown_reasoning_lora"
 
 
+# Memory optimization quick-reference:
+#   --gradient-checkpointing        recompute activations (saves memory, ~20-30% more compute)
+#   --micro-batch-size 4            4 episodes per fwd/bwd (best starting point)
+#   Combined (GC+M=4):             -33.7% peak memory, -34.6% step time at seq=1024
+#   See docs/06_performance.md for full benchmark table.
+
+
 # RolloutRunner uses max(10, max_steps) for buffer capacity, so it
 # dynamically grows with episodes_per_step.  No artificial cap needed.
 
@@ -406,13 +413,25 @@ if __name__ == "__main__":
     parser.add_argument(
         "--gradient-checkpointing",
         action="store_true",
-        help="Enable gradient checkpointing (trades compute for memory)",
+        help=(
+            "Enable gradient checkpointing — recomputes activations during "
+            "backward pass instead of caching them. ~20-30%% extra compute, "
+            "but significant memory savings. Best combined with "
+            "--micro-batch-size (GC+M=4 gives -33.7%% peak memory at "
+            "seq=1024)"
+        ),
     )
     parser.add_argument(
         "--micro-batch-size",
         type=int,
         default=None,
-        help="Process at most N episodes per forward pass to reduce peak memory",
+        help=(
+            "Split episodes into groups of N for forward/backward, "
+            "accumulating gradients. Reduces peak activation memory roughly "
+            "by factor N. Recommended starting point: 4 (gives -37.5%% peak "
+            "memory, -25%% step time at seq=1024). Combine with "
+            "--gradient-checkpointing for best results"
+        ),
     )
     parser.add_argument(
         "--profile-training",

@@ -68,12 +68,19 @@ def _make_checkpointed_class(original_cls: Type) -> Type:
         flat = tree_flatten(self.trainable_parameters())
         keys = [k for k, _ in flat]
         arrays = [a for _, a in flat]
+        # Preserve the pre-call parameter bindings. In compiled mode this
+        # prevents transient checkpoint inputs from leaking into module state
+        # after the forward pass.
+        original_params = tree_unflatten(flat)
 
         def forward(x_in, *params):
             # Reconnect trainable parameters into the layer.
             param_dict = tree_unflatten(list(zip(keys, params)))
             self.update(param_dict)
-            return original_call(self, x_in, mask=mask, cache=cache)
+            try:
+                return original_call(self, x_in, mask=mask, cache=cache)
+            finally:
+                self.update(original_params)
 
         return mx.checkpoint(forward)(x, *arrays)
 
