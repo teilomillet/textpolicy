@@ -38,7 +38,9 @@ from textpolicy.tasks.countdown import (
     format_countdown_prompt,
     generate_countdown_problems,
 )
-from textpolicy.training import create_tinylora_reasoning_setup
+from textpolicy.algorithms.grpo import compute_advantages, policy_loss
+from textpolicy.generation.lora import create_lora_setup
+from textpolicy.training import Trainer
 from textpolicy.training.gradient_checkpointing import _get_layers
 from textpolicy.utils.memory import clear_memory, get_memory_stats
 
@@ -90,10 +92,9 @@ def run_single_probe(
     model, tokenizer = load_model(model_id)
     optimizer = optim.Adam(learning_rate=5e-6)
 
-    trainer, _ = create_tinylora_reasoning_setup(
+    # 1. LoRA setup
+    lora_model, _ = create_lora_setup(
         model=model,
-        tokenizer=tokenizer,
-        optimizer=optimizer,
         lora_config={
             "lora_layers": 4,
             "lora_rank": 2,
@@ -101,6 +102,14 @@ def run_single_probe(
             "lora_dropout": 0.0,
         },
         auto_reload=False,
+    )
+
+    # 2. Trainer (no GTPO transform needed for checkpointing benchmarks)
+    trainer = Trainer(
+        model=lora_model,
+        advantage_fn=compute_advantages,
+        loss_fn=policy_loss,
+        optimizer=optimizer,
         compile_training=False,
         gradient_checkpointing=gradient_checkpointing,
         profile=True,

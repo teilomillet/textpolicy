@@ -52,8 +52,12 @@ class TestReasoningConfig:
             with (
                 patch("experiments.countdown_reasoning_lora.load_model") as mock_load_model,
                 patch(
-                    "experiments.countdown_reasoning_lora.create_tinylora_reasoning_setup"
-                ) as mock_create_setup,
+                    "experiments.countdown_reasoning_lora.create_lora_setup"
+                ) as mock_lora_setup,
+                patch(
+                    "experiments.countdown_reasoning_lora.Trainer"
+                ) as mock_trainer_cls,
+                patch("experiments.countdown_reasoning_lora.build_gtpo_transform"),
                 patch("experiments.countdown_reasoning_lora.create_policy"),
                 patch(
                     "experiments.countdown_reasoning_lora.generate_countdown_problems"
@@ -70,12 +74,14 @@ class TestReasoningConfig:
                 mock_tokenizer = MagicMock()
                 mock_load_model.return_value = (mock_model, mock_tokenizer)
 
-                mock_trainer = MagicMock()
-                mock_trainer.model = mock_model
-                mock_create_setup.return_value = (
-                    mock_trainer,
+                mock_lora_setup.return_value = (
+                    mock_model,
                     {"memory_savings_percent": 95.0},
                 )
+
+                mock_trainer = MagicMock()
+                mock_trainer.model = mock_model
+                mock_trainer_cls.return_value = mock_trainer
 
                 mock_generate_problems.return_value = [{"target": 15, "numbers": [10, 5, 3]}]
                 mock_rollout_cls.return_value = MagicMock()
@@ -187,7 +193,9 @@ class TestRunExperiment:
             with (
                 patch.object(exp, "HAS_WANDB", False),
                 patch.object(exp, "load_model") as mock_load_model,
-                patch.object(exp, "create_tinylora_reasoning_setup") as mock_create_setup,
+                patch.object(exp, "create_lora_setup") as mock_lora_setup,
+                patch.object(exp, "Trainer") as mock_trainer_cls,
+                patch.object(exp, "build_gtpo_transform"),
                 patch.object(exp, "create_policy"),
                 patch.object(exp, "generate_countdown_problems") as mock_generate_problems,
                 patch.object(exp, "RolloutCoordinator") as mock_rollout_cls,
@@ -198,12 +206,14 @@ class TestRunExperiment:
                 mock_tokenizer = MagicMock()
                 mock_load_model.return_value = (mock_model, mock_tokenizer)
 
-                mock_trainer = MagicMock()
-                mock_trainer.model = mock_model
-                mock_create_setup.return_value = (
-                    mock_trainer,
+                mock_lora_setup.return_value = (
+                    mock_model,
                     {"memory_savings_percent": 95.0},
                 )
+
+                mock_trainer = MagicMock()
+                mock_trainer.model = mock_model
+                mock_trainer_cls.return_value = mock_trainer
 
                 mock_generate_problems.return_value = [{"target": 15, "numbers": [10, 5, 3]}]
                 mock_rollout_cls.return_value = MagicMock()
@@ -219,9 +229,9 @@ class TestRunExperiment:
                 )
                 exp.run_experiment(cfg)
 
-                setup_kwargs = mock_create_setup.call_args.kwargs
-                assert "metrics_fn" not in setup_kwargs
-                assert "metrics_interval" not in setup_kwargs
+                trainer_kwargs = mock_trainer_cls.call_args.kwargs
+                assert "metrics_fn" not in trainer_kwargs
+                assert "metrics_interval" not in trainer_kwargs
 
     def test_smoke_uses_batched_rollout_config(self):
         from experiments.countdown_reasoning_lora import ReasoningConfig, run_experiment
@@ -230,8 +240,12 @@ class TestRunExperiment:
             with (
                 patch("experiments.countdown_reasoning_lora.load_model") as mock_load_model,
                 patch(
-                    "experiments.countdown_reasoning_lora.create_tinylora_reasoning_setup"
-                ) as mock_create_setup,
+                    "experiments.countdown_reasoning_lora.create_lora_setup"
+                ) as mock_lora_setup,
+                patch(
+                    "experiments.countdown_reasoning_lora.Trainer"
+                ) as mock_trainer_cls,
+                patch("experiments.countdown_reasoning_lora.build_gtpo_transform"),
                 patch("experiments.countdown_reasoning_lora.create_policy") as mock_create_policy,
                 patch(
                     "experiments.countdown_reasoning_lora.generate_countdown_problems"
@@ -248,13 +262,15 @@ class TestRunExperiment:
                 mock_tokenizer = MagicMock()
                 mock_load_model.return_value = (mock_model, mock_tokenizer)
 
+                mock_lora_setup.return_value = (
+                    mock_model,
+                    {"memory_savings_percent": 95.0},
+                )
+
                 mock_trainer = MagicMock()
                 mock_trainer.model = mock_model
                 mock_trainer.train.return_value = {"loss": 0.25}
-                mock_create_setup.return_value = (
-                    mock_trainer,
-                    {"memory_savings_percent": 95.0},
-                )
+                mock_trainer_cls.return_value = mock_trainer
 
                 mock_create_policy.return_value = MagicMock()
                 mock_generate_problems.return_value = [{"target": 15, "numbers": [10, 5, 3]}]

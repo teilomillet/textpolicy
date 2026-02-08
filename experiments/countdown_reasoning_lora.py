@@ -41,7 +41,9 @@ from textpolicy.tasks.countdown import (
     format_countdown_prompt,
     generate_countdown_problems,
 )
-from textpolicy.training import create_tinylora_reasoning_setup
+from textpolicy.algorithms.grpo import compute_advantages, policy_loss
+from textpolicy.generation.lora import create_lora_setup
+from textpolicy.training import Trainer, build_gtpo_transform
 
 
 @dataclass
@@ -478,30 +480,43 @@ def run_experiment(config: ReasoningConfig) -> None:
         trainer_kwargs["metrics_fn"] = grpo.compute_metrics
         trainer_kwargs["metrics_interval"] = 1
 
-    trainer, memory_stats = create_tinylora_reasoning_setup(
+    # 1. LoRA setup
+    lora_model, memory_stats = create_lora_setup(
         model=base_model,
-        tokenizer=tokenizer,
-        optimizer=optimizer,
         lora_config={
             "lora_layers": config.lora_layers,
             "lora_rank": config.lora_rank,
             "lora_scale": config.lora_scale,
             "lora_dropout": config.lora_dropout,
         },
-        strategic_grams=strategic_grams,
+        adapter_save_path=str(output_dir / "lora_adapters.safetensors"),
+    )
+
+    # 2. GTPO advantage transform (arXiv 2508.04349 Eq. 3, 5, 6)
+    transform = build_gtpo_transform(
         alpha_1=config.alpha_1,
         alpha_2=config.alpha_2,
         reward_threshold=config.reward_threshold,
+        tokenizer=tokenizer,
+        strategic_grams=strategic_grams,
         hicra_gamma=config.hicra_gamma,
+    )
+
+    # 3. Trainer
+    trainer = Trainer(
+        model=lora_model,
+        advantage_fn=compute_advantages,
+        loss_fn=policy_loss,
+        optimizer=optimizer,
+        advantage_transform_fn=transform,
+        max_grad_norm=config.max_grad_norm,
         compile_training=config.compile_training,
         gradient_checkpointing=config.gradient_checkpointing,
         micro_batch_size=config.micro_batch_size,
         profile=config.profile_training,
-        max_grad_norm=config.max_grad_norm,
-        adapter_save_path=str(output_dir / "lora_adapters.safetensors"),
         **trainer_kwargs,
     )
-    model = trainer.model
+    model = lora_model
 
     print(
         "Reasoning stack ready"

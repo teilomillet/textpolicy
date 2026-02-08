@@ -44,7 +44,9 @@ from textpolicy.tasks.countdown import (
     format_countdown_prompt,
     generate_countdown_problems,
 )
-from textpolicy.training import create_tinylora_reasoning_setup
+from textpolicy.algorithms.grpo import compute_advantages, policy_loss
+from textpolicy.generation.lora import create_lora_setup
+from textpolicy.training import Trainer
 from textpolicy.utils.memory import clear_memory, get_memory_stats
 
 
@@ -1514,26 +1516,34 @@ def run_profile(config: ProfileConfig) -> None:
     base_model, tokenizer = load_model(config.model_id)
 
     optimizer = optim.Adam(learning_rate=5e-6)
-    trainer, memory_stats = create_tinylora_reasoning_setup(
+
+    # 1. LoRA setup
+    # Profiling should measure compute/memory behavior, not disk writes.
+    # Disable auto-reload to avoid per-step adapter save I/O.
+    lora_model, memory_stats = create_lora_setup(
         model=base_model,
-        tokenizer=tokenizer,
-        optimizer=optimizer,
         lora_config={
             "lora_layers": 4,
             "lora_rank": 2,
             "lora_scale": 8.0,
             "lora_dropout": 0.0,
         },
-        # Profiling should measure compute/memory behavior, not disk writes.
-        # Disable auto-reload to avoid per-step adapter save I/O.
         auto_reload=False,
+    )
+
+    # 2. Trainer (no GTPO transform needed for hardware profiling)
+    trainer = Trainer(
+        model=lora_model,
+        advantage_fn=compute_advantages,
+        loss_fn=policy_loss,
+        optimizer=optimizer,
         compile_training=False,
         gradient_checkpointing=config.gradient_checkpointing,
         micro_batch_size=config.micro_batch_size,
         profile=True,
         max_grad_norm=0.5,
     )
-    model = trainer.model
+    model = lora_model
 
     mem_after = get_memory_stats()
     mem_before_mlx = mem_before.get("mlx_memory_mb", 0.0)

@@ -1,38 +1,31 @@
 # textpolicy/training/reasoning_stack.py
 """
-Composable setup helpers for a combined reasoning stack:
+Composable transform builders for GTPO + HICRA advantage shaping.
 
 - GTPO entropy-weighted advantages (arXiv:2508.04349)
 - HICRA planning-token amplification (arXiv:2509.03646)
-- TinyLoRA-inspired low-rank defaults (arXiv:2602.04118)
 
-The helpers in this module are intentionally thin wrappers around existing
-TextPolicy primitives so they remain easy to test and safe to evolve.
+These builders return Trainer-compatible transforms that can be injected
+via ``Trainer(advantage_transform_fn=...)``.  Experiment scripts compose
+LoRA setup + transform + Trainer directly (see ``experiments/`` for examples).
 """
 
 from __future__ import annotations
 
-import warnings
-from typing import Any, Callable, Dict, List, Optional, Sequence, Tuple, Union
+from typing import Any, Callable, Dict, List, Optional, Sequence
 
 import mlx.core as mx  # type: ignore
-import mlx.nn as nn  # type: ignore
-import mlx.optimizers as optim  # type: ignore
 
 from textpolicy.algorithms.grpo import (
     apply_entropy_weighting,
-    compute_advantages,
     compute_gtpo_shaped_rewards,
     normalize_gtpo_advantages,
-    policy_loss,
 )
 from textpolicy.algorithms.hicra import (
     apply_hicra_amplification,
     boost_entropy_with_planning,
     identify_planning_tokens,
 )
-from textpolicy.generation.lora import create_lora_setup
-from textpolicy.training.trainer import Trainer
 
 
 _DEFAULT_STRATEGIC_GRAMS = [
@@ -42,15 +35,6 @@ _DEFAULT_STRATEGIC_GRAMS = [
     "another way",
     "the key is",
 ]
-
-_DEFAULT_TINYLORA_CONFIG: Dict[str, Any] = {
-    "lora_layers": 4,
-    "lora_rank": 2,
-    "lora_scale": 8.0,
-    "lora_dropout": 0.0,
-}
-_LEGACY_HICRA_ALPHA_DEFAULT = 0.2
-_LEGACY_ENTROPY_WEIGHT_DEFAULT = 0.1
 
 
 def _flatten_padded_token_rows(
@@ -401,9 +385,6 @@ def build_gtpo_transform(
     completely replaces standard GRPO advantages with entropy-shaped,
     separately-normalized advantages.
 
-    This is the default advantage transform used by
-    ``create_tinylora_reasoning_setup`` when no custom transform is provided.
-
     PPO clipping (Eq. 7) is handled by the Trainer's ``loss_fn`` — use
     ``functools.partial(grpo.policy_loss, clip_ratio=0.2)`` or similar.
 
@@ -473,174 +454,3 @@ def build_gtpo_transform(
     )
 
 
-def create_tinylora_reasoning_setup(
-    model: nn.Module,
-    tokenizer: Any,
-    optimizer: optim.Optimizer,
-    *,
-    lora_config: Optional[Dict[str, Any]] = None,
-    advantage_transform_fn: Optional[Callable[[mx.array, Dict[str, Any]], mx.array]] = None,
-    strategic_grams: Optional[List[str]] = None,
-    alpha_1: float = 1.0,
-    alpha_2: float = 0.1,
-    reward_threshold: float = 0.5,
-    hicra_gamma: float = 0.3,
-    hicra_alpha: float = _LEGACY_HICRA_ALPHA_DEFAULT,
-    entropy_weight: float = _LEGACY_ENTROPY_WEIGHT_DEFAULT,
-    compile_training: Union[bool, str] = "auto",
-    gradient_checkpointing: Union[bool, int] = False,
-    micro_batch_size: Optional[int] = None,
-    auto_reload: bool = True,
-    adapter_save_path: str = "./lora_adapters.safetensors",
-    max_grad_norm: Optional[float] = 0.5,
-    **trainer_kwargs: Any,
-) -> Tuple[Trainer, Dict[str, float]]:
-    """
-    Create a Trainer wired for LoRA with TinyLoRA-style defaults.
-
-    The advantage transform is injectable: pass any ``(advantages, batch_data)
-    -> advantages`` callable via ``advantage_transform_fn``.  When ``None``
-    (the default), a GTPO transform (arXiv 2508.04349 Eq. 3, 5, 6) is built
-    from the ``alpha_1``, ``alpha_2``, ``reward_threshold``, ``hicra_gamma``,
-    and ``strategic_grams`` parameters.  For backward compatibility, setting
-    non-default ``hicra_alpha`` or ``entropy_weight`` (without injecting a
-    transform) switches to the legacy simplified GTPO+HICRA transform.
-
-    TinyLoRA-style here means a compact LoRA default configuration
-    (small rank + fewer adapted layers).  Exact TinyLoRA internals from
-    the paper are not re-implemented in this helper.
-
-    Examples::
-
-        # Default: GTPO (Eq. 3, 5, 6) with HICRA fusion
-        trainer, stats = create_tinylora_reasoning_setup(
-            model, tokenizer, optimizer,
-        )
-
-        # Custom GTPO parameters
-        trainer, stats = create_tinylora_reasoning_setup(
-            model, tokenizer, optimizer,
-            alpha_1=0.9, alpha_2=0.2, hicra_gamma=0.5,
-        )
-
-        # Inject the simplified GTPO+HICRA transform for ablation
-        trainer, stats = create_tinylora_reasoning_setup(
-            model, tokenizer, optimizer,
-            advantage_transform_fn=build_gtpo_hicra_transform(
-                tokenizer, entropy_weight=0.1, hicra_alpha=0.2,
-            ),
-        )
-
-    Args:
-        model: Base language model (will be wrapped with LoRA adapters).
-        tokenizer: Tokenizer matching the model.
-        optimizer: MLX optimizer instance (e.g. ``optim.Adam``).
-        lora_config: Override default LoRA hyper-parameters (rank, alpha, layers).
-        advantage_transform_fn: Custom advantage transform to inject.  When
-            ``None``, a default GTPO transform is built from the other
-            parameters.  All GTPO/HICRA params below are ignored when a
-            custom transform is provided.
-        strategic_grams: Planning phrases for HICRA (defaults to built-in list).
-            Only used when ``advantage_transform_fn`` is ``None``.
-        alpha_1: GTPO base reward weight (Eq. 3, default 1.0).
-            Only used when ``advantage_transform_fn`` is ``None``.
-        alpha_2: GTPO entropy-shaped weight (Eq. 3, default 0.1).
-            Only used when ``advantage_transform_fn`` is ``None``.
-        reward_threshold: GTPO O+/O- partition threshold (default 0.5).
-            Only used when ``advantage_transform_fn`` is ``None``.
-        hicra_gamma: HICRA entropy boost factor for GTPO fusion (default 0.3).
-            Only used when ``advantage_transform_fn`` is ``None``.
-        hicra_alpha: Legacy simplified GTPO+HICRA blend weight (default 0.2).
-            When ``advantage_transform_fn`` is ``None`` and either this value
-            or ``entropy_weight`` is changed from defaults, the helper falls
-            back to ``build_gtpo_hicra_transform`` for backward compatibility.
-            Ignored when a custom transform is provided.
-        entropy_weight: Legacy simplified GTPO entropy re-weighting coefficient
-            beta (default 0.1). Behaves like ``hicra_alpha`` above.
-        compile_training: ``True``, ``False``, or ``"auto"`` for mx.compile.
-        gradient_checkpointing: Re-compute activations during backward pass
-            instead of caching them.  ``True`` uses sqrt(n) layer selection
-            (Chen et al. 2016) for the best memory/compute trade-off.
-            An ``int`` sets the explicit stride (``1`` = every layer,
-            ``4`` = every 4th layer).
-        micro_batch_size: Process at most *N* episodes per logprob-extraction
-            forward pass. This bounds per-forward logits size and can reduce
-            peak memory, though exact savings depend on MLX scheduling while
-            preserving the same optimizer-step semantics.
-        auto_reload: Auto-reload adapters for the rollout policy.
-        adapter_save_path: Where to persist LoRA adapter weights.
-        max_grad_norm: Clip gradient norm (``None`` to disable).
-        **trainer_kwargs: Forwarded to :class:`Trainer`.
-
-    Memory Optimization:
-        For long sequences or memory-constrained hardware, start with
-        ``micro_batch_size=4`` and then add ``gradient_checkpointing=True``
-        if you still hit memory limits. Benchmark on your hardware before
-        locking defaults. See ``docs/06_performance.md`` for examples and
-        guidance.
-
-    Returns:
-        Tuple of ``(trainer, memory_stats)`` where *memory_stats* contains
-        LoRA setup diagnostics (trainable params, frozen params, etc.).
-    """
-    merged_lora_config = dict(_DEFAULT_TINYLORA_CONFIG)
-    if lora_config:
-        merged_lora_config.update(lora_config)
-
-    lora_model, memory_stats = create_lora_setup(
-        model=model,
-        lora_config=merged_lora_config,
-        auto_reload=auto_reload,
-        adapter_save_path=adapter_save_path,
-    )
-
-    uses_legacy_simplified_params = (
-        hicra_alpha != _LEGACY_HICRA_ALPHA_DEFAULT
-        or entropy_weight != _LEGACY_ENTROPY_WEIGHT_DEFAULT
-    )
-    if advantage_transform_fn is None:
-        if uses_legacy_simplified_params:
-            warnings.warn(
-                "Non-default hicra_alpha/entropy_weight requested without an "
-                "explicit advantage_transform_fn; using legacy "
-                "build_gtpo_hicra_transform(...) for backward compatibility. "
-                "Inject a transform explicitly to silence this warning.",
-                FutureWarning,
-                stacklevel=2,
-            )
-            advantage_transform_fn = build_gtpo_hicra_transform(
-                tokenizer,
-                strategic_grams=strategic_grams,
-                hicra_alpha=hicra_alpha,
-                entropy_weight=entropy_weight,
-            )
-        else:
-            advantage_transform_fn = build_gtpo_transform(
-                alpha_1=alpha_1,
-                alpha_2=alpha_2,
-                reward_threshold=reward_threshold,
-                tokenizer=tokenizer,
-                strategic_grams=strategic_grams,
-                hicra_gamma=hicra_gamma,
-            )
-    elif uses_legacy_simplified_params:
-        warnings.warn(
-            "hicra_alpha/entropy_weight are ignored when advantage_transform_fn "
-            "is provided.",
-            UserWarning,
-            stacklevel=2,
-        )
-
-    trainer = Trainer(
-        model=lora_model,
-        advantage_fn=compute_advantages,
-        loss_fn=policy_loss,
-        optimizer=optimizer,
-        max_grad_norm=max_grad_norm,
-        compile_training=compile_training,
-        gradient_checkpointing=gradient_checkpointing,
-        micro_batch_size=micro_batch_size,
-        advantage_transform_fn=advantage_transform_fn,
-        **trainer_kwargs,
-    )
-    return trainer, memory_stats

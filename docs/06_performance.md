@@ -103,16 +103,6 @@ trainer = Trainer(
 )
 ```
 
-Or via `create_tinylora_reasoning_setup()`:
-
-```python
-trainer, stats = create_tinylora_reasoning_setup(
-    model, tokenizer, optimizer,
-    gradient_checkpointing=True,
-    micro_batch_size=4,
-)
-```
-
 ### Benchmark Results (seq_length=1024)
 
 Example single-run probe (Apple M4 Pro 24 GB, Trinity-Nano-Preview, G=8):
