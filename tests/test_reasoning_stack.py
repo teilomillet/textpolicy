@@ -5,10 +5,14 @@ Covers:
   _flatten_padded_token_rows: 2D padded → flat 1D layout conversion
   build_gtpo_hicra_transform: factory validation and basic wiring
   _GTPOHICRATransform: transform correctness with entropy weighting
+  create_tinylora_reasoning_setup: deprecated wrapper legacy-kwargs behavior
 
 These were previously untested despite being the critical bridge between
 the Trainer's internal data layout and the HICRA/GTPO algorithm functions.
 """
+
+import warnings
+from unittest.mock import MagicMock, patch
 
 import pytest
 import mlx.core as mx
@@ -16,6 +20,9 @@ import mlx.core as mx
 from textpolicy.training.reasoning_stack import (
     _flatten_padded_token_rows,
     build_gtpo_hicra_transform,
+    create_tinylora_reasoning_setup,
+    _LEGACY_HICRA_ALPHA_DEFAULT,
+    _LEGACY_ENTROPY_WEIGHT_DEFAULT,
 )
 
 
@@ -293,4 +300,147 @@ class TestReasoningStackPublicAPI:
             assert param_name in sig.parameters, (
                 f"build_gtpo_transform must accept '{param_name}'."
             )
+
+
+# ---------------------------------------------------------------------------
+# create_tinylora_reasoning_setup — deprecated wrapper legacy-kwargs behavior
+# ---------------------------------------------------------------------------
+
+# Module paths for patching (target the reasoning_stack module's own imports)
+_RS = "textpolicy.training.reasoning_stack"
+
+
+@pytest.mark.unit
+class TestCreateTinyloraDeprecatedWrapper:
+    """Validate the deprecated wrapper emits DeprecationWarning and routes
+    hicra_alpha / entropy_weight to the correct transform builder without
+    leaking them into Trainer().
+    """
+
+    def _call_wrapper(self, **overrides):
+        """Call create_tinylora_reasoning_setup with mocked dependencies.
+
+        Returns (mock_trainer_cls, mock_build_gtpo, mock_build_hicra) so
+        callers can inspect which builder was called and what Trainer received.
+        """
+        mock_model = MagicMock()
+        mock_tokenizer = MagicMock()
+        mock_optimizer = MagicMock()
+        mock_lora_model = MagicMock()
+        mock_memory_stats = {"peak_memory_gb": 1.0}
+
+        with (
+            patch(f"{_RS}.create_lora_setup", return_value=(mock_lora_model, mock_memory_stats)) as mock_lora,
+            patch(f"{_RS}.build_gtpo_transform") as mock_build_gtpo,
+            patch(f"{_RS}.build_gtpo_hicra_transform") as mock_build_hicra,
+            patch(f"{_RS}.Trainer") as mock_trainer_cls,
+        ):
+            # Emit the warning but don't let it raise
+            with warnings.catch_warnings(record=True):
+                warnings.simplefilter("always")
+                create_tinylora_reasoning_setup(
+                    mock_model,
+                    mock_tokenizer,
+                    mock_optimizer,
+                    **overrides,
+                )
+
+        return mock_trainer_cls, mock_build_gtpo, mock_build_hicra
+
+    def test_emits_deprecation_warning(self):
+        """Calling the wrapper must emit a DeprecationWarning."""
+        mock_model = MagicMock()
+        mock_tokenizer = MagicMock()
+        mock_optimizer = MagicMock()
+
+        with (
+            patch(f"{_RS}.create_lora_setup", return_value=(MagicMock(), {})),
+            patch(f"{_RS}.build_gtpo_transform"),
+            patch(f"{_RS}.Trainer"),
+        ):
+            with warnings.catch_warnings(record=True) as caught:
+                warnings.simplefilter("always")
+                create_tinylora_reasoning_setup(
+                    mock_model, mock_tokenizer, mock_optimizer,
+                )
+
+        deprecations = [w for w in caught if issubclass(w.category, DeprecationWarning)]
+        assert len(deprecations) == 1
+        assert "deprecated" in str(deprecations[0].message).lower()
+
+    def test_default_kwargs_use_build_gtpo_transform(self):
+        """With default hicra_alpha and entropy_weight, uses build_gtpo_transform."""
+        mock_trainer_cls, mock_build_gtpo, mock_build_hicra = self._call_wrapper()
+
+        mock_build_gtpo.assert_called_once()
+        mock_build_hicra.assert_not_called()
+
+    def test_non_default_hicra_alpha_uses_hicra_transform(self):
+        """Non-default hicra_alpha triggers build_gtpo_hicra_transform."""
+        mock_trainer_cls, mock_build_gtpo, mock_build_hicra = self._call_wrapper(
+            hicra_alpha=0.5,
+        )
+
+        mock_build_hicra.assert_called_once()
+        mock_build_gtpo.assert_not_called()
+        # Verify the custom alpha was forwarded
+        call_kwargs = mock_build_hicra.call_args
+        assert call_kwargs.kwargs["hicra_alpha"] == 0.5
+
+    def test_non_default_entropy_weight_uses_hicra_transform(self):
+        """Non-default entropy_weight triggers build_gtpo_hicra_transform."""
+        mock_trainer_cls, mock_build_gtpo, mock_build_hicra = self._call_wrapper(
+            entropy_weight=0.3,
+        )
+
+        mock_build_hicra.assert_called_once()
+        mock_build_gtpo.assert_not_called()
+        # Verify the custom entropy_weight was forwarded
+        call_kwargs = mock_build_hicra.call_args
+        assert call_kwargs.kwargs["entropy_weight"] == 0.3
+
+    def test_both_legacy_kwargs_forwarded_to_hicra(self):
+        """Both hicra_alpha and entropy_weight are forwarded correctly."""
+        mock_trainer_cls, mock_build_gtpo, mock_build_hicra = self._call_wrapper(
+            hicra_alpha=0.8,
+            entropy_weight=0.05,
+        )
+
+        mock_build_hicra.assert_called_once()
+        call_kwargs = mock_build_hicra.call_args
+        assert call_kwargs.kwargs["hicra_alpha"] == 0.8
+        assert call_kwargs.kwargs["entropy_weight"] == 0.05
+
+    def test_legacy_kwargs_do_not_leak_into_trainer(self):
+        """hicra_alpha and entropy_weight must NOT appear in Trainer() kwargs."""
+        mock_trainer_cls, _, _ = self._call_wrapper(
+            hicra_alpha=0.5,
+            entropy_weight=0.3,
+        )
+
+        mock_trainer_cls.assert_called_once()
+        trainer_call_kwargs = mock_trainer_cls.call_args
+        all_kwargs = {**dict(zip(["model", "advantage_fn", "loss_fn", "optimizer"],
+                                 trainer_call_kwargs.args)),
+                      **trainer_call_kwargs.kwargs}
+        assert "hicra_alpha" not in all_kwargs
+        assert "entropy_weight" not in all_kwargs
+
+    def test_explicit_transform_skips_both_builders(self):
+        """When advantage_transform_fn is provided, neither builder is called."""
+        custom_transform = MagicMock()
+        mock_trainer_cls, mock_build_gtpo, mock_build_hicra = self._call_wrapper(
+            advantage_transform_fn=custom_transform,
+        )
+
+        mock_build_gtpo.assert_not_called()
+        mock_build_hicra.assert_not_called()
+        # The custom transform should be passed to Trainer
+        trainer_kwargs = mock_trainer_cls.call_args.kwargs
+        assert trainer_kwargs["advantage_transform_fn"] is custom_transform
+
+    def test_legacy_defaults_match_module_constants(self):
+        """Ensure the test uses the same defaults as the module."""
+        assert _LEGACY_HICRA_ALPHA_DEFAULT == 0.2
+        assert _LEGACY_ENTROPY_WEIGHT_DEFAULT == 0.1
 
