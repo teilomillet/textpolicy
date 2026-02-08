@@ -458,6 +458,7 @@ def create_tinylora_reasoning_setup(
     optimizer: optim.Optimizer,
     *,
     lora_config: Optional[Dict[str, Any]] = None,
+    advantage_transform_fn: Optional[Callable[[mx.array, Dict[str, Any]], mx.array]] = None,
     strategic_grams: Optional[List[str]] = None,
     hicra_alpha: float = 0.2,
     entropy_weight: float = 0.1,
@@ -470,20 +471,49 @@ def create_tinylora_reasoning_setup(
     **trainer_kwargs: Any,
 ) -> Tuple[Trainer, Dict[str, float]]:
     """
-    Create a Trainer wired for GTPO + HICRA with TinyLoRA-style defaults.
+    Create a Trainer wired for LoRA with TinyLoRA-style defaults.
+
+    The advantage transform is injectable: pass any ``(advantages, batch_data)
+    -> advantages`` callable via ``advantage_transform_fn``.  When ``None``
+    (the default), a simplified GTPO+HICRA transform is built from the
+    ``tokenizer``, ``strategic_grams``, ``hicra_alpha``, and
+    ``entropy_weight`` parameters.
 
     TinyLoRA-style here means a compact LoRA default configuration
     (small rank + fewer adapted layers).  Exact TinyLoRA internals from
     the paper are not re-implemented in this helper.
+
+    Examples::
+
+        # Default: simplified GTPO + HICRA (backward compatible)
+        trainer, stats = create_tinylora_reasoning_setup(
+            model, tokenizer, optimizer,
+        )
+
+        # Inject faithful GTPO + HICRA fusion
+        trainer, stats = create_tinylora_reasoning_setup(
+            model, tokenizer, optimizer,
+            advantage_transform_fn=build_gtpo_faithful_transform(
+                tokenizer=tokenizer, hicra_gamma=0.3,
+            ),
+        )
 
     Args:
         model: Base language model (will be wrapped with LoRA adapters).
         tokenizer: Tokenizer matching the model.
         optimizer: MLX optimizer instance (e.g. ``optim.Adam``).
         lora_config: Override default LoRA hyper-parameters (rank, alpha, layers).
+        advantage_transform_fn: Custom advantage transform to inject.  When
+            ``None``, a default GTPO+HICRA transform is built from the other
+            parameters.  The ``strategic_grams``, ``hicra_alpha``, and
+            ``entropy_weight`` params are ignored when a custom transform is
+            provided.
         strategic_grams: Path or list of strategic n-grams for HICRA.
+            Only used when ``advantage_transform_fn`` is ``None``.
         hicra_alpha: Blend weight for HICRA credit assignment (default 0.2).
+            Only used when ``advantage_transform_fn`` is ``None``.
         entropy_weight: GTPO entropy re-weighting coefficient beta (default 0.1).
+            Only used when ``advantage_transform_fn`` is ``None``.
         compile_training: ``True``, ``False``, or ``"auto"`` for mx.compile.
         gradient_checkpointing: Re-compute activations during backward pass
             instead of caching them.  ``True`` uses sqrt(n) layer selection
@@ -521,12 +551,13 @@ def create_tinylora_reasoning_setup(
         adapter_save_path=adapter_save_path,
     )
 
-    transform = build_gtpo_hicra_transform(
-        tokenizer,
-        strategic_grams=strategic_grams,
-        hicra_alpha=hicra_alpha,
-        entropy_weight=entropy_weight,
-    )
+    if advantage_transform_fn is None:
+        advantage_transform_fn = build_gtpo_hicra_transform(
+            tokenizer,
+            strategic_grams=strategic_grams,
+            hicra_alpha=hicra_alpha,
+            entropy_weight=entropy_weight,
+        )
 
     trainer = Trainer(
         model=lora_model,
@@ -537,7 +568,7 @@ def create_tinylora_reasoning_setup(
         compile_training=compile_training,
         gradient_checkpointing=gradient_checkpointing,
         micro_batch_size=micro_batch_size,
-        advantage_transform_fn=transform,
+        advantage_transform_fn=advantage_transform_fn,
         **trainer_kwargs,
     )
     return trainer, memory_stats
