@@ -296,3 +296,129 @@ class TestTrainerProfiling:
 
         with pytest.raises(ValueError, match="missing logprob"):
             trainer.train(buf)
+
+
+# ---------------------------------------------------------------------------
+# Rollout profiling tests
+# ---------------------------------------------------------------------------
+
+from textpolicy.rollout.runner import RolloutRunner
+from textpolicy.rollout.strategy import create_strategy
+
+
+class _SingleTurnEnv:
+    """Minimal single-turn env that terminates every episode."""
+
+    def __init__(self):
+        self._idx = 0
+
+    def reset(self):
+        self._idx += 1
+        return mx.array([float(self._idx)]), {}
+
+    def step(self, action):
+        return {
+            "observation": mx.array([0.0]),
+            "reward": 1.0,
+            "terminated": True,
+            "truncated": False,
+            "info": {},
+        }
+
+
+def _dummy_policy(obs, deterministic=False):
+    return mx.array(0), {"logprob": mx.array([-0.5])}
+
+
+def _dummy_batched_policy(obs_list):
+    return [
+        (mx.array([1], dtype=mx.int32), {"logprob": mx.array([-0.5])})
+        for _ in obs_list
+    ]
+
+
+class TestRolloutProfiling:
+    """Verify rollout sub-phase timing via RolloutRunner.profile."""
+
+    @pytest.mark.unit
+    def test_rollout_timing_keys_present_when_profiled(self):
+        """When profile=True, get_timing() must contain expected phase keys."""
+        env = _SingleTurnEnv()
+        runner = RolloutRunner(
+            env, policy=_dummy_policy, strategy=create_strategy("grpo"),
+            max_steps=3, profile=True,
+        )
+        runner.collect()
+        timing = runner.get_timing()
+
+        expected_keys = {"total", "generation", "env_step", "buffer_store", "env_reset"}
+        assert expected_keys.issubset(timing.keys()), (
+            f"Missing keys: {expected_keys - timing.keys()}"
+        )
+
+    @pytest.mark.unit
+    def test_no_timing_when_not_profiled(self):
+        """When profile=False (default), get_timing() returns empty dict."""
+        env = _SingleTurnEnv()
+        runner = RolloutRunner(
+            env, policy=_dummy_policy, strategy=create_strategy("grpo"),
+            max_steps=2, profile=False,
+        )
+        runner.collect()
+        assert runner.get_timing() == {}
+
+    @pytest.mark.unit
+    def test_timing_values_positive(self):
+        """All timing values must be > 0 after a collect call."""
+        env = _SingleTurnEnv()
+        runner = RolloutRunner(
+            env, policy=_dummy_policy, strategy=create_strategy("grpo"),
+            max_steps=3, profile=True,
+        )
+        runner.collect()
+        timing = runner.get_timing()
+
+        for phase, secs in timing.items():
+            assert secs > 0.0, f"{phase} has non-positive timing: {secs}"
+
+    @pytest.mark.unit
+    def test_batched_timing_keys_present(self):
+        """collect_batched path should also produce expected timing phases."""
+        env = _SingleTurnEnv()
+        runner = RolloutRunner(
+            env, policy=_dummy_policy, strategy=create_strategy("grpo"),
+            max_steps=4, profile=True,
+        )
+        runner.collect_batched(_dummy_batched_policy, batch_size=2)
+        timing = runner.get_timing()
+
+        expected_keys = {"total", "generation", "env_step", "buffer_store", "env_reset"}
+        assert expected_keys.issubset(timing.keys()), (
+            f"Missing keys: {expected_keys - timing.keys()}"
+        )
+        for phase, secs in timing.items():
+            assert secs > 0.0, f"{phase} has non-positive timing: {secs}"
+
+    @pytest.mark.unit
+    def test_reset_timing_clears_data(self):
+        """reset_timing() should clear all accumulated timing data."""
+        env = _SingleTurnEnv()
+        runner = RolloutRunner(
+            env, policy=_dummy_policy, strategy=create_strategy("grpo"),
+            max_steps=2, profile=True,
+        )
+        runner.collect()
+        assert runner.get_timing() != {}
+
+        runner.reset_timing()
+        assert runner.get_timing() == {}
+
+    @pytest.mark.unit
+    def test_timer_is_none_when_not_profiled(self):
+        """When profile=False, _timer must be None (zero overhead)."""
+        env = _SingleTurnEnv()
+        runner = RolloutRunner(
+            env, policy=_dummy_policy, strategy=create_strategy("grpo"),
+            max_steps=1,
+        )
+        assert runner._timer is None

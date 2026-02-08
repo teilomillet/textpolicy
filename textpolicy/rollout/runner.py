@@ -6,6 +6,7 @@ Core rollout collection engine.
 from typing import Callable, Dict, List, Optional, Tuple, Any
 import mlx.core as mx # type: ignore
 from textpolicy.buffer import Buffer
+from textpolicy.utils.timing import Timer
 from .base import RolloutStrategy, DEFAULT_MAX_STEPS
 
 
@@ -26,20 +27,22 @@ class RolloutRunner:
         policy: Optional[Callable[[mx.array], Tuple[mx.array, Dict[str, mx.array]]]] = None,
         strategy: Optional[RolloutStrategy] = None,
         max_steps: int = DEFAULT_MAX_STEPS,
-        agent = None  # Alternative API: pass agent instead of policy/strategy
+        agent = None,  # Alternative API: pass agent instead of policy/strategy
+        profile: bool = False,
     ) -> None:
         """
         Initialize rollout runner.
-        
+
         Args:
             env: Environment instance (must implement gym interface)
             policy: Policy function that takes obs and returns (action, extras)
             strategy: RolloutStrategy defining algorithm-specific behavior
             max_steps: Maximum steps per rollout collection
             agent: Alternative API - Agent object containing policy and rollout_strategy
+            profile: When True, collect per-phase timing via Timer (zero overhead when False)
         """
         self.env = env
-        
+
         # Support both direct policy/strategy and agent-based initialization
         if agent is not None:
             # Extract policy and strategy from agent for backward compatibility with tests
@@ -51,12 +54,13 @@ class RolloutRunner:
                 raise ValueError("Must provide either agent or both policy and strategy")
             self.policy = policy
             self.strategy = strategy
-            
+
         self.max_steps = max_steps
         # Ensure a single collect() call can retain all completed episodes.
         self._buffer_capacity = max(10, max_steps)
         self.buffer = Buffer(max_episodes=self._buffer_capacity)
         self.step_count = 0  # Track total steps collected for test compatibility
+        self._timer: Optional[Timer] = Timer() if profile else None
 
     def _normalize_step_result(self, step_result):
         """
@@ -109,32 +113,48 @@ class RolloutRunner:
     def collect(self) -> Buffer:
         """
         Run one complete rollout collection.
-        
+
         MLX efficiency guidelines:
         - Policy runs on GPU/ANE via MLX arrays
         - Buffer stores as Python lists
         - Batch array conversions reduce memory transfers
         - Strategy handles algorithm differences
-        
+
         Returns:
             Buffer containing collected episodes
         """
+        timer = self._timer
+        if timer is not None:
+            timer.reset()
+            timer.start("total")
+
         # Use a fresh buffer per collect() so repeated calls do not leak or mutate
         # previously returned buffers.
         self.buffer = Buffer(max_episodes=self._buffer_capacity)
 
+        if timer is not None:
+            timer.start("env_reset")
         reset_result = self.env.reset()
         if isinstance(reset_result, tuple):
             obs, _ = reset_result
         else:
             obs = reset_result
+        if timer is not None:
+            timer.stop("env_reset")
 
         for _ in range(self.max_steps):
             obs_single = obs
             obs_mx = mx.array(obs_single)
 
             # Policy forward pass - runs on GPU/ANE
+            if timer is not None:
+                timer.start("generation")
             action_mx, extra = self.strategy.select_action(self.policy, obs_mx)
+            if timer is not None:
+                # Force lazy MLX arrays to evaluate so generation cost isn't
+                # leaked into later phases (env_step, buffer_store).
+                mx.eval(action_mx, *[v for v in extra.values() if isinstance(v, mx.array)])
+                timer.stop("generation")
 
             # Convert action back to Python format (once per step)
             if action_mx.ndim == 0:
@@ -143,11 +163,16 @@ class RolloutRunner:
                 action = action_mx.tolist()  # Vector action (continuous environments)
 
             # Environment step (CPU-bound). Normalize to a standard tuple.
+            if timer is not None:
+                timer.start("env_step")
             step_result = self.env.step(action)
             next_obs, reward, done, trunc, info = self._normalize_step_result(step_result)
+            if timer is not None:
+                timer.stop("env_step")
 
             # Store transition using strategy-specific logic
-            # Strategy handles filtering and algorithm-specific data
+            if timer is not None:
+                timer.start("buffer_store")
             self.strategy.store_transition(
                 buffer=self.buffer,
                 obs=obs_single,
@@ -158,16 +183,25 @@ class RolloutRunner:
                 timeout=trunc,
                 **extra  # Algorithm-specific data (logprob, value, etc.)
             )
+            if timer is not None:
+                timer.stop("buffer_store")
 
             # Handle episode boundaries
             if done or trunc:
+                if timer is not None:
+                    timer.start("env_reset")
                 reset_result = self.env.reset()
                 if isinstance(reset_result, tuple):
                     obs, _ = reset_result
                 else:
                     obs = reset_result
+                if timer is not None:
+                    timer.stop("env_reset")
             else:
                 obs = next_obs
+
+        if timer is not None:
+            timer.stop("total")
 
         return self.buffer
     
@@ -308,6 +342,11 @@ class RolloutRunner:
         if batch_size <= 0:
             raise ValueError(f"batch_size must be positive, got {batch_size}")
 
+        timer = self._timer
+        if timer is not None:
+            timer.reset()
+            timer.start("total")
+
         self.buffer = Buffer(max_episodes=self._buffer_capacity)
         steps_remaining = self.max_steps
 
@@ -315,6 +354,8 @@ class RolloutRunner:
             this_batch = min(batch_size, steps_remaining)
 
             # Reset per episode to get prompt observations.
+            if timer is not None:
+                timer.start("env_reset")
             obs_batch: List[Any] = []
             for _ in range(this_batch):
                 reset_result = self.env.reset()
@@ -323,23 +364,48 @@ class RolloutRunner:
                 else:
                     obs = reset_result
                 obs_batch.append(obs)
+            if timer is not None:
+                timer.stop("env_reset")
 
+            if timer is not None:
+                timer.start("generation")
             prompt_obs_list = [mx.array(obs) for obs in obs_batch]
             results = batched_policy_fn(prompt_obs_list)
+            if timer is not None:
+                # Force lazy MLX arrays to evaluate so generation cost isn't
+                # leaked into env_step or buffer_store phases.
+                arrays_to_eval = []
+                for tokens, extra in results:
+                    arrays_to_eval.append(tokens)
+                    arrays_to_eval.extend(
+                        v for v in extra.values() if isinstance(v, mx.array)
+                    )
+                mx.eval(*arrays_to_eval)
+                timer.stop("generation")
+
             if len(results) != this_batch:
                 raise ValueError(
                     "batched_policy_fn must return one output per prompt. "
                     f"Expected {this_batch}, got {len(results)}."
                 )
 
+            # Pre-compute actions from generation results.
+            actions: List[Any] = []
+            extras: List[Dict[str, Any]] = []
             for i in range(this_batch):
                 response_tokens, extra = results[i]
                 if response_tokens.ndim == 0:
-                    action = response_tokens.item()
+                    actions.append(response_tokens.item())
                 else:
-                    action = response_tokens.tolist()
+                    actions.append(response_tokens.tolist())
+                extras.append(extra)
 
-                step_result = self.env.step(action)
+            # Environment step: reward computation + decoding.
+            if timer is not None:
+                timer.start("env_step")
+            step_outputs: List[Tuple[Any, float, bool, bool, Dict]] = []
+            for i in range(this_batch):
+                step_result = self.env.step(actions[i])
                 next_obs, reward, done, trunc, info = self._normalize_step_result(step_result)
 
                 if not (done or trunc):
@@ -347,18 +413,54 @@ class RolloutRunner:
                         "collect_batched requires single-turn episodes "
                         "(env.step must terminate or truncate each episode)."
                     )
+                step_outputs.append((next_obs, reward, done, trunc, info))
+            if timer is not None:
+                timer.stop("env_step")
 
+            # Buffer storage.
+            if timer is not None:
+                timer.start("buffer_store")
+            for i in range(this_batch):
+                next_obs, reward, done, trunc, info = step_outputs[i]
                 self.strategy.store_transition(
                     buffer=self.buffer,
                     obs=obs_batch[i],
-                    act=action,
+                    act=actions[i],
                     rew=reward,
                     next_obs=next_obs,
                     done=done,
                     timeout=trunc,
-                    **extra,
+                    **extras[i],
                 )
+            if timer is not None:
+                timer.stop("buffer_store")
 
             steps_remaining -= this_batch
 
+        if timer is not None:
+            timer.stop("total")
+
         return self.buffer
+
+    # ------------------------------------------------------------------
+    # Profiling API
+    # ------------------------------------------------------------------
+
+    def get_timing(self) -> Dict[str, float]:
+        """Return rollout sub-phase timing breakdown, or empty dict if not profiling.
+
+        Returns a dict mapping phase name to *total* accumulated seconds for that
+        phase across all invocations since the last ``reset_timing()`` call.
+        The ``"total"`` key gives the wall-clock time for the entire collect call.
+        """
+        if self._timer is None:
+            return {}
+        result: Dict[str, float] = {}
+        for phase in self._timer.times:
+            result[phase] = self._timer.get_stats(phase)["total"]
+        return result
+
+    def reset_timing(self) -> None:
+        """Reset timing accumulators (call per step to avoid unbounded growth)."""
+        if self._timer is not None:
+            self._timer.reset()

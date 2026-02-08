@@ -36,6 +36,7 @@ class RolloutCoordinator:
         model: Optional[Any] = None,
         tokenizer: Optional[Any] = None,
         generation_params: Optional[dict] = None,
+        profile: bool = False,
     ):
         """
         Initialize rollout coordinator.
@@ -51,6 +52,7 @@ class RolloutCoordinator:
             model: Optional explicit model for batched policy construction.
             tokenizer: Optional explicit tokenizer for batched policy construction.
             generation_params: Optional generation params override for batched policy.
+            profile: When True, collect per-phase timing in the rollout runner.
         """
         self.env_fn = env_fn
         self.policy_fn = policy_fn
@@ -61,6 +63,7 @@ class RolloutCoordinator:
         self._explicit_model = model
         self._explicit_tokenizer = tokenizer
         self._explicit_generation_params = generation_params
+        self.profile = profile
 
         if self.batch_size > 1 and self.num_workers > 0:
             raise ValueError(
@@ -109,7 +112,9 @@ class RolloutCoordinator:
         # Create single runner for direct use
         env = self.env_fn()
         policy = self.policy_fn()
-        self.runner = RolloutRunner(env, policy, self.strategy, self.max_steps)
+        self.runner = RolloutRunner(
+            env, policy, self.strategy, self.max_steps, profile=self.profile,
+        )
 
         if self.batch_size > 1 and self._batched_policy_fn is None:
             # Accept user-supplied batched policy directly.
@@ -195,6 +200,21 @@ class RolloutCoordinator:
             )
         return self.runner.collect()
     
+    def get_rollout_timing(self) -> dict:
+        """Return rollout sub-phase timing breakdown from the runner.
+
+        Delegates to ``RolloutRunner.get_timing()``.  Returns an empty dict
+        when profiling is disabled or in multi-process mode.
+        """
+        if hasattr(self, "runner"):
+            return self.runner.get_timing()
+        return {}
+
+    def reset_rollout_timing(self) -> None:
+        """Reset rollout timing accumulators."""
+        if hasattr(self, "runner"):
+            self.runner.reset_timing()
+
     def close(self):
         """Cleanup resources."""
         if self.workers:
