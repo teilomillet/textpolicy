@@ -80,7 +80,8 @@ class ReasoningConfig:
     output_dir: str = "results/countdown_reasoning_lora"
 
 
-_RUNNER_INTERNAL_MAX_EPISODES = 10  # hardcoded in RolloutRunner.__init__
+# RolloutRunner uses max(10, max_steps) for buffer capacity, so it
+# dynamically grows with episodes_per_step.  No artificial cap needed.
 
 
 def save_config(config: ReasoningConfig, output_dir: Path) -> None:
@@ -197,14 +198,6 @@ def print_amdahl_summary(
 
 
 def run_experiment(config: ReasoningConfig) -> None:
-    if config.episodes_per_step > _RUNNER_INTERNAL_MAX_EPISODES:
-        raise ValueError(
-            f"episodes_per_step ({config.episodes_per_step}) exceeds "
-            f"RolloutRunner's internal buffer capacity "
-            f"({_RUNNER_INTERNAL_MAX_EPISODES}). Episodes would be "
-            f"silently evicted before reaching the training buffer."
-        )
-
     if config.batch_size > config.episodes_per_step:
         raise ValueError(
             f"batch_size ({config.batch_size}) exceeds episodes_per_step "
@@ -387,6 +380,7 @@ if __name__ == "__main__":
     parser.add_argument("--num-problems", type=int, default=50, help="Number of countdown problems")
     parser.add_argument("--episodes-per-step", type=int, default=8, help="Episodes per training step")
     parser.add_argument("--batch-size", type=int, default=8, help="Batched generation across episodes")
+    parser.add_argument("--max-tokens", type=int, default=256, help="Max completion tokens per episode")
     parser.add_argument("--temperature", type=float, default=0.7, help="Temperature")
     parser.add_argument("--seed", type=int, default=42, help="Dataset seed")
     parser.add_argument("--lora-rank", type=int, default=2, help="LoRA rank")
@@ -428,6 +422,7 @@ if __name__ == "__main__":
         num_problems=args.num_problems,
         episodes_per_step=args.episodes_per_step,
         batch_size=args.batch_size,
+        max_completion_tokens=args.max_tokens,
         temperature=args.temperature,
         dataset_seed=args.seed,
         lora_rank=args.lora_rank,
