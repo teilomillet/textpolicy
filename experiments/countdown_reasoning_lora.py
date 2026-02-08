@@ -140,6 +140,7 @@ def print_summary(output_dir: Path) -> None:
 def print_amdahl_summary(
     phase_totals: Dict[str, float],
     trainer_phase_totals: Dict[str, float],
+    rollout_phase_totals: Optional[Dict[str, float]] = None,
 ) -> None:
     total = sum(phase_totals.values())
     if total <= 0.0:
@@ -158,6 +159,23 @@ def print_amdahl_summary(
             f"  {name:16s} {seconds:8.2f}s  "
             f"({fraction * 100:5.1f}%)  Amdahl limit if perfect: {speedup_str}"
         )
+
+    if rollout_phase_totals:
+        rollout_total = rollout_phase_totals.get("total", 0.0)
+        if rollout_total > 0.0:
+            print("\n  Rollout-internal split (for rollout_collect phase):")
+            r_ranked = sorted(
+                (
+                    (phase, secs)
+                    for phase, secs in rollout_phase_totals.items()
+                    if phase != "total"
+                ),
+                key=lambda kv: kv[1],
+                reverse=True,
+            )
+            for phase, seconds in r_ranked:
+                pct = (seconds / rollout_total) * 100.0
+                print(f"    {phase:16s} {seconds:8.2f}s  ({pct:5.1f}%)")
 
     if trainer_phase_totals:
         trainer_total = trainer_phase_totals.get("total", 0.0)
@@ -279,6 +297,7 @@ def run_experiment(config: ReasoningConfig) -> None:
             "top_p": config.top_p,
             "repetition_penalty": config.repetition_penalty,
         },
+        profile=config.profile_training,
     )
 
     buffer = Buffer(max_episodes=config.episodes_per_step)
@@ -294,6 +313,7 @@ def run_experiment(config: ReasoningConfig) -> None:
         "checkpoint_s": 0.0,
     }
     trainer_phase_totals: Dict[str, float] = {}
+    rollout_phase_totals: Dict[str, float] = {}
     for step in range(config.max_steps):
         step_start = time.perf_counter()
 
@@ -303,6 +323,10 @@ def run_experiment(config: ReasoningConfig) -> None:
         for ep in rollout_buffer.episodes:
             buffer.add_episode_from_dict(ep.to_dict())
         phase_totals["rollout_collect_s"] += time.perf_counter() - rollout_start
+
+        # Accumulate rollout sub-phase timing when profiling is enabled.
+        for phase, secs in rollout.get_rollout_timing().items():
+            rollout_phase_totals[phase] = rollout_phase_totals.get(phase, 0.0) + secs
 
         new_episode = rollout_buffer.episodes[-1]
         example = problems[global_episode_count % len(problems)]
@@ -349,7 +373,7 @@ def run_experiment(config: ReasoningConfig) -> None:
     save_checkpoint(model, output_dir, config.max_steps)
     phase_totals["checkpoint_s"] += time.perf_counter() - checkpoint_start
     print_summary(output_dir)
-    print_amdahl_summary(phase_totals, trainer_phase_totals)
+    print_amdahl_summary(phase_totals, trainer_phase_totals, rollout_phase_totals)
 
 
 if __name__ == "__main__":
