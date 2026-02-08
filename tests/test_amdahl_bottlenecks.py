@@ -172,7 +172,7 @@ class TestPackEpisodesRewards:
 
         episodes = _make_dict_episodes(10)
         expected_rewards = _pack_episodes_episode_rewards_reference(episodes)
-        result = _pack_episodes(episodes)
+        result = _pack_episodes(episodes, sort_by_length=False)
 
         actual_rewards = result['rewards'].tolist()
         assert len(actual_rewards) == len(expected_rewards)
@@ -184,7 +184,7 @@ class TestPackEpisodesRewards:
 
         episodes = _make_object_episodes(10)
         expected_rewards = _pack_episodes_episode_rewards_reference(episodes)
-        result = _pack_episodes(episodes)
+        result = _pack_episodes(episodes, sort_by_length=False)
 
         actual_rewards = result['rewards'].tolist()
         assert len(actual_rewards) == len(expected_rewards)
@@ -195,7 +195,7 @@ class TestPackEpisodesRewards:
         from textpolicy.algorithms.grpo import _pack_episodes
 
         episodes = _make_dict_episodes(5)
-        result = _pack_episodes(episodes)
+        result = _pack_episodes(episodes, sort_by_length=False)
 
         # Each episode has act=[[4,5]], flattened length = 2
         assert result['episode_lengths'] == [2] * 5
