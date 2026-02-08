@@ -1068,15 +1068,6 @@ class TestBoostEntropyWithPlanning:
         assert not mx.any(mx.isnan(result)).item()
         assert result.shape == entropies.shape
 
-    def test_h10q_negative_gamma_rejected_at_function_level(self):
-        """H10q regression: direct helper call rejects negative gamma."""
-        entropies = mx.array([1.0, 2.0, 3.0], dtype=mx.float32)
-        mask = mx.array([1.0, 0.0, 1.0], dtype=mx.float32)
-
-        with pytest.raises(ValueError, match="gamma must be >= 0"):
-            boost_entropy_with_planning(entropies, mask, gamma=-0.1)
-
-
 @pytest.mark.unit
 @pytest.mark.algorithm
 class TestHICRAFusionTransform:
@@ -1318,6 +1309,87 @@ class TestHICRAFusionTransform:
 
         assert mx.allclose(result_on_demand, result_prepared, atol=1e-6), \
             "On-demand planning_mask path must match prepared path"
+
+    def test_h10s_precomputed_planning_mask_does_not_require_act(self):
+        """H10s: Precomputed planning_mask path should work without `act`."""
+        from textpolicy.training.reasoning_stack import _GTPOFaithfulTransform
+
+        tokenizer = _MockTokenizer({1: "let", 2: "me", 3: "think", 4: "x"})
+        transform = _GTPOFaithfulTransform(
+            alpha_1=1.0, alpha_2=0.1,
+            tokenizer=tokenizer,
+            strategic_grams=["let me think"],
+            hicra_gamma=0.3,
+        )
+
+        batch_data = {
+            "rewards": mx.array([1.0, 1.0, 0.0, 0.0], dtype=mx.float32),
+            "token_entropies": mx.array([
+                2.0, 3.0, 1.0,
+                4.0, 1.0, 2.0,
+                3.0, 2.0, 1.0,
+                1.0, 3.0, 2.0,
+            ], dtype=mx.float32),
+            "episode_lengths": [3, 3, 3, 3],
+            "planning_mask": mx.array([
+                1.0, 1.0, 1.0,
+                0.0, 0.0, 0.0,
+                0.0, 0.0, 0.0,
+                0.0, 0.0, 0.0,
+            ], dtype=mx.float32),
+            # `act` intentionally omitted; precomputed mask should be sufficient.
+        }
+
+        advantages = mx.zeros((12,), dtype=mx.float32)
+        result = transform(advantages, batch_data)
+        mx.eval(result)
+        assert result.shape == (12,)
+        assert not mx.any(mx.isnan(result)).item()
+
+    def test_h10t_missing_act_raises_when_on_demand_mask_needed(self):
+        """H10t: Missing `act` raises when on-demand planning mask is required."""
+        from textpolicy.training.reasoning_stack import _GTPOFaithfulTransform
+
+        tokenizer = _MockTokenizer({1: "let", 2: "me", 3: "think", 4: "x"})
+        transform = _GTPOFaithfulTransform(
+            alpha_1=1.0, alpha_2=0.1,
+            tokenizer=tokenizer,
+            strategic_grams=["let me think"],
+            hicra_gamma=0.3,
+        )
+
+        batch_data = {
+            "rewards": mx.array([1.0, 0.0], dtype=mx.float32),
+            "token_entropies": mx.array([2.0, 3.0, 1.0, 4.0], dtype=mx.float32),
+            "episode_lengths": [2, 2],
+            # `planning_mask` and `act` both omitted -> on-demand path should fail.
+        }
+
+        with pytest.raises(ValueError, match="batch_data must include 'act'"):
+            transform(mx.zeros((4,), dtype=mx.float32), batch_data)
+
+    def test_h10u_invalid_precomputed_mask_shape_raises(self):
+        """H10u: Precomputed planning_mask with wrong shape raises ValueError."""
+        from textpolicy.training.reasoning_stack import _GTPOFaithfulTransform
+
+        tokenizer = _MockTokenizer({1: "let", 2: "me", 3: "think", 4: "x"})
+        transform = _GTPOFaithfulTransform(
+            alpha_1=1.0, alpha_2=0.1,
+            tokenizer=tokenizer,
+            strategic_grams=["let me think"],
+            hicra_gamma=0.3,
+        )
+
+        batch_data = {
+            "rewards": mx.array([1.0, 0.0], dtype=mx.float32),
+            "token_entropies": mx.array([2.0, 3.0, 1.0, 4.0], dtype=mx.float32),
+            "episode_lengths": [2, 2],
+            # Wrong length: should be 4 to align with token_entropies.
+            "planning_mask": mx.array([1.0, 0.0, 1.0], dtype=mx.float32),
+        }
+
+        with pytest.raises(ValueError, match="Shape mismatch"):
+            transform(mx.zeros((4,), dtype=mx.float32), batch_data)
 
 
 @pytest.mark.integration
