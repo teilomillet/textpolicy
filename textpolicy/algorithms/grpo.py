@@ -884,6 +884,13 @@ def gtpo_loss_faithful(
     References:
         Eq. 3, 5, 6, 7 — arXiv 2508.04349
     """
+    if new_logprobs.shape != old_logprobs.shape:
+        raise ValueError(
+            f"new_logprobs shape {new_logprobs.shape} != "
+            f"old_logprobs shape {old_logprobs.shape}. "
+            f"Both must be flat 1D with the same number of tokens."
+        )
+
     total_tokens = old_logprobs.shape[0]
     if total_tokens == 0:
         return mx.array(0.0)

@@ -519,6 +519,19 @@ class TestEdgeCases:
         with pytest.raises(ValueError, match="rewards length"):
             compute_gtpo_shaped_rewards(rewards, entropies, episode_lengths)
 
+    def test_new_logprobs_shape_mismatch_raises(self):
+        """Scalar/short new_logprobs silently broadcasts in MLX — must fail fast."""
+        old_lp = mx.array([-1.0, -1.0, -1.0, -1.0])
+        new_lp_scalar = mx.array([-1.0])  # length 1 != 4
+        rewards = [1.0, 0.0]
+        episode_lengths = [2, 2]
+        entropies = mx.array([2.0, 3.0, 1.0, 4.0])
+
+        with pytest.raises(ValueError, match="new_logprobs shape"):
+            gtpo_loss_faithful(
+                old_lp, new_lp_scalar, rewards, entropies, episode_lengths
+            )
+
 
 # ---------------------------------------------------------------------------
 # H8: Gradient detachment (Remark 2.5)
