@@ -19,22 +19,70 @@ get zero gradients.  The implementation therefore:
 This is safe with LoRA because only adapter weights need gradients.
 Frozen base weights are closed over and correctly receive no gradients.
 
+Implementation note: Python's data model looks up ``__call__`` on the
+**type**, not the instance, when handling the ``()`` operator.  Setting
+``layer.__call__ = wrapper`` as an instance attribute does NOT work —
+``layer(x)`` still dispatches to ``type(layer).__call__``.  We use
+``__class__`` reassignment to swap each layer's class to a dynamically
+created subclass whose class-level ``__call__`` invokes
+``mx.checkpoint``.  This preserves the parameter tree structure
+(no extra ``inner.`` prefix) and all attribute access.
+
 Incompatibility: ``mx.checkpoint`` inside ``mx.compile`` fails.  When
 gradient checkpointing is enabled, the Trainer forces compilation off.
 
 References:
     Issue #55 — O(n^1.89) training scaling and memory wall
     MLX docs — mx.checkpoint
+    Python Data Model — implicit special method lookup
 """
 
 import logging
-from typing import List
+from typing import Dict, List, Type
 
 import mlx.core as mx  # type: ignore
 import mlx.nn as nn  # type: ignore
 from mlx.utils import tree_flatten, tree_unflatten  # type: ignore
 
 logger = logging.getLogger(__name__)
+
+# Cache: original_class -> checkpointed_subclass.
+# Avoids creating duplicate subclasses when apply is called multiple times
+# or on multiple models that share the same layer class.
+_checkpointed_class_cache: Dict[Type, Type] = {}
+
+
+def _make_checkpointed_class(original_cls: Type) -> Type:
+    """Create a subclass of ``original_cls`` with ``__call__`` wrapped by
+    ``mx.checkpoint``.
+
+    The subclass overrides ``__call__`` at the **class level**, which is
+    where Python's ``()`` operator looks it up.  The ``_original_class``
+    attribute lets ``remove_gradient_checkpointing`` restore the layer.
+    """
+    original_call = original_cls.__call__
+
+    def checkpointed_call(self, x, mask=None, cache=None):
+        # Extract trainable parameters as explicit checkpoint args.
+        # With LoRA, this is just the adapter weights (lora_a, lora_b).
+        flat = tree_flatten(self.trainable_parameters())
+        keys = [k for k, _ in flat]
+        arrays = [a for _, a in flat]
+
+        def forward(x_in, *params):
+            # Reconnect trainable parameters into the layer.
+            param_dict = tree_unflatten(list(zip(keys, params)))
+            self.update(param_dict)
+            return original_call(self, x_in, mask=mask, cache=cache)
+
+        return mx.checkpoint(forward)(x, *arrays)
+
+    cls_name = f"_Checkpointed_{original_cls.__name__}"
+    checkpointed_cls = type(cls_name, (original_cls,), {
+        "__call__": checkpointed_call,
+        "_original_class": original_cls,
+    })
+    return checkpointed_cls
 
 
 def _get_layers(model: nn.Module) -> List[nn.Module]:
@@ -62,16 +110,14 @@ def _get_layers(model: nn.Module) -> List[nn.Module]:
 def apply_gradient_checkpointing(model: nn.Module) -> int:
     """Wrap each transformer layer's forward pass with ``mx.checkpoint``.
 
-    For each layer in the model's transformer stack:
-    1. Save the original ``__call__`` as ``layer._original_call``
-    2. Replace ``__call__`` with a wrapper that:
-       a. Extracts trainable parameters via ``tree_flatten``
-       b. Passes them as explicit positional args to ``mx.checkpoint``
-       c. Inside checkpoint: ``layer.update()`` reconnects params,
-          then calls the original forward
+    For each layer in the model's transformer stack, swaps the layer's
+    ``__class__`` to a dynamically-created subclass whose ``__call__``
+    invokes ``mx.checkpoint``.  This ensures that ``layer(x)`` (Python's
+    ``()`` operator, which dispatches via ``type(layer).__call__``)
+    actually hits the checkpointed path.
 
-    Already-checkpointed layers (those with ``_original_call``) are
-    skipped, making this function idempotent.
+    Already-checkpointed layers (those whose class has ``_original_class``)
+    are skipped, making this function idempotent.
 
     Args:
         model: MLX transformer model (with LoRA adapters applied).
@@ -83,39 +129,17 @@ def apply_gradient_checkpointing(model: nn.Module) -> int:
     count = 0
 
     for layer in layers:
-        if hasattr(layer, "_original_call"):
+        if getattr(type(layer), "_original_class", None) is not None:
             # Already checkpointed — skip for idempotency.
             continue
 
-        original_call = layer.__call__
-        layer._original_call = original_call
+        original_cls = type(layer)
+        if original_cls not in _checkpointed_class_cache:
+            _checkpointed_class_cache[original_cls] = (
+                _make_checkpointed_class(original_cls)
+            )
 
-        def _make_checkpointed_call(layer_ref, orig_call):
-            """Build a checkpoint wrapper closed over a specific layer.
-
-            The closure captures ``layer_ref`` and ``orig_call`` by
-            value (via the factory function's local scope), avoiding
-            the late-binding pitfall of Python closures in loops.
-            """
-
-            def checkpointed_call(x, mask=None, cache=None):
-                # Extract trainable parameters as explicit checkpoint args.
-                # With LoRA, this is just the adapter weights (lora_a, lora_b).
-                flat = tree_flatten(layer_ref.trainable_parameters())
-                keys = [k for k, _ in flat]
-                arrays = [a for _, a in flat]
-
-                def forward(x_in, *params):
-                    # Reconnect trainable parameters into the layer.
-                    param_dict = tree_unflatten(list(zip(keys, params)))
-                    layer_ref.update(param_dict)
-                    return orig_call(x_in, mask=mask, cache=cache)
-
-                return mx.checkpoint(forward)(x, *arrays)
-
-            return checkpointed_call
-
-        layer.__call__ = _make_checkpointed_call(layer, original_call)
+        layer.__class__ = _checkpointed_class_cache[original_cls]
         count += 1
 
     if count > 0:
@@ -127,7 +151,7 @@ def apply_gradient_checkpointing(model: nn.Module) -> int:
 
 
 def remove_gradient_checkpointing(model: nn.Module) -> int:
-    """Restore original ``__call__`` on all checkpointed layers.
+    """Restore original ``__class__`` on all checkpointed layers.
 
     Args:
         model: MLX transformer model with checkpointing active.
@@ -139,9 +163,9 @@ def remove_gradient_checkpointing(model: nn.Module) -> int:
     count = 0
 
     for layer in layers:
-        if hasattr(layer, "_original_call"):
-            layer.__call__ = layer._original_call
-            del layer._original_call
+        original_cls = getattr(type(layer), "_original_class", None)
+        if original_cls is not None:
+            layer.__class__ = original_cls
             count += 1
 
     if count > 0:
@@ -159,11 +183,14 @@ def is_gradient_checkpointing_active(model: nn.Module) -> bool:
         model: MLX transformer model.
 
     Returns:
-        True if at least one layer has a ``_original_call`` attribute.
+        True if at least one layer's class has ``_original_class``.
     """
     try:
         layers = _get_layers(model)
     except ValueError:
         return False
 
-    return any(hasattr(layer, "_original_call") for layer in layers)
+    return any(
+        getattr(type(layer), "_original_class", None) is not None
+        for layer in layers
+    )

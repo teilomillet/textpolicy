@@ -146,27 +146,32 @@ class TestApplyRemove:
         count = apply_gradient_checkpointing(model)
         assert count == 3, f"Expected 3, got {count}"
 
-    def test_remove_restores_original_calls(self):
-        """H2: remove restores original __call__ and removes _original_call attr."""
+    def test_remove_restores_original_class(self):
+        """H2: remove restores original __class__ on all layers."""
         mx.random.seed(42)
         model = TinyLoRAModel(num_layers=3)
         mx.eval(model.parameters())
 
         apply_gradient_checkpointing(model)
-        # All layers should have _original_call after apply
+        # All layers should have a checkpointed class after apply
         for i, layer in enumerate(model.layers):
-            assert hasattr(layer, "_original_call"), (
-                f"Layer {i} missing _original_call after apply"
+            assert getattr(type(layer), "_original_class", None) is not None, (
+                f"Layer {i} not checkpointed after apply"
+            )
+            assert type(layer).__name__.startswith("_Checkpointed_"), (
+                f"Layer {i} class name is {type(layer).__name__}"
             )
 
         count = remove_gradient_checkpointing(model)
         assert count == 3, f"Expected 3 restored, got {count}"
 
-        # _original_call should be cleaned up
+        # All layers should be back to original class
         for i, layer in enumerate(model.layers):
-            assert not hasattr(layer, "_original_call"), (
-                f"Layer {i} still has _original_call after remove"
+            assert type(layer) is TransformerLayer, (
+                f"Layer {i} class is {type(layer).__name__}, "
+                f"expected TransformerLayer"
             )
+            assert getattr(type(layer), "_original_class", None) is None
 
     def test_double_apply_is_idempotent(self):
         """H3: Second apply returns 0 (no layers newly checkpointed)."""
@@ -211,6 +216,45 @@ class TestApplyRemove:
         count = apply_gradient_checkpointing(model)
         assert count == 4
         assert is_gradient_checkpointing_active(model)
+
+    def test_call_dispatches_to_checkpointed_wrapper(self):
+        """H15: layer(x) dispatches to the checkpointed __call__, not the original.
+
+        This is the critical test that catches the original bug: instance
+        attribute monkey-patching of __call__ is silently ignored by
+        Python's () operator, which looks up __call__ on the type.
+
+        We verify that after apply_gradient_checkpointing:
+        1. type(layer).__call__ is different from the original class __call__
+        2. The class name reflects the checkpointed wrapper
+        3. Parameter tree paths are preserved (no 'inner.' prefix)
+        """
+        mx.random.seed(42)
+        model = TinyLoRAModel(num_layers=3)
+        mx.eval(model.parameters())
+
+        original_call = TransformerLayer.__call__
+
+        # Capture parameter paths before checkpointing
+        paths_before = [k for k, _ in tree_flatten(model.parameters())]
+
+        apply_gradient_checkpointing(model)
+
+        # Verify class-level __call__ changed (not just instance attribute)
+        for i, layer in enumerate(model.layers):
+            assert type(layer).__call__ is not original_call, (
+                f"Layer {i}: type(layer).__call__ is still the original — "
+                f"checkpointing wrapper not dispatched by layer(x)"
+            )
+            assert "_Checkpointed_" in type(layer).__name__
+
+        # Verify parameter tree paths are preserved
+        paths_after = [k for k, _ in tree_flatten(model.parameters())]
+        assert paths_before == paths_after, (
+            f"Parameter paths changed after checkpointing:\n"
+            f"  before: {paths_before}\n"
+            f"  after:  {paths_after}"
+        )
 
 
 # ---------------------------------------------------------------------------
