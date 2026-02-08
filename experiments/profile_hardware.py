@@ -216,7 +216,12 @@ def run_probe(
             rollout_buffer = rollout.collect()
             for ep in rollout_buffer.episodes:
                 buffer.add_episode_from_dict(ep.to_dict())
-            mx.eval()  # Force sync for accurate timing
+            # Evaluate model parameters to flush any pending lazy computation
+            # from the generation phase.  mx.eval() with no args is a no-op;
+            # explicit arrays are required.  The rollout runner's internal
+            # barriers should already handle this, but we add a defence-in-depth
+            # barrier to ensure generation cost is not leaked into train timing.
+            mx.eval(model.parameters())
             gen_time = time.perf_counter() - gen_start
             gen_times.append(gen_time)
 
@@ -262,7 +267,11 @@ def run_probe(
             # Training phase
             train_start = time.perf_counter()
             metrics = trainer.train()
-            mx.eval()  # Force sync for accurate timing
+            # Flush any pending lazy computation from the training phase.
+            # trainer.train() has internal mx.eval(loss, grads) barriers, but
+            # metrics computation may leave lazy arrays.  Evaluating model
+            # parameters ensures training cost is fully attributed here.
+            mx.eval(model.parameters())
             train_time = time.perf_counter() - train_start
             train_times.append(train_time)
 
