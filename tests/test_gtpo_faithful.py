@@ -32,6 +32,7 @@ from textpolicy.algorithms.grpo import (
     normalize_gtpo_advantages,
     gtpo_loss_faithful,
 )
+from textpolicy.algorithms.hicra import boost_entropy_with_planning
 
 
 # ---------------------------------------------------------------------------
@@ -951,6 +952,415 @@ class TestGTPOFaithfulTrainerIntegration:
         batch = self._make_batch(num_episodes=4, response_len=2)
         metrics = trainer.train(batch)
         assert math.isfinite(metrics["loss"]), f"Loss should be finite, got {metrics['loss']}"
+
+
+# ---------------------------------------------------------------------------
+# H10: HICRA Fusion via Entropy Injection
+# ---------------------------------------------------------------------------
+
+# MockTokenizer for HICRA fusion tests — maps token IDs to predictable strings
+# so we can control which tokens match strategic grams.
+class _MockTokenizer:
+    """Maps token IDs to pre-configured strings for test control."""
+
+    def __init__(self, vocab: dict):
+        self._vocab = vocab
+
+    def convert_ids_to_tokens(self, ids):
+        return [self._vocab.get(i, "x") for i in ids]
+
+
+@pytest.mark.unit
+@pytest.mark.algorithm
+class TestBoostEntropyWithPlanning:
+    """H10a-g: Pure function tests for boost_entropy_with_planning."""
+
+    def test_h10a_gamma_zero_identity(self):
+        """H10a: gamma=0 returns entropies unchanged (identity)."""
+        entropies = mx.array([1.0, 2.0, 3.0, 4.0])
+        mask = mx.array([1.0, 0.0, 1.0, 0.0])
+
+        result = boost_entropy_with_planning(entropies, mask, gamma=0.0)
+        mx.eval(result)
+
+        assert mx.array_equal(result, entropies), "gamma=0 should return identity"
+
+    def test_h10b_all_zero_mask_identity(self):
+        """H10b: All-zero planning mask → entropies unchanged."""
+        entropies = mx.array([1.0, 2.0, 3.0, 4.0])
+        mask = mx.zeros((4,), dtype=mx.float32)
+
+        result = boost_entropy_with_planning(entropies, mask, gamma=0.3)
+        mx.eval(result)
+
+        assert mx.allclose(result, entropies, atol=1e-6), \
+            "All-zero mask should leave entropies unchanged"
+
+    def test_h10c_manual_verification(self):
+        """H10c: Manual verification: H + gamma * mask * mean(H)."""
+        entropies = mx.array([2.0, 4.0, 1.0, 3.0])
+        mask = mx.array([1.0, 0.0, 1.0, 0.0])
+        gamma = 0.3
+
+        result = boost_entropy_with_planning(entropies, mask, gamma=gamma)
+        mx.eval(result)
+        r = result.tolist()
+
+        # mean(H) = (2+4+1+3)/4 = 2.5
+        mean_h = 2.5
+        # t=0: 2.0 + 0.3*1.0*2.5 = 2.0 + 0.75 = 2.75
+        assert abs(r[0] - 2.75) < 1e-4, f"t=0: expected 2.75, got {r[0]}"
+        # t=1: 4.0 + 0.3*0.0*2.5 = 4.0
+        assert abs(r[1] - 4.0) < 1e-4, f"t=1: expected 4.0, got {r[1]}"
+        # t=2: 1.0 + 0.3*1.0*2.5 = 1.75
+        assert abs(r[2] - 1.75) < 1e-4, f"t=2: expected 1.75, got {r[2]}"
+        # t=3: 3.0 + 0.3*0.0*2.5 = 3.0
+        assert abs(r[3] - 3.0) < 1e-4, f"t=3: expected 3.0, got {r[3]}"
+
+    def test_h10d_zero_entropies_no_nan(self):
+        """H10d: All-zero entropies → boost is zero, no NaN."""
+        entropies = mx.zeros((4,), dtype=mx.float32)
+        mask = mx.array([1.0, 0.0, 1.0, 0.0])
+
+        result = boost_entropy_with_planning(entropies, mask, gamma=0.5)
+        mx.eval(result)
+
+        assert not mx.any(mx.isnan(result)).item(), "Should not produce NaN"
+        assert mx.allclose(result, mx.zeros((4,)), atol=1e-6), \
+            "Zero entropies + boost should still be zero (mean(0)=0)"
+
+    def test_h10e_shape_mismatch_raises(self):
+        """H10e: Shape mismatch raises ValueError."""
+        entropies = mx.array([1.0, 2.0, 3.0])
+        mask = mx.array([1.0, 0.0])
+
+        with pytest.raises(ValueError, match="Shape mismatch"):
+            boost_entropy_with_planning(entropies, mask)
+
+    def test_h10f_stop_gradient_on_mask(self):
+        """H10f: mx.stop_gradient — no gradient through planning mask."""
+        def fn(mask):
+            entropies = mx.array([2.0, 4.0, 1.0, 3.0])
+            boosted = boost_entropy_with_planning(entropies, mask, gamma=0.3)
+            return mx.sum(boosted)
+
+        mask = mx.array([1.0, 0.0, 1.0, 0.0])
+        grad_fn = mx.grad(fn)
+        grad_mask = grad_fn(mask)
+        mx.eval(grad_mask)
+
+        assert mx.allclose(
+            grad_mask, mx.zeros_like(grad_mask), atol=1e-12
+        ), f"Gradient w.r.t. mask should be zero, got {grad_mask}"
+
+    def test_h10g_runs_under_mx_compile(self):
+        """H10g: Runs under mx.compile without error."""
+        @mx.compile
+        def compiled_boost(entropies, mask):
+            return boost_entropy_with_planning(entropies, mask, gamma=0.3)
+
+        entropies = mx.array([2.0, 4.0, 1.0, 3.0])
+        mask = mx.array([1.0, 0.0, 1.0, 0.0])
+
+        result = compiled_boost(entropies, mask)
+        mx.eval(result)
+
+        assert not mx.any(mx.isnan(result)).item()
+        assert result.shape == entropies.shape
+
+
+@pytest.mark.unit
+@pytest.mark.algorithm
+class TestHICRAFusionTransform:
+    """H10h-n: Transform-level tests for HICRA fusion in _GTPOFaithfulTransform."""
+
+    def test_h10h_default_build_identical(self):
+        """H10h: Default build (no HICRA) works identically to original."""
+        from textpolicy.training import build_gtpo_faithful_transform
+
+        transform = build_gtpo_faithful_transform(alpha_1=1.0, alpha_2=0.1)
+
+        rewards = mx.array([1.0, 1.0, 0.0])
+        episode_lengths = [2, 2, 2]
+        token_entropies = mx.array([3.0, 1.0, 1.0, 3.0, 2.0, 2.0])
+
+        batch_data = {
+            "rewards": rewards,
+            "token_entropies": token_entropies,
+            "episode_lengths": episode_lengths,
+        }
+        advantages = mx.zeros((6,))
+        result = transform(advantages, batch_data)
+        mx.eval(result)
+
+        assert result.shape == (6,)
+        assert not mx.any(mx.isnan(result)).item()
+
+    def test_h10i_gamma_without_tokenizer_raises(self):
+        """H10i: hicra_gamma > 0 without tokenizer raises ValueError."""
+        from textpolicy.training import build_gtpo_faithful_transform
+
+        with pytest.raises(ValueError, match="tokenizer"):
+            build_gtpo_faithful_transform(hicra_gamma=0.3)
+
+    def test_h10j_negative_gamma_rejected(self):
+        """H10j: Negative gamma rejected by builder."""
+        from textpolicy.training import build_gtpo_faithful_transform
+
+        with pytest.raises(ValueError, match="hicra_gamma"):
+            build_gtpo_faithful_transform(hicra_gamma=-0.1)
+
+    def test_h10k_prepare_batch_computes_planning_mask(self):
+        """H10k: prepare_batch computes correct planning mask."""
+        from textpolicy.training.reasoning_stack import _GTPOFaithfulTransform
+
+        # Token IDs: 1="let", 2="me", 3="think", 4="x"
+        tokenizer = _MockTokenizer({1: "let", 2: "me", 3: "think", 4: "x"})
+        transform = _GTPOFaithfulTransform(
+            tokenizer=tokenizer,
+            strategic_grams=["let me think"],
+            hicra_gamma=0.3,
+        )
+
+        batch_data = {
+            "act": mx.array([1, 2, 3, 4, 4, 4]),
+            "episode_lengths": [3, 3],
+        }
+        transform.prepare_batch(batch_data)
+
+        assert "planning_mask" in batch_data
+        mask = batch_data["planning_mask"]
+        mx.eval(mask)
+        mask_list = mask.tolist()
+
+        # Tokens 0,1,2 ("let me think") should be marked, tokens 3,4,5 should not
+        assert mask_list[0] == 1.0, "Token 'let' should be marked"
+        assert mask_list[1] == 1.0, "Token 'me' should be marked"
+        assert mask_list[2] == 1.0, "Token 'think' should be marked"
+        assert mask_list[3] == 0.0, "Token 'x' should not be marked"
+
+    def test_h10l_prepare_batch_noop_when_gamma_zero(self):
+        """H10l: prepare_batch is no-op when gamma=0."""
+        from textpolicy.training.reasoning_stack import _GTPOFaithfulTransform
+
+        tokenizer = _MockTokenizer({1: "let", 2: "me", 3: "think"})
+        transform = _GTPOFaithfulTransform(
+            tokenizer=tokenizer,
+            strategic_grams=["let me think"],
+            hicra_gamma=0.0,
+        )
+
+        batch_data = {
+            "act": mx.array([1, 2, 3]),
+            "episode_lengths": [3],
+        }
+        transform.prepare_batch(batch_data)
+
+        assert "planning_mask" not in batch_data, \
+            "prepare_batch should be no-op when gamma=0"
+
+    def test_h10m_planning_tokens_get_different_shaped_rewards(self):
+        """H10m: Planning tokens get different shaped rewards with fusion.
+
+        Uses 2+ episodes per O+ group so normalization doesn't collapse to zero.
+        Non-uniform entropies ensure the boost creates observable asymmetry.
+        """
+        from textpolicy.training.reasoning_stack import _GTPOFaithfulTransform
+
+        tokenizer = _MockTokenizer({1: "let", 2: "me", 3: "think", 4: "x"})
+
+        # With HICRA fusion
+        fused = _GTPOFaithfulTransform(
+            alpha_1=1.0, alpha_2=0.1,
+            tokenizer=tokenizer,
+            strategic_grams=["let me think"],
+            hicra_gamma=0.5,
+        )
+
+        # Without HICRA fusion
+        plain = _GTPOFaithfulTransform(alpha_1=1.0, alpha_2=0.1)
+
+        # 2 O+ episodes + 2 O- episodes, non-uniform entropy
+        rewards = mx.array([1.0, 1.0, 0.0, 0.0])
+        episode_lengths = [3, 3, 3, 3]
+        # Non-uniform entropy so boosting creates observable asymmetry
+        token_entropies = mx.array([
+            2.0, 3.0, 1.0,   # ep0 (O+) — has planning tokens
+            4.0, 1.0, 2.0,   # ep1 (O+) — no planning tokens
+            3.0, 2.0, 1.0,   # ep2 (O-)
+            1.0, 3.0, 2.0,   # ep3 (O-)
+        ])
+        # ep0 has "let me think" → planning mask [1,1,1,0,0,0,...]
+        act = mx.array([[1, 2, 3], [4, 4, 4], [4, 4, 4], [4, 4, 4]])
+
+        batch_fused = {
+            "rewards": rewards,
+            "token_entropies": token_entropies,
+            "episode_lengths": episode_lengths,
+            "act": act,
+        }
+        fused.prepare_batch(batch_fused)
+
+        batch_plain = {
+            "rewards": rewards,
+            "token_entropies": token_entropies,
+            "episode_lengths": episode_lengths,
+        }
+
+        advantages = mx.zeros((12,))
+        result_fused = fused(advantages, batch_fused)
+        result_plain = plain(advantages, batch_plain)
+        mx.eval(result_fused, result_plain)
+
+        # Compare the shaped rewards before normalization to see the effect
+        # After normalization, the boosted entropies should redistribute credit
+        # differently within the O+ group
+        assert not mx.allclose(result_fused, result_plain, atol=1e-4), \
+            "HICRA fusion should produce different shaped rewards than plain GTPO"
+
+    def test_h10n_no_matching_grams_same_as_no_hicra(self):
+        """H10n: No matching grams → same result as no HICRA."""
+        from textpolicy.training.reasoning_stack import _GTPOFaithfulTransform
+
+        # Tokenizer maps IDs to strings that won't match "let me think"
+        tokenizer = _MockTokenizer({1: "foo", 2: "bar", 3: "baz"})
+
+        fused = _GTPOFaithfulTransform(
+            alpha_1=1.0, alpha_2=0.1,
+            tokenizer=tokenizer,
+            strategic_grams=["let me think"],
+            hicra_gamma=0.5,
+        )
+        plain = _GTPOFaithfulTransform(alpha_1=1.0, alpha_2=0.1)
+
+        rewards = mx.array([1.0, 0.0])
+        episode_lengths = [3, 3]
+        token_entropies = mx.array([2.0, 3.0, 1.0, 4.0, 0.5, 2.5])
+
+        batch_fused = {
+            "rewards": rewards,
+            "token_entropies": token_entropies,
+            "episode_lengths": episode_lengths,
+            "act": mx.array([1, 2, 3, 1, 2, 3]),
+        }
+        fused.prepare_batch(batch_fused)
+
+        batch_plain = {
+            "rewards": rewards,
+            "token_entropies": token_entropies,
+            "episode_lengths": episode_lengths,
+        }
+
+        advantages = mx.zeros((6,))
+        result_fused = fused(advantages, batch_fused)
+        result_plain = plain(advantages, batch_plain)
+        mx.eval(result_fused, result_plain)
+
+        # No tokens match → planning_mask is all zeros → boost is identity
+        # → results should be identical
+        assert mx.allclose(result_fused, result_plain, atol=1e-6), \
+            "No matching grams should produce identical results to no HICRA"
+
+
+@pytest.mark.integration
+class TestHICRAFusionTrainerIntegration:
+    """H10o-p: End-to-end Trainer tests with fused HICRA+GTPO."""
+
+    def _make_model(self, vocab_size=16, dim=8):
+        class TinyLM(nn.Module):
+            def __init__(self):
+                super().__init__()
+                self.embed = nn.Embedding(vocab_size, dim)
+                self.head = nn.Linear(dim, vocab_size)
+            def __call__(self, x):
+                return self.head(self.embed(x))
+
+        model = TinyLM()
+        mx.eval(model.parameters())
+        return model
+
+    def _make_batch(self, num_episodes=3, prompt_len=3, response_len=2, vocab_size=16):
+        # Use token IDs that will produce "let me think" for first episode
+        # IDs 1,2 → "let","me" for strategic gram matching
+        obs = mx.random.randint(0, vocab_size, shape=(num_episodes, prompt_len + response_len))
+        # Craft act tokens: first episode has "let me", rest random
+        act_row0 = mx.array([[1, 2]])
+        act_rest = mx.random.randint(3, vocab_size, shape=(num_episodes - 1, response_len))
+        act = mx.concatenate([act_row0, act_rest], axis=0) if num_episodes > 1 else act_row0
+        total_tokens = num_episodes * response_len
+        logprob = -mx.abs(mx.random.normal((total_tokens,)))
+        rewards_list = [1.0] + [0.0] * (num_episodes - 1)
+        rewards = mx.array(rewards_list, dtype=mx.float32)
+        mx.eval(obs, act, logprob, rewards)
+        return {
+            "obs": obs,
+            "act": act,
+            "logprob": logprob,
+            "rewards": rewards,
+            "episode_lengths": [response_len] * num_episodes,
+            "prompt_lengths": [prompt_len] * num_episodes,
+        }
+
+    def test_h10o_trainer_trains_uncompiled(self):
+        """H10o: Trainer trains with fused HICRA+GTPO (uncompiled)."""
+        from functools import partial
+        from textpolicy.training import Trainer, build_gtpo_faithful_transform
+        from textpolicy.algorithms import grpo
+
+        tokenizer = _MockTokenizer({1: "let", 2: "me", 3: "think"})
+        model = self._make_model()
+        transform = build_gtpo_faithful_transform(
+            alpha_1=1.0, alpha_2=0.1,
+            tokenizer=tokenizer,
+            strategic_grams=["let me"],
+            hicra_gamma=0.3,
+        )
+
+        trainer = Trainer(
+            model=model,
+            advantage_fn=grpo.compute_advantages,
+            loss_fn=partial(grpo.policy_loss, clip_ratio=0.2),
+            optimizer=optim.Adam(learning_rate=1e-3),
+            compile_training=False,
+            advantage_transform_fn=transform,
+        )
+
+        batch = self._make_batch()
+        metrics = trainer.train(batch)
+
+        assert "loss" in metrics
+        assert math.isfinite(metrics["loss"]), f"Loss should be finite, got {metrics['loss']}"
+
+    def test_h10p_trainer_trains_compiled(self):
+        """H10p: Trainer trains with fused HICRA+GTPO (compiled) — compile-safety proof."""
+        from functools import partial
+        from textpolicy.training import Trainer, build_gtpo_faithful_transform
+        from textpolicy.algorithms import grpo
+
+        tokenizer = _MockTokenizer({1: "let", 2: "me", 3: "think"})
+        model = self._make_model()
+        transform = build_gtpo_faithful_transform(
+            alpha_1=1.0, alpha_2=0.1,
+            tokenizer=tokenizer,
+            strategic_grams=["let me"],
+            hicra_gamma=0.3,
+        )
+
+        trainer = Trainer(
+            model=model,
+            advantage_fn=grpo.compute_advantages,
+            loss_fn=partial(grpo.policy_loss, clip_ratio=0.2),
+            optimizer=optim.Adam(learning_rate=1e-3),
+            compile_training=True,
+            advantage_transform_fn=transform,
+        )
+
+        batch = self._make_batch()
+        metrics = trainer.train(batch)
+
+        assert "loss" in metrics
+        assert math.isfinite(metrics["loss"]), f"Loss should be finite, got {metrics['loss']}"
+        assert trainer._compiled is True
 
 
 if __name__ == "__main__":
