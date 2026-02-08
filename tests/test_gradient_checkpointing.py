@@ -1,8 +1,8 @@
 """
 Tests for gradient checkpointing (Issue #55).
 
-Validates the gradient checkpointing implementation which wraps each
-transformer layer's forward pass with ``mx.checkpoint`` to trade compute
+Validates the gradient checkpointing implementation which wraps selected
+transformer layers' forward pass with ``mx.checkpoint`` to trade compute
 for memory.
 
 Hypotheses tested:
@@ -213,7 +213,8 @@ class TestApplyRemove:
         model = WrappedTinyModel(num_layers=4)
         mx.eval(model.parameters())
 
-        count = apply_gradient_checkpointing(model)
+        # checkpoint_every=1 to checkpoint all layers (default uses sqrt(n))
+        count = apply_gradient_checkpointing(model, checkpoint_every=1)
         assert count == 4
         assert is_gradient_checkpointing_active(model)
 
@@ -823,3 +824,205 @@ class TestMicroBatching:
         mx.eval(lp_micro, lp_full)
 
         assert mx.allclose(lp_micro, lp_full, atol=1e-5)
+
+
+# ---------------------------------------------------------------------------
+# TestCheckpointStrideValidation
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.unit
+class TestCheckpointStrideValidation:
+    """Validate checkpoint stride input validation paths."""
+
+    def test_apply_checkpoint_every_rejects_invalid_values(self):
+        mx.random.seed(42)
+        model = TinyLoRAModel(dim=8, num_layers=3, vocab_size=16)
+        mx.eval(model.parameters())
+
+        with pytest.raises(ValueError, match="checkpoint_every must be > 0"):
+            apply_gradient_checkpointing(model, checkpoint_every=0)
+
+        with pytest.raises(ValueError, match="checkpoint_every must be > 0"):
+            apply_gradient_checkpointing(model, checkpoint_every=-1)
+
+        with pytest.raises(
+            ValueError, match="checkpoint_every must be a positive integer"
+        ):
+            apply_gradient_checkpointing(model, checkpoint_every=True)
+
+    def test_trainer_gradient_checkpointing_rejects_invalid_stride(self):
+        from textpolicy.training import Trainer
+        from textpolicy.algorithms import grpo
+
+        mx.random.seed(42)
+        model = TinyLoRAModel(dim=8, num_layers=3, vocab_size=16)
+        mx.eval(model.parameters())
+        assert not is_gradient_checkpointing_active(model)
+
+        with pytest.raises(
+            ValueError, match="integer stride must be > 0"
+        ):
+            Trainer(
+                model=model,
+                loss_fn=grpo.policy_loss,
+                optimizer=optim.Adam(learning_rate=1e-3),
+                advantage_fn=grpo.compute_advantages,
+                compile_training=False,
+                gradient_checkpointing=0,
+            )
+
+        with pytest.raises(
+            ValueError, match="must be bool or a positive integer stride"
+        ):
+            Trainer(
+                model=model,
+                loss_fn=grpo.policy_loss,
+                optimizer=optim.Adam(learning_rate=1e-3),
+                advantage_fn=grpo.compute_advantages,
+                compile_training=False,
+                gradient_checkpointing=1.5,
+            )
+
+        assert not is_gradient_checkpointing_active(model)
+
+    def test_trainer_rejects_no_trainable_params(self):
+        from textpolicy.training import Trainer
+        from textpolicy.algorithms import grpo
+
+        for use_checkpointing in (False, True):
+            mx.random.seed(42)
+            model = TinyLoRAModel(dim=8, num_layers=3, vocab_size=16)
+            mx.eval(model.parameters())
+            model.freeze()
+
+            with pytest.raises(ValueError, match="no trainable parameters"):
+                Trainer(
+                    model=model,
+                    loss_fn=grpo.policy_loss,
+                    optimizer=optim.Adam(learning_rate=1e-3),
+                    advantage_fn=grpo.compute_advantages,
+                    compile_training=False,
+                    gradient_checkpointing=use_checkpointing,
+                )
+
+            assert not is_gradient_checkpointing_active(model), (
+                "Failed Trainer init should not mutate model checkpointing state"
+            )
+
+
+# ---------------------------------------------------------------------------
+# TestSelectiveCheckpointing
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.unit
+class TestSelectiveCheckpointing:
+    """Validate selective sqrt(n) checkpointing strategy (Chen et al. 2016).
+
+    Hypotheses tested:
+      H_new1: checkpoint_every=None (sqrt(n)) on 9-layer model → 3 layers
+      H_new2: checkpoint_every=1 checkpoints all layers (backward compat)
+      H_new3: checkpoint_every=3 checkpoints layers 0, 3, 6 on 9-layer model
+      H_new4: Gradients identical between full and selective checkpointing
+    """
+
+    def test_sqrt_n_strategy(self):
+        """H_new1: Default sqrt(n) strategy checkpoints sqrt(9)=3 layers."""
+        mx.random.seed(42)
+        model = TinyLoRAModel(dim=8, num_layers=9, vocab_size=16)
+        mx.eval(model.parameters())
+
+        count = apply_gradient_checkpointing(model)
+        # sqrt(9) = 3, so stride=3, checkpointing layers 0, 3, 6 → 3 layers
+        assert count == 3, f"Expected 3, got {count}"
+
+        # Verify exactly layers 0, 3, 6 are checkpointed
+        for i, layer in enumerate(model.layers):
+            is_ckpt = getattr(type(layer), "_original_class", None) is not None
+            if i % 3 == 0:
+                assert is_ckpt, f"Layer {i} should be checkpointed"
+            else:
+                assert not is_ckpt, f"Layer {i} should NOT be checkpointed"
+
+    def test_checkpoint_every_1_all_layers(self):
+        """H_new2: checkpoint_every=1 checkpoints all layers (backward compat)."""
+        mx.random.seed(42)
+        model = TinyLoRAModel(dim=8, num_layers=9, vocab_size=16)
+        mx.eval(model.parameters())
+
+        count = apply_gradient_checkpointing(model, checkpoint_every=1)
+        assert count == 9, f"Expected 9, got {count}"
+
+        for i, layer in enumerate(model.layers):
+            assert getattr(type(layer), "_original_class", None) is not None, (
+                f"Layer {i} should be checkpointed with checkpoint_every=1"
+            )
+
+    def test_checkpoint_every_3_explicit(self):
+        """H_new3: checkpoint_every=3 checkpoints layers 0, 3, 6."""
+        mx.random.seed(42)
+        model = TinyLoRAModel(dim=8, num_layers=9, vocab_size=16)
+        mx.eval(model.parameters())
+
+        count = apply_gradient_checkpointing(model, checkpoint_every=3)
+        assert count == 3, f"Expected 3, got {count}"
+
+        checkpointed_indices = []
+        for i, layer in enumerate(model.layers):
+            if getattr(type(layer), "_original_class", None) is not None:
+                checkpointed_indices.append(i)
+
+        assert checkpointed_indices == [0, 3, 6], (
+            f"Expected layers [0, 3, 6], got {checkpointed_indices}"
+        )
+
+    def test_gradients_identical_selective_vs_full(self):
+        """H_new4: Gradients are bit-identical between full and selective checkpointing.
+
+        Selective checkpointing only changes *which* layers recompute
+        activations — the mathematical result is identical.  This test
+        verifies that property with the same model weights and input.
+        """
+        x = mx.array([[0, 1, 2, 3]], dtype=mx.int32)
+
+        def loss_fn(model, x):
+            return model(x).sum()
+
+        # Full checkpointing (every layer)
+        mx.random.seed(42)
+        model_full = TinyLoRAModel(dim=8, num_layers=9, vocab_size=16)
+        mx.eval(model_full.parameters())
+        model_full = _freeze_base_keep_lora(model_full)
+        apply_gradient_checkpointing(model_full, checkpoint_every=1)
+
+        loss_full, grads_full = nn.value_and_grad(model_full, loss_fn)(model_full, x)
+        mx.eval(loss_full, grads_full)
+
+        # Selective checkpointing (sqrt(n) default)
+        mx.random.seed(42)
+        model_sel = TinyLoRAModel(dim=8, num_layers=9, vocab_size=16)
+        mx.eval(model_sel.parameters())
+        model_sel = _freeze_base_keep_lora(model_sel)
+        apply_gradient_checkpointing(model_sel)  # None → sqrt(9) = 3
+
+        loss_sel, grads_sel = nn.value_and_grad(model_sel, loss_fn)(model_sel, x)
+        mx.eval(loss_sel, grads_sel)
+
+        # Losses must be identical
+        assert abs(loss_full.item() - loss_sel.item()) < 1e-5, (
+            f"Loss mismatch: full={loss_full.item():.6f}, "
+            f"selective={loss_sel.item():.6f}"
+        )
+
+        # All LoRA gradients must match
+        flat_full = tree_flatten(grads_full)
+        flat_sel = tree_flatten(grads_sel)
+        assert len(flat_full) == len(flat_sel)
+
+        for (k1, v1), (k2, v2) in zip(flat_full, flat_sel):
+            assert k1 == k2
+            assert mx.allclose(v1, v2, atol=1e-5), (
+                f"Gradient mismatch for {k1}: "
+                f"max diff={mx.abs(v1 - v2).max().item():.6f}"
+            )

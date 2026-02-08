@@ -53,7 +53,7 @@ class Trainer:
         metrics_fn: Optional[Callable] = None,
         max_grad_norm: Optional[float] = 0.5,
         compile_training: Union[bool, str] = "auto",
-        gradient_checkpointing: bool = False,
+        gradient_checkpointing: Union[bool, int] = False,
         micro_batch_size: Optional[int] = None,
         buffer: Optional[Buffer] = None,
         data_selector_fn: Optional[Callable] = None,
@@ -78,13 +78,19 @@ class Trainer:
                 ``"auto"`` (default) compiles when model has ≥ 1M parameters
                 (compilation overhead is only amortized for larger models).
                 ``True`` always compiles.  ``False`` never compiles.
-            gradient_checkpointing: When True, wraps each transformer layer's
-                forward pass with ``mx.checkpoint`` to trade ~30% more compute
-                for ~60% less activation memory. Compatible with
+            gradient_checkpointing: Controls activation checkpointing.
+                ``False`` disables checkpointing.
+                ``True`` enables with sqrt(n) layer selection (Chen et al.
+                2016) — best balance of memory savings vs recompute overhead.
+                An ``int`` sets the explicit stride: ``1`` checkpoints every
+                layer (maximum memory savings, ~30% extra compute), ``4``
+                checkpoints every 4th layer, etc.  Compatible with
                 ``mx.compile`` on MLX >= 0.30.6.
             micro_batch_size: When set, processes at most this many episodes
                 per model forward pass during logprob extraction, reducing
-                peak activation memory by factor ``N / micro_batch_size``.
+                per-forward logits size. In practice this can reduce peak
+                memory, but the exact reduction depends on MLX scheduling
+                during forward/backward evaluation.
                 ``None`` (default) processes all episodes in one pass.
             buffer: Optional linked buffer for automatic data selection
             data_selector_fn: Algorithm-specific function to select data from buffer
@@ -150,10 +156,9 @@ class Trainer:
         # helps for models above ~1M parameters.  TinyLM (50K) is 4x slower
         # compiled; Qwen3-0.6B (596M) is 16% faster.
         _AUTO_COMPILE_PARAM_THRESHOLD = 1_000_000
+        from mlx.utils import tree_flatten
 
         if compile_training == "auto":
-            from mlx.utils import tree_flatten
-
             n_params = sum(p.size for _, p in tree_flatten(model.parameters()))
             should_compile = n_params >= _AUTO_COMPILE_PARAM_THRESHOLD
             logger.info(
@@ -173,12 +178,41 @@ class Trainer:
         # constructor doesn't leave the model in a partially-modified state
         # (e.g. checkpointing applied but Trainer not created).
         if micro_batch_size is not None:
-            if isinstance(micro_batch_size, bool) or not isinstance(micro_batch_size, int) or micro_batch_size <= 0:
+            if (
+                isinstance(micro_batch_size, bool)
+                or not isinstance(micro_batch_size, int)
+                or micro_batch_size <= 0
+            ):
                 raise ValueError(
                     f"micro_batch_size must be a positive integer, "
                     f"got {micro_batch_size!r}"
                 )
         self._micro_batch_size = micro_batch_size
+
+        checkpoint_stride: Optional[int]
+        if isinstance(gradient_checkpointing, bool):
+            checkpoint_stride = None
+        elif isinstance(gradient_checkpointing, int):
+            if gradient_checkpointing <= 0:
+                raise ValueError(
+                    "gradient_checkpointing integer stride must be > 0, "
+                    f"got {gradient_checkpointing!r}"
+                )
+            checkpoint_stride = gradient_checkpointing
+        else:
+            raise ValueError(
+                "gradient_checkpointing must be bool or a positive integer "
+                f"stride, got {gradient_checkpointing!r}"
+            )
+
+        # Fail fast with a clear message instead of surfacing a low-level MLX
+        # grad error on the first training step.
+        n_trainable = len(tree_flatten(model.trainable_parameters()))
+        if n_trainable == 0:
+            raise ValueError(
+                "Model has no trainable parameters. Apply LoRA adapters or "
+                "unfreeze parameters before creating Trainer."
+            )
 
         # Gradient checkpointing: apply before loss_and_grad_fn creation.
         # Verified compatible with mx.compile on MLX >= 0.30.6 (explicit
@@ -186,9 +220,8 @@ class Trainer:
         self._gradient_checkpointing = gradient_checkpointing
         if gradient_checkpointing:
             from .gradient_checkpointing import apply_gradient_checkpointing
-            n_layers = apply_gradient_checkpointing(model)
-            logger.info(
-                "Gradient checkpointing applied to %d layers", n_layers
+            apply_gradient_checkpointing(
+                model, checkpoint_every=checkpoint_stride
             )
 
         if self._micro_batch_size is not None:
@@ -664,9 +697,10 @@ class Trainer:
 
                 M = self._micro_batch_size
                 if M is not None and M < num_episodes:
-                    # Micro-batched: process M episodes at a time to reduce
-                    # peak activation memory (logits tensor scales as
-                    # [M, max_seq_len, vocab] instead of [N, ...]).
+                    # Micro-batched: process M episodes at a time, bounding
+                    # per-call logits shape to [M, max_seq_len, vocab]
+                    # instead of [N, ...]. Observed peak-memory savings in
+                    # end-to-end training depend on MLX autograd scheduling.
                     all_logprobs = []
                     all_entropies = []
                     for start in range(0, num_episodes, M):

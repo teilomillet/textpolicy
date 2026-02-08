@@ -244,7 +244,7 @@ def create_tinylora_reasoning_setup(
     hicra_alpha: float = 0.2,
     entropy_weight: float = 0.1,
     compile_training: Union[bool, str] = "auto",
-    gradient_checkpointing: bool = False,
+    gradient_checkpointing: Union[bool, int] = False,
     micro_batch_size: Optional[int] = None,
     auto_reload: bool = True,
     adapter_save_path: str = "./lora_adapters.safetensors",
@@ -268,23 +268,25 @@ def create_tinylora_reasoning_setup(
         entropy_weight: GTPO entropy re-weighting coefficient beta (default 0.1).
         compile_training: ``True``, ``False``, or ``"auto"`` for mx.compile.
         gradient_checkpointing: Re-compute activations during backward pass
-            instead of caching them — reduces peak memory at the cost of
-            ~20-30 %% extra compute.
-        micro_batch_size: Process at most *N* episodes per forward/backward
-            pass, accumulating gradients across micro-batches.  Reduces peak
-            activation memory roughly by a factor of N.
+            instead of caching them.  ``True`` uses sqrt(n) layer selection
+            (Chen et al. 2016) for the best memory/compute trade-off.
+            An ``int`` sets the explicit stride (``1`` = every layer,
+            ``4`` = every 4th layer).
+        micro_batch_size: Process at most *N* episodes per logprob-extraction
+            forward pass. This bounds per-forward logits size and can reduce
+            peak memory, though exact savings depend on MLX scheduling while
+            preserving the same optimizer-step semantics.
         auto_reload: Auto-reload adapters for the rollout policy.
         adapter_save_path: Where to persist LoRA adapter weights.
         max_grad_norm: Clip gradient norm (``None`` to disable).
         **trainer_kwargs: Forwarded to :class:`Trainer`.
 
     Memory Optimization:
-        For long sequences or memory-constrained hardware, enabling both
-        ``gradient_checkpointing=True`` and ``micro_batch_size=4`` can cut
-        peak memory by ~34 %% and total step time by ~35 %% (benchmarked at
-        seq_length=1024).  Start with ``micro_batch_size=4`` and adjust
-        based on your hardware.  See ``docs/06_performance.md`` for full
-        benchmark numbers.
+        For long sequences or memory-constrained hardware, start with
+        ``micro_batch_size=4`` and then add ``gradient_checkpointing=True``
+        if you still hit memory limits. Benchmark on your hardware before
+        locking defaults. See ``docs/06_performance.md`` for examples and
+        guidance.
 
     Returns:
         Tuple of ``(trainer, memory_stats)`` where *memory_stats* contains

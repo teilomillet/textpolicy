@@ -974,8 +974,7 @@ def build_recommendation(
         next_seq = min(r.seq_length for r in failed)
         notes.append(
             f"To unlock {next_seq}+ tokens: try gradient_checkpointing=True "
-            f"and micro_batch_size=4 (GC+M=4 gives -33.7% peak memory at "
-            f"seq=1024)"
+            f"and tune micro_batch_size (start with 4) on your hardware."
         )
 
     # Check if peak memory exceeds or approaches physical RAM
@@ -996,7 +995,7 @@ def build_recommendation(
             if highest_ok.peak_memory_mb > memory_mb * 0.7:
                 notes.append(
                     "Consider micro_batch_size=4 to reduce peak memory, or "
-                    "combine with gradient_checkpointing=True for best savings"
+                    "combine with gradient_checkpointing=True if still tight."
                 )
 
     if max_feasible < 4096:
@@ -1028,7 +1027,7 @@ def build_recommendation(
         if sweet_analysis.regime == "compute-bound":
             optimization_targets.append(
                 "Train phase dominates: consider mx.compile, "
-                "gradient_checkpointing=True, micro_batch_size=4, "
+                "gradient_checkpointing=True, and tuned micro_batch_size, "
                 "or quantized training"
             )
         elif sweet_analysis.regime == "memory-bandwidth-bound":
@@ -1783,10 +1782,9 @@ Examples:
         action="store_true",
         help=(
             "Enable gradient checkpointing — recomputes activations during "
-            "backward pass instead of caching them. ~20-30%% extra compute, "
-            "but significant memory savings. Best combined with "
-            "--micro-batch-size (GC+M=4 gives -33.7%% peak memory at "
-            "seq=1024)"
+            "backward pass instead of caching them. This reduces peak "
+            "memory at the cost of additional compute. In this trainer, "
+            "True uses sqrt(n) layer selection."
         ),
     )
     parser.add_argument(
@@ -1794,11 +1792,10 @@ Examples:
         type=int,
         default=None,
         help=(
-            "Split episodes into groups of N for forward/backward, "
-            "accumulating gradients. Reduces peak activation memory roughly "
-            "by factor N. Recommended starting point: 4 (gives -37.5%% peak "
-            "memory, -25%% step time at seq=1024). Combine with "
-            "--gradient-checkpointing for best results"
+            "Process at most N episodes per logprob-extraction forward pass "
+            "to reduce peak activation memory. Start with 4, then tune for "
+            "your model/hardware. Combine with --gradient-checkpointing "
+            "when still memory constrained."
         ),
     )
     parser.add_argument(

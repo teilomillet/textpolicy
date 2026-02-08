@@ -40,10 +40,11 @@ trainer = Trainer(
 ### Micro-Batch Size
 
 By default, the Trainer concatenates all episodes into a single forward pass.
-With `micro_batch_size=N`, it splits episodes into groups of N, runs
-forward/backward on each group, and accumulates gradients before stepping.
-Peak activation memory scales with the micro-batch size rather than the
-full batch.
+With `micro_batch_size=N`, GRPO logprob extraction runs in chunks of
+at most N episodes per forward pass. This bounds per-forward logits tensor
+size and can reduce peak memory in practice, while preserving the same final
+optimizer step semantics. Exact savings depend on MLX's forward/backward
+scheduling for the specific model and hardware.
 
 ```python
 trainer = Trainer(
@@ -83,25 +84,72 @@ trainer, stats = create_tinylora_reasoning_setup(
 
 ### Benchmark Results (seq_length=1024)
 
-| Configuration       | Peak Memory (MB) | Step Time (s) | Memory Savings | Time Savings |
-|---------------------|-------------------|---------------|----------------|--------------|
-| Baseline            | 2 048             | 4.80          | —              | —            |
-| Micro-batch M=2     | 1 536             | 4.20          | -25.0%         | -12.5%       |
-| Micro-batch M=4     | 1 280             | 3.60          | -37.5%         | -25.0%       |
-| GC only             | 1 600             | 5.50          | -21.9%         | +14.6%       |
-| **GC + M=4**        | **1 357**         | **3.14**      | **-33.7%**     | **-34.6%**   |
+Example single-run probe (Apple M4 Pro 24 GB, Trinity-Nano-Preview, G=8):
 
-*GC = gradient checkpointing.  Measured on Apple M-series with unified memory.*
+| Configuration       | Peak Memory (GB) | Train Time (s) | Total Step Time (s) |
+|---------------------|------------------|----------------|---------------------|
+| Baseline            | 36.67            | 36.92          | 127.78              |
+| Micro-batch M=2     | 30.10            | 28.78          | 130.94              |
+| Micro-batch M=4     | 29.06            | 18.92          | 92.35               |
+| GC only             | 32.14            | 22.40          | 127.94              |
+| **GC + M=4**        | **24.31**        | **12.93**      | **83.56**           |
+
+Use `experiments/profile_hardware.py` on your machine before locking defaults;
+optimal settings are model- and hardware-dependent.
 
 ### Choosing Values
 
-- **Start with `micro_batch_size=4`** — this alone gives the best latency
-  improvement and significant memory savings with no extra compute.
+- **Start with `micro_batch_size=4`** — often a good balance for memory
+  savings and train-phase throughput.
 - **Add `gradient_checkpointing=True`** if you still hit memory limits, or
   if you need to scale to longer sequences (2048+ tokens).
-- **Lower `micro_batch_size`** (e.g. 2) if you want less granular accumulation.
-  Higher values (8, 16) save more memory but increase overhead from multiple
-  forward passes.
-- Gradient checkpointing adds ~20-30% compute overhead on its own, but when
-  combined with micro-batching the reduced batch size more than compensates.
+- **Tune with `profile_hardware.py`** since rollout generation can dominate
+  end-to-end time even when train time improves.
+- Gradient checkpointing usually adds compute overhead in isolation, but can
+  still improve end-to-end behavior when it prevents memory pressure.
 
+#### Selective checkpointing (sqrt(n) strategy)
+
+By default, `gradient_checkpointing=True` uses the **sqrt(n) strategy** from
+Chen et al. 2016 — only every sqrt(n)-th layer is checkpointed rather than
+all layers.  For a 56-layer model (Trinity-Nano) this means checkpointing 8
+layers instead of 56 (stride=7).  Gradients are mathematically identical
+regardless of which layers are checkpointed.
+
+##### Checkpointing strategy comparison
+
+Benchmarked on Apple M4 Pro 24 GB, Trinity-Nano-Preview (56 layers), G=8,
+LoRA rank=2 on 4 layers, `compile_training=False`:
+
+| Strategy | Layers Ckpt | seq=256 Train (s) | seq=512 Train (s) | seq=512 Peak (GB) |
+|---|---|---|---|---|
+| None (`False`) | 0/56 | 3.74 | 10.37 | 24.51 |
+| **sqrt(n) (`True`)** | **8/56** | **3.46 (-7.6%)** | **6.40 (-38.3%)** | **24.51** |
+| Every layer (`1`) | 56/56 | 2.28 (-39.2%) | 5.24 (-49.5%) | 24.24 (-1.1%) |
+
+On this model/hardware combination, both strategies improve training time
+because reduced activation memory alleviates memory-bandwidth pressure on
+Apple Silicon unified memory. The sqrt(n) strategy provides the most
+conservative checkpointing (fewer recomputed layers) while still delivering
+substantial speedups at longer sequences. Every-layer checkpointing maximizes
+both time and memory savings but recomputes more activations.
+
+Reproduce with: `uv run python experiments/benchmark_checkpointing.py`
+
+To force every-layer checkpointing, pass an explicit integer stride of `1`:
+
+```python
+trainer = Trainer(
+    ...,
+    gradient_checkpointing=1,   # every layer (max memory savings)
+)
+```
+
+Or use a custom stride (e.g. every 4th layer):
+
+```python
+trainer = Trainer(
+    ...,
+    gradient_checkpointing=4,   # every 4th layer
+)
+```

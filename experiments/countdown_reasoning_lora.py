@@ -83,10 +83,10 @@ class ReasoningConfig:
 
 
 # Memory optimization quick-reference:
-#   --gradient-checkpointing        recompute activations (saves memory, ~20-30% more compute)
-#   --micro-batch-size 4            4 episodes per fwd/bwd (best starting point)
-#   Combined (GC+M=4):             -33.7% peak memory, -34.6% step time at seq=1024
-#   See docs/06_performance.md for full benchmark table.
+#   --gradient-checkpointing        recompute selected activations to reduce memory
+#   --micro-batch-size 4            good first value for lower memory/logit pressure
+#   Combine both when memory is still tight; benchmark on your hardware.
+#   See docs/06_performance.md for examples.
 
 
 # RolloutRunner uses max(10, max_steps) for buffer capacity, so it
@@ -415,10 +415,9 @@ if __name__ == "__main__":
         action="store_true",
         help=(
             "Enable gradient checkpointing — recomputes activations during "
-            "backward pass instead of caching them. ~20-30%% extra compute, "
-            "but significant memory savings. Best combined with "
-            "--micro-batch-size (GC+M=4 gives -33.7%% peak memory at "
-            "seq=1024)"
+            "backward pass instead of caching them. This reduces peak "
+            "memory at the cost of additional compute. In this trainer, "
+            "True uses sqrt(n) layer selection."
         ),
     )
     parser.add_argument(
@@ -426,11 +425,10 @@ if __name__ == "__main__":
         type=int,
         default=None,
         help=(
-            "Split episodes into groups of N for forward/backward, "
-            "accumulating gradients. Reduces peak activation memory roughly "
-            "by factor N. Recommended starting point: 4 (gives -37.5%% peak "
-            "memory, -25%% step time at seq=1024). Combine with "
-            "--gradient-checkpointing for best results"
+            "Process at most N episodes per logprob-extraction forward pass "
+            "to reduce peak activation memory. Start with 4, then tune for "
+            "your model/hardware. Combine with --gradient-checkpointing "
+            "when still memory constrained."
         ),
     )
     parser.add_argument(
