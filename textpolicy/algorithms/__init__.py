@@ -21,6 +21,10 @@ from .grpo import (
     compute_token_entropy,
     apply_entropy_weighting,
     compute_advantages_gtpo,
+    # GTPO faithful: Paper-exact implementation (arXiv 2508.04349)
+    compute_gtpo_shaped_rewards,
+    normalize_gtpo_advantages,
+    gtpo_loss_faithful,
     # Compiled versions
     compute_advantages_compiled,
     policy_loss_compiled,
@@ -68,6 +72,10 @@ __all__ = [
     "compute_token_entropy",
     "apply_entropy_weighting",
     "compute_advantages_gtpo",
+    # GTPO faithful: Paper-exact implementation (arXiv 2508.04349)
+    "compute_gtpo_shaped_rewards",
+    "normalize_gtpo_advantages",
+    "gtpo_loss_faithful",
     # GRPO compiled versions
     "compute_advantages_compiled",
     "policy_loss_compiled",

@@ -21,6 +21,8 @@ import mlx.optimizers as optim  # type: ignore
 from textpolicy.algorithms.grpo import (
     apply_entropy_weighting,
     compute_advantages,
+    compute_gtpo_shaped_rewards,
+    normalize_gtpo_advantages,
     policy_loss,
 )
 from textpolicy.algorithms.hicra import (
@@ -231,6 +233,138 @@ def build_gtpo_hicra_transform(
         strategic_grams=strategic_grams,
         hicra_alpha=hicra_alpha,
         entropy_weight=entropy_weight,
+    )
+
+
+class _GTPOFaithfulTransform:
+    """Trainer transform for paper-faithful GTPO (arXiv 2508.04349).
+
+    Computes entropy-shaped, separately-normalized advantages per Eq. 3, 5, 6,
+    completely replacing the standard GRPO advantages.  All operations are
+    compile-safe (no ``mx.eval`` or ``.item()``).
+
+    The PPO clipped objective (Eq. 7) is handled by the Trainer's ``loss_fn``
+    (e.g. ``grpo.policy_loss``).
+    """
+
+    def __init__(
+        self,
+        *,
+        alpha_1: float = 1.0,
+        alpha_2: float = 0.1,
+        reward_threshold: float = 0.5,
+        eps: float = 1e-8,
+    ) -> None:
+        self.alpha_1 = alpha_1
+        self.alpha_2 = alpha_2
+        self.reward_threshold = reward_threshold
+        self.eps = eps
+
+    def __call__(self, advantages: mx.array, batch_data: Dict[str, Any]) -> mx.array:
+        episode_lengths = batch_data.get("episode_lengths")
+        if episode_lengths is None:
+            raise ValueError(
+                "batch_data must include 'episode_lengths' for faithful GTPO. "
+                "Ensure the rollout pipeline provides episode_lengths in the batch."
+            )
+
+        token_entropies = batch_data.get("token_entropies")
+        if token_entropies is None:
+            raise ValueError(
+                "batch_data must include 'token_entropies' for faithful GTPO. "
+                "This is auto-computed when advantage_transform_fn is set."
+            )
+
+        rewards = batch_data.get("rewards")
+        if rewards is None:
+            raise ValueError(
+                "batch_data must include 'rewards' for faithful GTPO. "
+                "Ensure the rollout pipeline provides episode-level rewards."
+            )
+
+        # Defensively flatten token_entropies if 2D padded
+        flat_entropies = _flatten_padded_token_rows(
+            token_entropies,
+            episode_lengths,
+            field_name="token_entropies",
+        )
+
+        # Eq. 3 + Eq. 5: entropy-shaped token-level rewards
+        shaped_rewards, is_positive = compute_gtpo_shaped_rewards(
+            rewards,
+            flat_entropies,
+            episode_lengths,
+            alpha_1=self.alpha_1,
+            alpha_2=self.alpha_2,
+            reward_threshold=self.reward_threshold,
+            eps=self.eps,
+        )
+
+        # Eq. 6: separate O+/O- normalization
+        faithful_advantages = normalize_gtpo_advantages(
+            shaped_rewards, is_positive, eps=self.eps,
+        )
+
+        return faithful_advantages
+
+
+def build_gtpo_faithful_transform(
+    *,
+    alpha_1: float = 1.0,
+    alpha_2: float = 0.1,
+    reward_threshold: float = 0.5,
+    eps: float = 1e-8,
+) -> Callable[[mx.array, Dict[str, Any]], mx.array]:
+    """
+    Build a Trainer-compatible transform for paper-faithful GTPO.
+
+    Implements Eq. 3, 5, 6 from arXiv 2508.04349. The returned transform
+    completely replaces standard GRPO advantages with entropy-shaped,
+    separately-normalized advantages.
+
+    PPO clipping (Eq. 7) is handled by the Trainer's ``loss_fn`` — use
+    ``functools.partial(grpo.policy_loss, clip_ratio=0.2)`` or similar.
+
+    Expected batch_data keys (auto-populated by the Trainer):
+    - ``'rewards'``: episode-level rewards [num_episodes]
+    - ``'token_entropies'``: per-token entropy [total_tokens] (auto-computed)
+    - ``'episode_lengths'``: token count per episode
+
+    Example::
+
+        from textpolicy.training import Trainer, build_gtpo_faithful_transform
+        from textpolicy.algorithms import grpo
+        from functools import partial
+
+        trainer = Trainer(
+            model=model,
+            advantage_fn=grpo.compute_advantages,
+            loss_fn=partial(grpo.policy_loss, clip_ratio=0.2),
+            optimizer=optimizer,
+            advantage_transform_fn=build_gtpo_faithful_transform(
+                alpha_1=1.0, alpha_2=0.1,
+            ),
+        )
+
+    Args:
+        alpha_1: Base reward weight (default 1.0).
+        alpha_2: Entropy-shaped weight (default 0.1).
+        reward_threshold: Threshold for O+/O- partition (default 0.5).
+        eps: Numerical stability constant (Remark 2.1).
+
+    Returns:
+        A callable ``(advantages, batch_data) -> advantages``.
+    """
+    if alpha_1 < 0.0:
+        raise ValueError(f"alpha_1 must be >= 0, got {alpha_1}.")
+    if alpha_2 < 0.0:
+        raise ValueError(f"alpha_2 must be >= 0, got {alpha_2}.")
+
+    return _GTPOFaithfulTransform(
+        alpha_1=alpha_1,
+        alpha_2=alpha_2,
+        reward_threshold=reward_threshold,
+        eps=eps,
     )
 
 

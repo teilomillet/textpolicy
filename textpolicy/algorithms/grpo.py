@@ -676,9 +676,7 @@ def compute_gtpo_shaped_rewards(
 
     # --- Partition into O+ and O- ---
     # Paper uses binary rewards {0, 1}; we threshold for generality.
-    mx.eval(rewards_arr)
     is_positive_ep = rewards_arr > reward_threshold  # [num_episodes]
-    mx.eval(is_positive_ep)
 
     # --- Build 2D internal layout: [num_episodes, max_len] ---
     # Flat 1D in/out, 2D internal for vectorized position-wise operations.
@@ -769,8 +767,9 @@ def compute_gtpo_shaped_rewards(
     for i, length in enumerate(episode_lengths):
         if length > 0:
             parts_shaped.append(shaped_2d[i, :length])
+            # Compile-safe: repeat the boolean scalar without .item()
             parts_mask.append(
-                mx.full((length,), bool(is_positive_ep[i].item()), dtype=mx.bool_)
+                mx.repeat(is_positive_ep[i:i + 1].astype(mx.bool_), length)
             )
 
     shaped_flat = mx.concatenate(parts_shaped) if parts_shaped else mx.array(
