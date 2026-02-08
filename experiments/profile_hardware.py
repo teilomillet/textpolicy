@@ -162,6 +162,10 @@ def run_probe(
     try:
         # Reset peak memory tracking before probe
         mx.reset_peak_memory()
+        # Reset trainer step count so each probe starts from step 0.
+        # Currently cosmetic (metrics_fn is None), but prevents subtle
+        # issues if a learning rate scheduler or metrics_fn is added later.
+        trainer._step_count = 0
 
         def create_env():
             return TextGenerationEnv(
