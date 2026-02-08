@@ -173,7 +173,7 @@ class Trainer:
         # constructor doesn't leave the model in a partially-modified state
         # (e.g. checkpointing applied but Trainer not created).
         if micro_batch_size is not None:
-            if not isinstance(micro_batch_size, int) or micro_batch_size <= 0:
+            if isinstance(micro_batch_size, bool) or not isinstance(micro_batch_size, int) or micro_batch_size <= 0:
                 raise ValueError(
                     f"micro_batch_size must be a positive integer, "
                     f"got {micro_batch_size!r}"

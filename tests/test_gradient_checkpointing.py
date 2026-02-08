@@ -725,6 +725,25 @@ class TestMicroBatching:
                 micro_batch_size=1.5,
             )
 
+    def test_micro_batch_bool_raises(self):
+        """H14f: micro_batch_size=True raises ValueError (bool is not int)."""
+        from textpolicy.training import Trainer
+        from textpolicy.algorithms import grpo
+
+        mx.random.seed(42)
+        model = TinyLoRAModel(dim=8, num_layers=3, vocab_size=16)
+        mx.eval(model.parameters())
+
+        with pytest.raises(ValueError, match="positive integer"):
+            Trainer(
+                model=model,
+                loss_fn=grpo.policy_loss,
+                optimizer=optim.Adam(learning_rate=1e-3),
+                advantage_fn=grpo.compute_advantages,
+                compile_training=False,
+                micro_batch_size=True,
+            )
+
     def test_invalid_micro_batch_does_not_mutate_model(self):
         """H14e: Failed Trainer init does not leave checkpointing active."""
         from textpolicy.training import Trainer
