@@ -1,7 +1,7 @@
 """
-Tests for GTPO Faithful: Paper-Exact Implementation (arXiv 2508.04349).
+Tests for GTPO: Paper-Exact Implementation (arXiv 2508.04349).
 
-Validates the paper-faithful GTPO implementation against every equation,
+Validates the GTPO implementation against every equation,
 proposition, and remark from "GTPO and GRPO-S: Token and Sequence-Level
 Reward Shaping with Policy Entropy" (Tan et al., 2025).
 
@@ -30,7 +30,7 @@ import mlx.optimizers as optim
 from textpolicy.algorithms.grpo import (
     compute_gtpo_shaped_rewards,
     normalize_gtpo_advantages,
-    gtpo_loss_faithful,
+    gtpo_loss,
 )
 from textpolicy.algorithms.hicra import boost_entropy_with_planning
 
@@ -236,7 +236,7 @@ class TestGTPOLossFaithful:
         episode_lengths = [2, 2, 2]
         entropies = mx.array([3.0, 1.5, 4.2, 2.0, 1.0, 3.5])
 
-        loss = gtpo_loss_faithful(
+        loss = gtpo_loss(
             old_lp, new_lp, rewards, entropies, episode_lengths
         )
         mx.eval(loss)
@@ -245,7 +245,7 @@ class TestGTPOLossFaithful:
         assert not mx.isinf(loss).item(), "Loss should not be Inf"
 
     def test_differs_from_baseline_grpo(self):
-        """H4: GTPO faithful should produce different advantages than GRPO.
+        """H4: GTPO should produce different advantages than GRPO.
 
         We compare shaped rewards directly rather than final loss values,
         because loss can be near zero for symmetric logprob patterns.
@@ -264,7 +264,7 @@ class TestGTPOLossFaithful:
         parts = [mx.repeat(base_adv[i:i+1], 2) for i in range(4)]
         grpo_advantages = mx.concatenate(parts)
 
-        # GTPO faithful: per-token shaped rewards → normalized advantages
+        # GTPO: per-token shaped rewards → normalized advantages
         shaped, is_pos = compute_gtpo_shaped_rewards(
             rewards, entropies, episode_lengths
         )
@@ -281,7 +281,7 @@ class TestGTPOLossFaithful:
 
         # And overall should differ from GRPO
         assert not mx.allclose(grpo_advantages, gtpo_advantages, atol=1e-4), \
-            "GTPO faithful advantages should differ from standard GRPO"
+            "GTPO advantages should differ from standard GRPO"
 
     def test_loss_with_all_features(self):
         """H4: Full loss with asymmetric clipping and varied entropy."""
@@ -291,7 +291,7 @@ class TestGTPOLossFaithful:
         episode_lengths = [2, 2, 2]
         entropies = mx.array([3.0, 1.0, 1.0, 4.0, 2.0, 2.0])
 
-        loss = gtpo_loss_faithful(
+        loss = gtpo_loss(
             old_lp, new_lp, rewards, entropies, episode_lengths,
             alpha_1=1.0, alpha_2=0.1, clip_epsilon=0.2
         )
@@ -530,7 +530,7 @@ class TestEdgeCases:
         entropies = mx.array([2.0, 3.0, 1.0, 4.0])
 
         with pytest.raises(ValueError, match="new_logprobs shape"):
-            gtpo_loss_faithful(
+            gtpo_loss(
                 old_lp, new_lp_scalar, rewards, entropies, episode_lengths
             )
 
@@ -545,7 +545,7 @@ class TestGradientDetachment:
     """Verify entropy weights are detached from gradient (Remark 2.5)."""
 
     def test_loss_produces_valid_gradient(self):
-        """H8: gtpo_loss_faithful should produce valid gradients for model params."""
+        """H8: gtpo_loss should produce valid gradients for model params."""
         model = nn.Linear(4, 4)
 
         def loss_fn(x):
@@ -561,7 +561,7 @@ class TestGradientDetachment:
             probs = mx.exp(log_probs)
             token_entropies = -mx.sum(probs * log_probs, axis=-1)
 
-            return gtpo_loss_faithful(
+            return gtpo_loss(
                 old_logprobs, new_logprobs, rewards,
                 token_entropies, episode_lengths
             )
@@ -683,20 +683,20 @@ class TestNumericalVerification:
 
 
 # ---------------------------------------------------------------------------
-# H9: Trainer integration for faithful GTPO
+# H9: Trainer integration for GTPO
 # ---------------------------------------------------------------------------
 
 @pytest.mark.integration
 class TestGTPOFaithfulTrainerIntegration:
-    """Validate that faithful GTPO works through the Trainer via advantage_transform_fn.
+    """Validate that GTPO works through the Trainer via advantage_transform_fn.
 
     The decomposition:
-    - advantage_transform_fn → build_gtpo_faithful_transform (Eq. 3, 5, 6)
+    - advantage_transform_fn → build_gtpo_transform (Eq. 3, 5, 6)
     - loss_fn → grpo.policy_loss (Eq. 7, PPO clipping)
 
     Hypotheses:
-      H9a: Trainer trains with faithful GTPO (uncompiled) — finite loss
-      H9b: Trainer trains with faithful GTPO (compiled) — compile-safety proof
+      H9a: Trainer trains with GTPO (uncompiled) — finite loss
+      H9b: Trainer trains with GTPO (compiled) — compile-safety proof
       H9c: Transform output differs from standard GRPO advantages
       H9d: Variable-length episodes handled correctly
       H9e: functools.partial(policy_loss, clip_ratio=0.2) works
@@ -721,7 +721,7 @@ class TestGTPOFaithfulTrainerIntegration:
         return model
 
     def _make_batch(self, num_episodes=3, prompt_len=3, response_len=2, vocab_size=16):
-        """Build a GRPO-style batch with rewards for faithful GTPO."""
+        """Build a GRPO-style batch with rewards for GTPO."""
         import mlx.core as mx
         obs = mx.random.randint(0, vocab_size, shape=(num_episodes, prompt_len + response_len))
         act = mx.random.randint(0, vocab_size, shape=(num_episodes, response_len))
@@ -741,13 +741,13 @@ class TestGTPOFaithfulTrainerIntegration:
         }
 
     def test_h9a_trainer_trains_uncompiled(self):
-        """H9a: Trainer produces finite loss with faithful GTPO (uncompiled)."""
+        """H9a: Trainer produces finite loss with GTPO (uncompiled)."""
         from functools import partial
-        from textpolicy.training import Trainer, build_gtpo_faithful_transform
+        from textpolicy.training import Trainer, build_gtpo_transform
         from textpolicy.algorithms import grpo
 
         model = self._make_model()
-        transform = build_gtpo_faithful_transform(alpha_1=1.0, alpha_2=0.1)
+        transform = build_gtpo_transform(alpha_1=1.0, alpha_2=0.1)
 
         trainer = Trainer(
             model=model,
@@ -765,17 +765,17 @@ class TestGTPOFaithfulTrainerIntegration:
         assert math.isfinite(metrics["loss"]), f"Loss should be finite, got {metrics['loss']}"
 
     def test_h9b_trainer_trains_compiled(self):
-        """H9b: Trainer produces finite loss with faithful GTPO (compiled).
+        """H9b: Trainer produces finite loss with GTPO (compiled).
 
-        This proves all operations in _GTPOFaithfulTransform are compile-safe:
+        This proves all operations in _GTPOTransform are compile-safe:
         no mx.eval(), no .item(), no bool() on arrays inside the traced graph.
         """
         from functools import partial
-        from textpolicy.training import Trainer, build_gtpo_faithful_transform
+        from textpolicy.training import Trainer, build_gtpo_transform
         from textpolicy.algorithms import grpo
 
         model = self._make_model()
-        transform = build_gtpo_faithful_transform(alpha_1=1.0, alpha_2=0.1)
+        transform = build_gtpo_transform(alpha_1=1.0, alpha_2=0.1)
 
         trainer = Trainer(
             model=model,
@@ -795,10 +795,10 @@ class TestGTPOFaithfulTrainerIntegration:
 
     def test_h9c_transform_differs_from_grpo(self):
         """H9c: Faithful GTPO advantages differ from standard GRPO advantages."""
-        from textpolicy.training import build_gtpo_faithful_transform
+        from textpolicy.training import build_gtpo_transform
         from textpolicy.algorithms.grpo import compute_advantages
 
-        transform = build_gtpo_faithful_transform(alpha_1=1.0, alpha_2=0.1)
+        transform = build_gtpo_transform(alpha_1=1.0, alpha_2=0.1)
 
         rewards = mx.array([1.0, 1.0, 0.0, 0.0])
         episode_lengths = [2, 2, 2, 2]
@@ -815,21 +815,21 @@ class TestGTPOFaithfulTrainerIntegration:
             "token_entropies": token_entropies,
             "episode_lengths": episode_lengths,
         }
-        faithful_advantages = transform(expanded, batch_data)
-        mx.eval(expanded, faithful_advantages)
+        gtpo_advantages = transform(expanded, batch_data)
+        mx.eval(expanded, gtpo_advantages)
 
         # GTPO should produce non-uniform per-token advantages within an episode
-        assert not mx.allclose(expanded, faithful_advantages, atol=1e-4), \
+        assert not mx.allclose(expanded, gtpo_advantages, atol=1e-4), \
             "Faithful GTPO advantages should differ from standard GRPO"
 
     def test_h9d_variable_length_episodes(self):
         """H9d: Variable-length episodes handled correctly through Trainer."""
         from functools import partial
-        from textpolicy.training import Trainer, build_gtpo_faithful_transform
+        from textpolicy.training import Trainer, build_gtpo_transform
         from textpolicy.algorithms import grpo
 
         model = self._make_model()
-        transform = build_gtpo_faithful_transform(alpha_1=1.0, alpha_2=0.1)
+        transform = build_gtpo_transform(alpha_1=1.0, alpha_2=0.1)
 
         trainer = Trainer(
             model=model,
@@ -868,11 +868,11 @@ class TestGTPOFaithfulTrainerIntegration:
     def test_h9e_partial_policy_loss(self):
         """H9e: functools.partial(policy_loss, clip_ratio=0.2) works as loss_fn."""
         from functools import partial
-        from textpolicy.training import Trainer, build_gtpo_faithful_transform
+        from textpolicy.training import Trainer, build_gtpo_transform
         from textpolicy.algorithms import grpo
 
         model = self._make_model()
-        transform = build_gtpo_faithful_transform(alpha_1=1.0, alpha_2=0.1)
+        transform = build_gtpo_transform(alpha_1=1.0, alpha_2=0.1)
 
         # Use partial with a custom clip_ratio
         loss_fn = partial(grpo.policy_loss, clip_ratio=0.3)
@@ -892,9 +892,9 @@ class TestGTPOFaithfulTrainerIntegration:
 
     def test_h9f_missing_episode_lengths_raises(self):
         """H9f: Missing episode_lengths in batch_data raises ValueError."""
-        from textpolicy.training import build_gtpo_faithful_transform
+        from textpolicy.training import build_gtpo_transform
 
-        transform = build_gtpo_faithful_transform(alpha_1=1.0, alpha_2=0.1)
+        transform = build_gtpo_transform(alpha_1=1.0, alpha_2=0.1)
         advantages = mx.array([0.5, -0.5, 0.3, -0.3])
         batch_data = {
             "rewards": mx.array([1.0, 0.0]),
@@ -907,9 +907,9 @@ class TestGTPOFaithfulTrainerIntegration:
 
     def test_h9g_missing_token_entropies_raises(self):
         """H9g: Missing token_entropies in batch_data raises ValueError."""
-        from textpolicy.training import build_gtpo_faithful_transform
+        from textpolicy.training import build_gtpo_transform
 
-        transform = build_gtpo_faithful_transform(alpha_1=1.0, alpha_2=0.1)
+        transform = build_gtpo_transform(alpha_1=1.0, alpha_2=0.1)
         advantages = mx.array([0.5, -0.5, 0.3, -0.3])
         batch_data = {
             "rewards": mx.array([1.0, 0.0]),
@@ -922,22 +922,22 @@ class TestGTPOFaithfulTrainerIntegration:
 
     def test_h9h_negative_alpha_rejected(self):
         """H9h: Negative alpha values are rejected by the builder."""
-        from textpolicy.training import build_gtpo_faithful_transform
+        from textpolicy.training import build_gtpo_transform
 
         with pytest.raises(ValueError, match="alpha_1"):
-            build_gtpo_faithful_transform(alpha_1=-0.1)
+            build_gtpo_transform(alpha_1=-0.1)
 
         with pytest.raises(ValueError, match="alpha_2"):
-            build_gtpo_faithful_transform(alpha_2=-0.5)
+            build_gtpo_transform(alpha_2=-0.5)
 
     def test_h9i_micro_batching(self):
         """H9i: Works with micro_batch_size=2."""
         from functools import partial
-        from textpolicy.training import Trainer, build_gtpo_faithful_transform
+        from textpolicy.training import Trainer, build_gtpo_transform
         from textpolicy.algorithms import grpo
 
         model = self._make_model()
-        transform = build_gtpo_faithful_transform(alpha_1=1.0, alpha_2=0.1)
+        transform = build_gtpo_transform(alpha_1=1.0, alpha_2=0.1)
 
         trainer = Trainer(
             model=model,
@@ -1071,13 +1071,13 @@ class TestBoostEntropyWithPlanning:
 @pytest.mark.unit
 @pytest.mark.algorithm
 class TestHICRAFusionTransform:
-    """H10h-n: Transform-level tests for HICRA fusion in _GTPOFaithfulTransform."""
+    """H10h-n: Transform-level tests for HICRA fusion in _GTPOTransform."""
 
     def test_h10h_default_build_identical(self):
         """H10h: Default build (no HICRA) works identically to original."""
-        from textpolicy.training import build_gtpo_faithful_transform
+        from textpolicy.training import build_gtpo_transform
 
-        transform = build_gtpo_faithful_transform(alpha_1=1.0, alpha_2=0.1)
+        transform = build_gtpo_transform(alpha_1=1.0, alpha_2=0.1)
 
         rewards = mx.array([1.0, 1.0, 0.0])
         episode_lengths = [2, 2, 2]
@@ -1097,25 +1097,25 @@ class TestHICRAFusionTransform:
 
     def test_h10i_gamma_without_tokenizer_raises(self):
         """H10i: hicra_gamma > 0 without tokenizer raises ValueError."""
-        from textpolicy.training import build_gtpo_faithful_transform
+        from textpolicy.training import build_gtpo_transform
 
         with pytest.raises(ValueError, match="tokenizer"):
-            build_gtpo_faithful_transform(hicra_gamma=0.3)
+            build_gtpo_transform(hicra_gamma=0.3)
 
     def test_h10j_negative_gamma_rejected(self):
         """H10j: Negative gamma rejected by builder."""
-        from textpolicy.training import build_gtpo_faithful_transform
+        from textpolicy.training import build_gtpo_transform
 
         with pytest.raises(ValueError, match="hicra_gamma"):
-            build_gtpo_faithful_transform(hicra_gamma=-0.1)
+            build_gtpo_transform(hicra_gamma=-0.1)
 
     def test_h10k_prepare_batch_computes_planning_mask(self):
         """H10k: prepare_batch computes correct planning mask."""
-        from textpolicy.training.reasoning_stack import _GTPOFaithfulTransform
+        from textpolicy.training.reasoning_stack import _GTPOTransform
 
         # Token IDs: 1="let", 2="me", 3="think", 4="x"
         tokenizer = _MockTokenizer({1: "let", 2: "me", 3: "think", 4: "x"})
-        transform = _GTPOFaithfulTransform(
+        transform = _GTPOTransform(
             tokenizer=tokenizer,
             strategic_grams=["let me think"],
             hicra_gamma=0.3,
@@ -1140,10 +1140,10 @@ class TestHICRAFusionTransform:
 
     def test_h10l_prepare_batch_noop_when_gamma_zero(self):
         """H10l: prepare_batch is no-op when gamma=0."""
-        from textpolicy.training.reasoning_stack import _GTPOFaithfulTransform
+        from textpolicy.training.reasoning_stack import _GTPOTransform
 
         tokenizer = _MockTokenizer({1: "let", 2: "me", 3: "think"})
-        transform = _GTPOFaithfulTransform(
+        transform = _GTPOTransform(
             tokenizer=tokenizer,
             strategic_grams=["let me think"],
             hicra_gamma=0.0,
@@ -1164,12 +1164,12 @@ class TestHICRAFusionTransform:
         Uses 2+ episodes per O+ group so normalization doesn't collapse to zero.
         Non-uniform entropies ensure the boost creates observable asymmetry.
         """
-        from textpolicy.training.reasoning_stack import _GTPOFaithfulTransform
+        from textpolicy.training.reasoning_stack import _GTPOTransform
 
         tokenizer = _MockTokenizer({1: "let", 2: "me", 3: "think", 4: "x"})
 
         # With HICRA fusion
-        fused = _GTPOFaithfulTransform(
+        fused = _GTPOTransform(
             alpha_1=1.0, alpha_2=0.1,
             tokenizer=tokenizer,
             strategic_grams=["let me think"],
@@ -1177,7 +1177,7 @@ class TestHICRAFusionTransform:
         )
 
         # Without HICRA fusion
-        plain = _GTPOFaithfulTransform(alpha_1=1.0, alpha_2=0.1)
+        plain = _GTPOTransform(alpha_1=1.0, alpha_2=0.1)
 
         # 2 O+ episodes + 2 O- episodes, non-uniform entropy
         rewards = mx.array([1.0, 1.0, 0.0, 0.0])
@@ -1219,18 +1219,18 @@ class TestHICRAFusionTransform:
 
     def test_h10n_no_matching_grams_same_as_no_hicra(self):
         """H10n: No matching grams → same result as no HICRA."""
-        from textpolicy.training.reasoning_stack import _GTPOFaithfulTransform
+        from textpolicy.training.reasoning_stack import _GTPOTransform
 
         # Tokenizer maps IDs to strings that won't match "let me think"
         tokenizer = _MockTokenizer({1: "foo", 2: "bar", 3: "baz"})
 
-        fused = _GTPOFaithfulTransform(
+        fused = _GTPOTransform(
             alpha_1=1.0, alpha_2=0.1,
             tokenizer=tokenizer,
             strategic_grams=["let me think"],
             hicra_gamma=0.5,
         )
-        plain = _GTPOFaithfulTransform(alpha_1=1.0, alpha_2=0.1)
+        plain = _GTPOTransform(alpha_1=1.0, alpha_2=0.1)
 
         rewards = mx.array([1.0, 0.0])
         episode_lengths = [3, 3]
@@ -1262,10 +1262,10 @@ class TestHICRAFusionTransform:
 
     def test_h10r_on_demand_planning_mask_matches_prepared_path(self):
         """H10r regression: on-demand planning_mask path matches prepared path."""
-        from textpolicy.training.reasoning_stack import _GTPOFaithfulTransform
+        from textpolicy.training.reasoning_stack import _GTPOTransform
 
         tokenizer = _MockTokenizer({1: "let", 2: "me", 3: "think", 4: "x"})
-        transform = _GTPOFaithfulTransform(
+        transform = _GTPOTransform(
             alpha_1=1.0, alpha_2=0.1,
             tokenizer=tokenizer,
             strategic_grams=["let me think"],
@@ -1312,10 +1312,10 @@ class TestHICRAFusionTransform:
 
     def test_h10s_precomputed_planning_mask_does_not_require_act(self):
         """H10s: Precomputed planning_mask path should work without `act`."""
-        from textpolicy.training.reasoning_stack import _GTPOFaithfulTransform
+        from textpolicy.training.reasoning_stack import _GTPOTransform
 
         tokenizer = _MockTokenizer({1: "let", 2: "me", 3: "think", 4: "x"})
-        transform = _GTPOFaithfulTransform(
+        transform = _GTPOTransform(
             alpha_1=1.0, alpha_2=0.1,
             tokenizer=tokenizer,
             strategic_grams=["let me think"],
@@ -1348,10 +1348,10 @@ class TestHICRAFusionTransform:
 
     def test_h10t_missing_act_raises_when_on_demand_mask_needed(self):
         """H10t: Missing `act` raises when on-demand planning mask is required."""
-        from textpolicy.training.reasoning_stack import _GTPOFaithfulTransform
+        from textpolicy.training.reasoning_stack import _GTPOTransform
 
         tokenizer = _MockTokenizer({1: "let", 2: "me", 3: "think", 4: "x"})
-        transform = _GTPOFaithfulTransform(
+        transform = _GTPOTransform(
             alpha_1=1.0, alpha_2=0.1,
             tokenizer=tokenizer,
             strategic_grams=["let me think"],
@@ -1370,10 +1370,10 @@ class TestHICRAFusionTransform:
 
     def test_h10u_invalid_precomputed_mask_shape_raises(self):
         """H10u: Precomputed planning_mask with wrong shape raises ValueError."""
-        from textpolicy.training.reasoning_stack import _GTPOFaithfulTransform
+        from textpolicy.training.reasoning_stack import _GTPOTransform
 
         tokenizer = _MockTokenizer({1: "let", 2: "me", 3: "think", 4: "x"})
-        transform = _GTPOFaithfulTransform(
+        transform = _GTPOTransform(
             alpha_1=1.0, alpha_2=0.1,
             tokenizer=tokenizer,
             strategic_grams=["let me think"],
@@ -1434,12 +1434,12 @@ class TestHICRAFusionTrainerIntegration:
     def test_h10o_trainer_trains_uncompiled(self):
         """H10o: Trainer trains with fused HICRA+GTPO (uncompiled)."""
         from functools import partial
-        from textpolicy.training import Trainer, build_gtpo_faithful_transform
+        from textpolicy.training import Trainer, build_gtpo_transform
         from textpolicy.algorithms import grpo
 
         tokenizer = _MockTokenizer({1: "let", 2: "me", 3: "think"})
         model = self._make_model()
-        transform = build_gtpo_faithful_transform(
+        transform = build_gtpo_transform(
             alpha_1=1.0, alpha_2=0.1,
             tokenizer=tokenizer,
             strategic_grams=["let me"],
@@ -1464,12 +1464,12 @@ class TestHICRAFusionTrainerIntegration:
     def test_h10p_trainer_trains_compiled(self):
         """H10p: Trainer trains with fused HICRA+GTPO (compiled) — compile-safety proof."""
         from functools import partial
-        from textpolicy.training import Trainer, build_gtpo_faithful_transform
+        from textpolicy.training import Trainer, build_gtpo_transform
         from textpolicy.algorithms import grpo
 
         tokenizer = _MockTokenizer({1: "let", 2: "me", 3: "think"})
         model = self._make_model()
-        transform = build_gtpo_faithful_transform(
+        transform = build_gtpo_transform(
             alpha_1=1.0, alpha_2=0.1,
             tokenizer=tokenizer,
             strategic_grams=["let me"],

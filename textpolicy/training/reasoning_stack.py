@@ -376,17 +376,9 @@ class _GTPOTransform:
         )
 
         # Eq. 6: separate O+/O- normalization
-        faithful_advantages = normalize_gtpo_advantages(
+        return normalize_gtpo_advantages(
             shaped_rewards, is_positive, eps=self.eps,
         )
-
-        return faithful_advantages
-
-
-# Backward-compat alias: the "faithful" qualifier is removed since the
-# paper-exact implementation *is* GTPO.  Existing code that imports the
-# old name continues to work.
-_GTPOFaithfulTransform = _GTPOTransform
 
 
 def build_gtpo_transform(
@@ -476,10 +468,6 @@ def build_gtpo_transform(
         strategic_grams=strategic_grams,
         hicra_gamma=hicra_gamma,
     )
-
-
-# Backward-compat alias for the builder function.
-build_gtpo_faithful_transform = build_gtpo_transform
 
 
 def create_tinylora_reasoning_setup(

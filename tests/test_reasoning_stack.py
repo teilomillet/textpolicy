@@ -295,10 +295,6 @@ class TestReasoningStackPublicAPI:
                 f"build_gtpo_transform must accept '{param_name}'."
             )
 
-    def test_build_gtpo_faithful_transform_is_alias(self):
-        """build_gtpo_faithful_transform must be an alias for build_gtpo_transform."""
-        from textpolicy.training import build_gtpo_transform, build_gtpo_faithful_transform
-        assert build_gtpo_faithful_transform is build_gtpo_transform
 
 
 # ---------------------------------------------------------------------------
@@ -346,18 +342,18 @@ class TestTransformInjection:
             "are backward compatible (they get the default GTPO+HICRA transform)."
         )
 
-    def test_build_gtpo_faithful_transform_accepts_hicra_params(self):
-        """build_gtpo_faithful_transform must accept HICRA fusion params.
+    def test_build_gtpo_transform_accepts_hicra_params(self):
+        """build_gtpo_transform must accept HICRA fusion params.
 
-        This ensures faithful GTPO + HICRA can be composed and injected.
+        This ensures GTPO + HICRA can be composed and injected.
         """
         import inspect
-        from textpolicy.training import build_gtpo_faithful_transform
+        from textpolicy.training import build_gtpo_transform
 
-        sig = inspect.signature(build_gtpo_faithful_transform)
+        sig = inspect.signature(build_gtpo_transform)
         for param_name in ("tokenizer", "hicra_gamma", "strategic_grams"):
             assert param_name in sig.parameters, (
-                f"build_gtpo_faithful_transform must accept '{param_name}' "
+                f"build_gtpo_transform must accept '{param_name}' "
                 f"for HICRA fusion composition."
             )
 

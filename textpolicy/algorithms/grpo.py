@@ -838,7 +838,7 @@ def normalize_gtpo_advantages(
     return advantages
 
 
-def gtpo_loss_faithful(
+def gtpo_loss(
     old_logprobs: mx.array,
     new_logprobs: mx.array,
     rewards: Union[List[float], mx.array],

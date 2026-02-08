@@ -43,7 +43,6 @@ try:
     from .reasoning_stack import (
         build_gtpo_hicra_transform,
         build_gtpo_transform,
-        build_gtpo_faithful_transform,
         create_tinylora_reasoning_setup,
     )
 
@@ -51,7 +50,6 @@ try:
         [
             "build_gtpo_hicra_transform",
             "build_gtpo_transform",
-            "build_gtpo_faithful_transform",
             "create_tinylora_reasoning_setup",
         ]
     )
