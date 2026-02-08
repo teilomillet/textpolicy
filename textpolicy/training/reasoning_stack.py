@@ -337,7 +337,24 @@ class _GTPOFaithfulTransform:
         # Optional HICRA fusion: boost entropies at planning positions
         if self.hicra_gamma > 0.0 and self.tokenizer is not None:
             planning_mask = batch_data.get("planning_mask")
-            if planning_mask is not None:
+            if planning_mask is None:
+                # On-demand computation (mirrors _GTPOHICRATransform pattern).
+                # This fails inside mx.compile with a clear message.
+                try:
+                    token_ids = self._flatten_actions(batch_data)
+                    planning_mask = identify_planning_tokens(
+                        token_ids, self.tokenizer, self.grams
+                    )
+                except ValueError as exc:
+                    if "Attempting to eval an array" in str(exc):
+                        raise ValueError(
+                            "HICRA planning_mask must be prepared outside "
+                            "mx.compile. Use Trainer.train() which calls "
+                            "prepare_batch() automatically."
+                        ) from exc
+                    raise
+                batch_data["planning_mask"] = planning_mask
+            else:
                 planning_mask = _flatten_padded_token_rows(
                     planning_mask,
                     episode_lengths,
@@ -345,7 +362,7 @@ class _GTPOFaithfulTransform:
                 )
             flat_entropies = boost_entropy_with_planning(
                 flat_entropies, planning_mask, gamma=self.hicra_gamma,
-            ) if planning_mask is not None else flat_entropies
+            )
 
         # Eq. 3 + Eq. 5: entropy-shaped token-level rewards
         shaped_rewards, is_positive = compute_gtpo_shaped_rewards(

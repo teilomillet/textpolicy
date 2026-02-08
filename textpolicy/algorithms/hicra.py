@@ -283,6 +283,13 @@ def boost_entropy_with_planning(
     Raises:
         ValueError: If shapes don't match.
     """
+    if gamma < 0.0:
+        raise ValueError(
+            f"gamma must be >= 0, got {gamma}. Negative gamma reduces "
+            f"entropy at planning tokens, which can produce negative "
+            f"values that break inverse-entropy shaping (Eq. 5)."
+        )
+
     if token_entropies.shape != planning_mask.shape:
         raise ValueError(
             f"Shape mismatch: token_entropies {token_entropies.shape} vs "

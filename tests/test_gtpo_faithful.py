@@ -1068,6 +1068,14 @@ class TestBoostEntropyWithPlanning:
         assert not mx.any(mx.isnan(result)).item()
         assert result.shape == entropies.shape
 
+    def test_h10q_negative_gamma_rejected_at_function_level(self):
+        """H10q regression: direct helper call rejects negative gamma."""
+        entropies = mx.array([1.0, 2.0, 3.0], dtype=mx.float32)
+        mask = mx.array([1.0, 0.0, 1.0], dtype=mx.float32)
+
+        with pytest.raises(ValueError, match="gamma must be >= 0"):
+            boost_entropy_with_planning(entropies, mask, gamma=-0.1)
+
 
 @pytest.mark.unit
 @pytest.mark.algorithm
@@ -1260,6 +1268,56 @@ class TestHICRAFusionTransform:
         # → results should be identical
         assert mx.allclose(result_fused, result_plain, atol=1e-6), \
             "No matching grams should produce identical results to no HICRA"
+
+    def test_h10r_on_demand_planning_mask_matches_prepared_path(self):
+        """H10r regression: on-demand planning_mask path matches prepared path."""
+        from textpolicy.training.reasoning_stack import _GTPOFaithfulTransform
+
+        tokenizer = _MockTokenizer({1: "let", 2: "me", 3: "think", 4: "x"})
+        transform = _GTPOFaithfulTransform(
+            alpha_1=1.0, alpha_2=0.1,
+            tokenizer=tokenizer,
+            strategic_grams=["let me think"],
+            hicra_gamma=0.3,
+        )
+
+        rewards = mx.array([1.0, 1.0, 0.0, 0.0], dtype=mx.float32)
+        episode_lengths = [3, 3, 3, 3]
+        token_entropies = mx.array([
+            2.0, 3.0, 1.0,
+            4.0, 1.0, 2.0,
+            3.0, 2.0, 1.0,
+            1.0, 3.0, 2.0,
+        ], dtype=mx.float32)
+        act = mx.array([[1, 2, 3], [4, 4, 4], [4, 4, 4], [4, 4, 4]])
+        advantages = mx.zeros((12,), dtype=mx.float32)
+
+        # Path A: no planning_mask provided; __call__ computes on demand.
+        batch_no_mask = {
+            "rewards": rewards,
+            "token_entropies": token_entropies,
+            "episode_lengths": episode_lengths,
+            "act": act,
+        }
+        result_on_demand = transform(advantages, batch_no_mask)
+        mx.eval(result_on_demand)
+        assert "planning_mask" in batch_no_mask, \
+            "__call__ should cache planning_mask when missing"
+
+        # Path B: planning_mask prepared eagerly.
+        batch_prepared = {
+            "rewards": rewards,
+            "token_entropies": token_entropies,
+            "episode_lengths": episode_lengths,
+            "act": act,
+        }
+        transform.prepare_batch(batch_prepared)
+        assert "planning_mask" in batch_prepared
+        result_prepared = transform(advantages, batch_prepared)
+        mx.eval(result_prepared)
+
+        assert mx.allclose(result_on_demand, result_prepared, atol=1e-6), \
+            "On-demand planning_mask path must match prepared path"
 
 
 @pytest.mark.integration
