@@ -1313,3 +1313,118 @@ class TestComputeLogprobsCompileSafety:
         mx.eval(result)
         assert result.shape[0] == 2
         assert not mx.any(mx.isnan(result)).item()
+
+
+@pytest.mark.unit
+class TestLazyGradientClipping:
+    """Tests for lazy gradient clipping (Issue #39).
+
+    The lazy approach computes the global norm first and skips the scaling
+    traversal when gradients are already within bounds.  This saves one
+    full tree traversal per training step when the norm is below max_norm.
+
+    Hypotheses:
+        H1: When norm > max_norm, output matches optim.clip_grad_norm
+        H2: When norm <= max_norm, original grads are returned (identity)
+        H3: Works with nested gradient dicts (LoRA-style structures)
+    """
+
+    def _make_trainer(self, max_grad_norm=1.0):
+        """Create a minimal Trainer for testing _clip_gradients."""
+        from textpolicy.training import Trainer
+        from textpolicy.algorithms import grpo
+
+        class TinyLM(nn.Module):
+            def __init__(self):
+                super().__init__()
+                self.linear = nn.Linear(10, 10)
+            def __call__(self, x):
+                return self.linear(x)
+
+        model = TinyLM()
+        mx.eval(model.parameters())
+        return Trainer(
+            model=model,
+            loss_fn=grpo.policy_loss,
+            optimizer=optim.Adam(learning_rate=1e-3),
+            advantage_fn=grpo.compute_advantages,
+            compile_training=False,
+            max_grad_norm=max_grad_norm,
+        )
+
+    def test_lazy_clip_matches_full_when_clipping_needed(self):
+        """H1: norm > max_norm → output matches optim.clip_grad_norm."""
+        trainer = self._make_trainer(max_grad_norm=0.5)
+
+        grads = {
+            "weight": mx.array([[10.0, 20.0], [30.0, 40.0]]),
+            "bias": mx.array([5.0, 15.0]),
+        }
+        mx.eval(grads)
+
+        # Reference: MLX built-in clipping
+        ref_clipped, _ = optim.clip_grad_norm(grads, 0.5)
+        mx.eval(ref_clipped)
+
+        # Lazy clipping
+        lazy_clipped = trainer._clip_gradients(grads, 0.5)
+        mx.eval(lazy_clipped)
+
+        for key in grads:
+            assert mx.allclose(lazy_clipped[key], ref_clipped[key], atol=1e-5).item(), (
+                f"Mismatch for {key}: lazy={lazy_clipped[key].tolist()} "
+                f"ref={ref_clipped[key].tolist()}"
+            )
+
+    def test_lazy_clip_returns_original_when_below_threshold(self):
+        """H2: norm <= max_norm → returns original grads (identity, not copy)."""
+        trainer = self._make_trainer(max_grad_norm=1000.0)
+
+        grads = {
+            "weight": mx.array([[0.01, 0.02], [0.03, 0.04]]),
+            "bias": mx.array([0.001, 0.002]),
+        }
+        mx.eval(grads)
+
+        result = trainer._clip_gradients(grads, 1000.0)
+
+        # Should be the exact same dict (identity check)
+        assert result is grads, (
+            "When norm <= max_norm, _clip_gradients should return the "
+            "original grads object, not a copy"
+        )
+
+    def test_lazy_clip_with_nested_lora_grads(self):
+        """H3: Works with nested gradient dicts typical of LoRA models."""
+        trainer = self._make_trainer(max_grad_norm=0.5)
+
+        # Simulate nested LoRA gradient structure:
+        # model.layers.0.self_attn.q_proj.lora_a.weight
+        grads = {
+            "layers": [
+                {
+                    "self_attn": {
+                        "q_proj": {
+                            "lora_a": {"weight": mx.array([[5.0, 6.0]])},
+                            "lora_b": {"weight": mx.array([[7.0, 8.0]])},
+                        }
+                    }
+                }
+            ]
+        }
+        mx.eval(grads)
+
+        # Reference
+        ref_clipped, _ = optim.clip_grad_norm(grads, 0.5)
+        mx.eval(ref_clipped)
+
+        # Lazy
+        lazy_clipped = trainer._clip_gradients(grads, 0.5)
+        mx.eval(lazy_clipped)
+
+        # Compare leaf values
+        lazy_qa = lazy_clipped["layers"][0]["self_attn"]["q_proj"]["lora_a"]["weight"]
+        ref_qa = ref_clipped["layers"][0]["self_attn"]["q_proj"]["lora_a"]["weight"]
+        assert mx.allclose(lazy_qa, ref_qa, atol=1e-5).item(), (
+            f"Nested LoRA grad mismatch: lazy={lazy_qa.tolist()} ref={ref_qa.tolist()}"
+        )
