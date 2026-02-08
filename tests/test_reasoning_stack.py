@@ -5,6 +5,7 @@ Covers:
   _flatten_padded_token_rows: 2D padded → flat 1D layout conversion
   build_gtpo_hicra_transform: factory validation and basic wiring
   _GTPOHICRATransform: transform correctness with entropy weighting
+  DI enforcement: create_tinylora_reasoning_setup accepts injected transforms
 
 These were previously untested despite being the critical bridge between
 the Trainer's internal data layout and the HICRA/GTPO algorithm functions.
@@ -276,3 +277,86 @@ class TestReasoningStackPublicAPI:
         """create_tinylora_reasoning_setup must be importable from textpolicy.training."""
         from textpolicy.training import create_tinylora_reasoning_setup
         assert callable(create_tinylora_reasoning_setup)
+
+
+# ---------------------------------------------------------------------------
+# DI enforcement: advantage_transform_fn injection
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.unit
+class TestTransformInjection:
+    """Enforce that create_tinylora_reasoning_setup supports dependency injection.
+
+    The textpolicy philosophy is "swap function references, not subclass."
+    The setup helper must accept any advantage transform via injection,
+    not hardwire a single algorithm.  These tests enforce this contract
+    so future changes cannot silently regress to a hardcoded transform.
+    """
+
+    def test_accepts_advantage_transform_fn_parameter(self):
+        """create_tinylora_reasoning_setup must accept advantage_transform_fn kwarg.
+
+        This is the textpolicy DI contract: convenience helpers must not
+        hardwire algorithm choices.  If this test fails, the injection
+        point has been removed — restore it instead of adding a new
+        convenience function.
+        """
+        import inspect
+        from textpolicy.training import create_tinylora_reasoning_setup
+
+        sig = inspect.signature(create_tinylora_reasoning_setup)
+        assert "advantage_transform_fn" in sig.parameters, (
+            "create_tinylora_reasoning_setup must accept 'advantage_transform_fn' "
+            "for dependency injection. Do NOT hardwire algorithm transforms — "
+            "accept them as injectable dependencies (textpolicy DI principle)."
+        )
+
+    def test_advantage_transform_fn_defaults_to_none(self):
+        """Default must be None (backward compatible, builds default transform)."""
+        import inspect
+        from textpolicy.training import create_tinylora_reasoning_setup
+
+        sig = inspect.signature(create_tinylora_reasoning_setup)
+        param = sig.parameters["advantage_transform_fn"]
+        assert param.default is None, (
+            "advantage_transform_fn default must be None so existing callers "
+            "are backward compatible (they get the default GTPO+HICRA transform)."
+        )
+
+    def test_build_gtpo_faithful_transform_accepts_hicra_params(self):
+        """build_gtpo_faithful_transform must accept HICRA fusion params.
+
+        This ensures faithful GTPO + HICRA can be composed and injected.
+        """
+        import inspect
+        from textpolicy.training import build_gtpo_faithful_transform
+
+        sig = inspect.signature(build_gtpo_faithful_transform)
+        for param_name in ("tokenizer", "hicra_gamma", "strategic_grams"):
+            assert param_name in sig.parameters, (
+                f"build_gtpo_faithful_transform must accept '{param_name}' "
+                f"for HICRA fusion composition."
+            )
+
+    def test_injected_transform_is_used(self):
+        """When advantage_transform_fn is provided, it must be the one the Trainer uses.
+
+        This catches regressions where the helper ignores the injected transform
+        and builds its own internally.
+        """
+        import inspect
+        from textpolicy.training.reasoning_stack import create_tinylora_reasoning_setup
+
+        # Read the source to verify the injection is actually wired through.
+        # This is a structural test — it checks the implementation pattern,
+        # not just the interface.  If the function body builds a transform
+        # AND ignores the parameter, this approach catches it.
+        source = inspect.getsource(create_tinylora_reasoning_setup)
+
+        # The function must conditionally build the default transform
+        assert "if advantage_transform_fn is None" in source, (
+            "create_tinylora_reasoning_setup must only build the default transform "
+            "when advantage_transform_fn is None.  Found unconditional transform "
+            "construction — the injected transform would be ignored."
+        )
