@@ -5,12 +5,22 @@ Unified training infrastructure for all RL algorithms.
 
 from .trainer import Trainer
 from .rollout_manager import RolloutManager
-from .metrics import TrainingMetrics
+from .metrics import (
+    TrainingMetrics,
+    RolloutMetrics,
+    log_metrics,
+    compute_explained_variance,
+    compute_policy_metrics,
+)
 
 __all__ = [
     "Trainer",
-    "RolloutManager", 
+    "RolloutManager",
     "TrainingMetrics",
+    "RolloutMetrics",
+    "log_metrics",
+    "compute_explained_variance",
+    "compute_policy_metrics",
 ]
 
 # Gradient checkpointing utilities.
