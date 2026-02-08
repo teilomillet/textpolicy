@@ -584,6 +584,348 @@ def compute_advantages_gtpo(
 # are imported from .length_shaping module (see imports at top of file)
 
 
+# ---------------------------------------------------------------------------
+# GTPO Faithful: Paper-Exact Implementation (arXiv 2508.04349)
+# ---------------------------------------------------------------------------
+#
+# The functions below implement GTPO as described in:
+#   "GTPO and GRPO-S: Token and Sequence-Level Reward Shaping
+#    with Policy Entropy" (Tan et al., 2025)
+#
+# Key differences from the simplified `apply_entropy_weighting` above:
+#   1. Separate O+/O- treatment (Eq. 3 vs Eq. 5)
+#   2. Inverse entropy for O- (confident mistakes penalized harder)
+#   3. Position-dependent d_t / h_t (surviving sequence counts)
+#   4. Additive reward shaping (not multiplicative advantage scaling)
+#   5. Separate advantage normalization per group (Eq. 6)
+# ---------------------------------------------------------------------------
+
+
+def compute_gtpo_shaped_rewards(
+    rewards: Union[List[float], mx.array],
+    token_entropies: mx.array,
+    episode_lengths: List[int],
+    alpha_1: float = 1.0,
+    alpha_2: float = 0.1,
+    reward_threshold: float = 0.5,
+    eps: float = 1e-8,
+) -> Tuple[mx.array, mx.array]:
+    """
+    Compute GTPO token-level shaped rewards per Eq. 3 (O+) and Eq. 5 (O-).
+
+    Paper reference: arXiv 2508.04349, Section 2.1–2.2.
+
+    For successful sequences (O+), Eq. 3:
+        r̃⁺ᵢ,ₜ = α₁·rᵢ + α₂ · (Hᵢ,ₜ / Σₖ∈O⁺ₜ Hₖ,ₜ) · dₜ
+
+    For unsuccessful sequences (O-), Eq. 5:
+        r̃⁻ⱼ,ₜ = α₁·(-1) + α₂ · ((1/Hⱼ,ₜ) / Σₖ∈O⁻ₜ (1/Hₖ,ₜ)) · hₜ · (-1)
+
+    Where:
+        dₜ = |O⁺ₜ| = count of successful sequences with length ≥ t+1
+        hₜ = |O⁻ₜ| = count of unsuccessful sequences with length ≥ t+1
+        Sequences shorter than t+1 are inactive (entropy treated as 0).
+
+    Args:
+        rewards: Episode-level rewards [num_episodes]. Binary {0,1} expected
+                 but continuous rewards work too (thresholded by reward_threshold).
+        token_entropies: Per-token entropy [total_tokens] (flat 1D).
+        episode_lengths: Token count per episode.
+        alpha_1: Base reward weight (default 1.0, paper experimental value).
+        alpha_2: Entropy-shaped reward weight (default 0.1, paper experimental value).
+                 Proposition 2.2 requires α₁ + α₂ = 1 for reward conservation.
+        reward_threshold: Threshold for O+/O- partition (default 0.5).
+                         Episodes with reward > threshold are O+, else O-.
+        eps: Small constant for numerical stability (Remark 2.1).
+
+    Returns:
+        Tuple of:
+        - shaped_rewards: Flat 1D [total_tokens] shaped token rewards.
+        - is_positive: Flat 1D bool [total_tokens], True for tokens from O+ episodes.
+
+    Raises:
+        ValueError: If sum(episode_lengths) != len(token_entropies).
+
+    References:
+        Eq. 3, Eq. 5, Remark 2.1 — arXiv 2508.04349
+    """
+    # --- Input validation ---
+    if isinstance(rewards, list):
+        rewards_arr = mx.array(rewards, dtype=mx.float32)
+    else:
+        rewards_arr = rewards.astype(mx.float32)
+
+    num_episodes = rewards_arr.shape[0]
+    if num_episodes != len(episode_lengths):
+        raise ValueError(
+            f"rewards length {num_episodes} != episode_lengths length "
+            f"{len(episode_lengths)}"
+        )
+
+    total_tokens = sum(episode_lengths)
+    if total_tokens != token_entropies.shape[0]:
+        raise ValueError(
+            f"sum(episode_lengths)={total_tokens} != "
+            f"token_entropies length {token_entropies.shape[0]}"
+        )
+
+    if total_tokens == 0:
+        return mx.array([], dtype=mx.float32), mx.array([], dtype=mx.bool_)
+
+    max_len = max(episode_lengths)
+
+    # --- Partition into O+ and O- ---
+    # Paper uses binary rewards {0, 1}; we threshold for generality.
+    mx.eval(rewards_arr)
+    is_positive_ep = rewards_arr > reward_threshold  # [num_episodes]
+    mx.eval(is_positive_ep)
+
+    # --- Build 2D internal layout: [num_episodes, max_len] ---
+    # Flat 1D in/out, 2D internal for vectorized position-wise operations.
+    entropies_2d = mx.zeros((num_episodes, max_len), dtype=mx.float32)
+    starts = []
+    offset = 0
+    for i, length in enumerate(episode_lengths):
+        starts.append(offset)
+        if length > 0:
+            entropies_2d = entropies_2d.at[i, :length].add(
+                token_entropies[offset:offset + length]
+            )
+        offset += length
+
+    # Active mask: True where episode i has a token at position t.
+    # [num_episodes, max_len]
+    active_mask = mx.zeros((num_episodes, max_len), dtype=mx.bool_)
+    for i, length in enumerate(episode_lengths):
+        if length > 0:
+            active_mask = active_mask.at[i, :length].add(
+                mx.ones(length, dtype=mx.bool_)
+            )
+
+    # --- Positive (O+) shaping: Eq. 3 ---
+    # pos_active[i, t] = True if episode i is in O+ AND has token at position t
+    pos_ep = is_positive_ep[:, None]  # [num_episodes, 1]
+    pos_active = pos_ep & active_mask  # [num_episodes, max_len]
+
+    # H values for active O+ tokens, 0 elsewhere
+    H_pos = entropies_2d * pos_active  # [num_episodes, max_len]
+    H_sum_pos = mx.sum(H_pos, axis=0)  # [max_len] — Σₖ∈O⁺ₜ Hₖ,ₜ
+
+    # d_t: count of active O+ episodes at each position
+    d_t = mx.sum(pos_active.astype(mx.float32), axis=0)  # [max_len]
+
+    # Entropy weight for O+: Hᵢ,ₜ / Σₖ Hₖ,ₜ (Eq. 3 inner fraction)
+    # Safe division: if H_sum_pos[t] = 0 (no active O+ or all zero entropy),
+    # the weight is 0 (no entropy signal to distribute).
+    safe_H_sum_pos = mx.maximum(H_sum_pos, mx.array(eps))
+    entropy_weight_pos = H_pos / safe_H_sum_pos[None, :]  # [num_episodes, max_len]
+
+    # Shaped positive rewards:
+    # r̃⁺ᵢ,ₜ = α₁·rᵢ + α₂ · (Hᵢ,ₜ/ΣH) · dₜ
+    # rewards_arr[:, None] broadcasts episode reward to all positions
+    shaped_pos = (
+        alpha_1 * rewards_arr[:, None]
+        + alpha_2 * entropy_weight_pos * d_t[None, :]
+    )
+    # Zero out non-O+ and inactive tokens
+    shaped_pos = shaped_pos * pos_active
+
+    # --- Negative (O-) shaping: Eq. 5 ---
+    neg_ep = ~is_positive_ep[:, None]  # [num_episodes, 1]
+    neg_active = neg_ep & active_mask  # [num_episodes, max_len]
+
+    # Inverse entropy for O-: 1/H (confident mistakes get stronger signal)
+    # Remark 2.1: add eps to avoid 1/0
+    inv_H = 1.0 / (entropies_2d + eps)
+    inv_H_neg = inv_H * neg_active  # [num_episodes, max_len]
+    inv_H_sum_neg = mx.sum(inv_H_neg, axis=0)  # [max_len]
+
+    # h_t: count of active O- episodes at each position
+    h_t = mx.sum(neg_active.astype(mx.float32), axis=0)  # [max_len]
+
+    # Inverse entropy weight: (1/Hⱼ,ₜ) / Σₖ(1/Hₖ,ₜ) (Eq. 5 inner fraction)
+    safe_inv_H_sum_neg = mx.maximum(inv_H_sum_neg, mx.array(eps))
+    inv_entropy_weight_neg = inv_H_neg / safe_inv_H_sum_neg[None, :]
+
+    # Shaped negative rewards:
+    # r̃⁻ⱼ,ₜ = α₁·(-1) + α₂ · (inv_weight) · hₜ · (-1)
+    shaped_neg = (
+        alpha_1 * (-1.0)
+        + alpha_2 * inv_entropy_weight_neg * h_t[None, :] * (-1.0)
+    )
+    # Zero out non-O- and inactive tokens
+    shaped_neg = shaped_neg * neg_active
+
+    # --- Combine and flatten back to 1D ---
+    shaped_2d = shaped_pos + shaped_neg  # [num_episodes, max_len]
+
+    # Detach entropy from gradient graph (Remark 2.5):
+    # "the entropy term is detached from the gradient computation"
+    shaped_2d = mx.stop_gradient(shaped_2d)
+
+    # Flatten: extract non-padded tokens in episode order
+    parts_shaped = []
+    parts_mask = []
+    for i, length in enumerate(episode_lengths):
+        if length > 0:
+            parts_shaped.append(shaped_2d[i, :length])
+            parts_mask.append(
+                mx.full((length,), bool(is_positive_ep[i].item()), dtype=mx.bool_)
+            )
+
+    shaped_flat = mx.concatenate(parts_shaped) if parts_shaped else mx.array(
+        [], dtype=mx.float32
+    )
+    is_positive_flat = mx.concatenate(parts_mask) if parts_mask else mx.array(
+        [], dtype=mx.bool_
+    )
+
+    return shaped_flat, is_positive_flat
+
+
+def normalize_gtpo_advantages(
+    shaped_rewards: mx.array,
+    is_positive: mx.array,
+    eps: float = 1e-8,
+) -> mx.array:
+    """
+    Normalize shaped rewards into advantages with separate O+/O- normalization.
+
+    Paper reference: arXiv 2508.04349, Eq. 6.
+
+        Ã⁺ᵢ,ₜ = (r̃⁺ᵢ,ₜ − mean(R̃⁺)) / std(R̃⁺)
+        Ã⁻ⱼ,ₜ = (r̃⁻ⱼ,ₜ − mean(R̃⁻)) / std(R̃⁻)
+
+    Where R̃⁺ is the set of ALL shaped positive token rewards and R̃⁻ is the
+    set of ALL shaped negative token rewards. Normalization is separate per set.
+
+    Args:
+        shaped_rewards: Flat 1D [total_tokens] from compute_gtpo_shaped_rewards.
+        is_positive: Flat 1D bool [total_tokens], True for O+ tokens.
+        eps: Small constant for numerical stability (Remark 2.1).
+
+    Returns:
+        Flat 1D [total_tokens] normalized advantages.
+
+    References:
+        Eq. 6 — arXiv 2508.04349
+    """
+    if shaped_rewards.size == 0:
+        return shaped_rewards
+
+    pos_mask_f = is_positive.astype(mx.float32)
+    neg_mask_f = (1.0 - pos_mask_f)  # ~is_positive as float
+
+    # --- O+ normalization ---
+    pos_count = mx.sum(pos_mask_f)
+    # Masked rewards (O- tokens zeroed)
+    pos_rewards = shaped_rewards * pos_mask_f
+    pos_mean = mx.sum(pos_rewards) / mx.maximum(pos_count, mx.array(1.0))
+    pos_diff = (shaped_rewards - pos_mean) * pos_mask_f
+    pos_var = mx.sum(pos_diff * pos_diff) / mx.maximum(pos_count, mx.array(1.0))
+    pos_std = mx.sqrt(pos_var + eps)
+
+    # --- O- normalization ---
+    neg_count = mx.sum(neg_mask_f)
+    neg_rewards = shaped_rewards * neg_mask_f
+    neg_mean = mx.sum(neg_rewards) / mx.maximum(neg_count, mx.array(1.0))
+    neg_diff = (shaped_rewards - neg_mean) * neg_mask_f
+    neg_var = mx.sum(neg_diff * neg_diff) / mx.maximum(neg_count, mx.array(1.0))
+    neg_std = mx.sqrt(neg_var + eps)
+
+    # Combine: each group's tokens carry their group's normalization
+    advantages = (pos_diff / pos_std) + (neg_diff / neg_std)
+
+    return advantages
+
+
+def gtpo_loss_faithful(
+    old_logprobs: mx.array,
+    new_logprobs: mx.array,
+    rewards: Union[List[float], mx.array],
+    token_entropies: mx.array,
+    episode_lengths: List[int],
+    alpha_1: float = 1.0,
+    alpha_2: float = 0.1,
+    clip_epsilon: float = 0.2,
+    reward_threshold: float = 0.5,
+    eps: float = 1e-8,
+) -> mx.array:
+    """
+    Full GTPO loss per Eq. 7 (arXiv 2508.04349).
+
+    Combines:
+        1. Reward shaping (Eq. 3 + Eq. 5) → token-level shaped rewards
+        2. Separate O+/O- advantage normalization (Eq. 6)
+        3. PPO-style clipped surrogate objective (Eq. 7)
+
+    Eq. 7:
+        J_GTPO(θ) = E[ 1/Σ|oₖ| · (
+            Σᵢ∈O⁺ Σₜ min(wᵢ,ₜ Ã⁺ᵢ,ₜ , clip(wᵢ,ₜ) Ã⁺ᵢ,ₜ)
+          + Σⱼ∈O⁻ Σₜ min(wⱼ,ₜ Ã⁻ⱼ,ₜ , clip(wⱼ,ₜ) Ã⁻ⱼ,ₜ) )]
+
+    Data layout: all arrays are flat 1D (tokens from all episodes concatenated).
+
+    Args:
+        old_logprobs: Log probabilities from old policy [total_tokens].
+        new_logprobs: Log probabilities from current policy [total_tokens].
+        rewards: Episode-level rewards [num_episodes]. Binary {0,1} expected.
+        token_entropies: Per-token entropy from old policy [total_tokens].
+        episode_lengths: Token count per episode.
+        alpha_1: Base reward weight (default 1.0).
+        alpha_2: Entropy-shaped weight (default 0.1).
+        clip_epsilon: PPO clipping epsilon (default 0.2).
+        reward_threshold: Threshold for O+/O- partition (default 0.5).
+        eps: Numerical stability constant (Remark 2.1).
+
+    Returns:
+        Scalar loss (to be minimized, so negated internally).
+
+    References:
+        Eq. 3, 5, 6, 7 — arXiv 2508.04349
+    """
+    if new_logprobs.shape != old_logprobs.shape:
+        raise ValueError(
+            f"new_logprobs shape {new_logprobs.shape} != "
+            f"old_logprobs shape {old_logprobs.shape}. "
+            f"Both must be flat 1D with the same number of tokens."
+        )
+
+    total_tokens = old_logprobs.shape[0]
+    if total_tokens == 0:
+        return mx.array(0.0)
+
+    # Step 1: Compute shaped rewards (Eq. 3 + Eq. 5)
+    shaped_rewards, is_positive = compute_gtpo_shaped_rewards(
+        rewards, token_entropies, episode_lengths,
+        alpha_1=alpha_1, alpha_2=alpha_2,
+        reward_threshold=reward_threshold, eps=eps,
+    )
+
+    # Step 2: Normalize advantages separately for O+/O- (Eq. 6)
+    advantages = normalize_gtpo_advantages(shaped_rewards, is_positive, eps=eps)
+
+    # Validate alignment
+    if advantages.shape[0] != total_tokens:
+        raise ValueError(
+            f"Advantages length {advantages.shape[0]} != "
+            f"logprobs length {total_tokens}"
+        )
+
+    # Step 3: PPO clipped surrogate objective (Eq. 7)
+    ratio = mx.exp(new_logprobs - old_logprobs)
+    clipped_ratio = mx.clip(ratio, 1.0 - clip_epsilon, 1.0 + clip_epsilon)
+
+    surr1 = ratio * advantages
+    surr2 = clipped_ratio * advantages
+    min_surr = mx.minimum(surr1, surr2)
+
+    # Eq. 7 normalization: 1/Σ|oₖ| (total tokens) = mean
+    loss = -mx.mean(min_surr)
+
+    return loss
+
+
 # DAPO-style dynamic batch filtering (Issue #9)
 def _get_episode_reward(episode) -> float:
     """Extract total reward from episode (handles both Episode objects and dicts)."""
