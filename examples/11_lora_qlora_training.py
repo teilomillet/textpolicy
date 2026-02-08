@@ -61,6 +61,9 @@ def main():
         loss_fn=grpo.policy_loss,
         optimizer=optim.Adam(learning_rate=5e-6),
         compile_training=True,
+        # Memory optimization (off by default, enable for long sequences):
+        # gradient_checkpointing=True,   # recompute activations to save memory
+        # micro_batch_size=4,            # process 4 episodes per forward pass
     )
 
     # 4) Create policy for rollout

@@ -13,6 +13,21 @@ __all__ = [
     "TrainingMetrics",
 ]
 
+# Gradient checkpointing utilities.
+from .gradient_checkpointing import (
+    apply_gradient_checkpointing,
+    is_gradient_checkpointing_active,
+    remove_gradient_checkpointing,
+)
+
+__all__.extend(
+    [
+        "apply_gradient_checkpointing",
+        "remove_gradient_checkpointing",
+        "is_gradient_checkpointing_active",
+    ]
+)
+
 # Optional reasoning-stack helpers (module may be absent in partial installs).
 try:
     from .reasoning_stack import (

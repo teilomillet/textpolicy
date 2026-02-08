@@ -8,7 +8,7 @@ Welcome! TextPolicy is a lightweight RL toolkit for text generation on MLX, desi
 - Generation with mlx-lm: 03_generation_mlx_lm.md
 - Environments: 04_environments.md
 - Rollouts and Training: 05_rollout_training.md
-- Performance on Apple Silicon: 06_performance.md
+- Performance and Memory Optimization: 06_performance.md
 - Testing and Integration: 07_testing.md
 - Efficient MLX Policies: 08_efficient_policies.md
  - Command-Line Interface: 09_cli.md

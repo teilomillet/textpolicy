@@ -60,6 +60,8 @@ class ReasoningConfig:
     max_steps: int = 500
     max_grad_norm: float = 0.5
     compile_training: Union[bool, str] = False
+    gradient_checkpointing: bool = False
+    micro_batch_size: Optional[int] = None
     profile_training: bool = False
 
     # Generation
@@ -78,6 +80,13 @@ class ReasoningConfig:
 
     # Output
     output_dir: str = "results/countdown_reasoning_lora"
+
+
+# Memory optimization quick-reference:
+#   --gradient-checkpointing        recompute selected activations to reduce memory
+#   --micro-batch-size 4            good first value for lower memory/logit pressure
+#   Combine both when memory is still tight; benchmark on your hardware.
+#   See docs/06_performance.md for examples.
 
 
 # RolloutRunner uses max(10, max_steps) for buffer capacity, so it
@@ -234,6 +243,8 @@ def run_experiment(config: ReasoningConfig) -> None:
         hicra_alpha=config.hicra_alpha,
         entropy_weight=config.entropy_weight,
         compile_training=config.compile_training,
+        gradient_checkpointing=config.gradient_checkpointing,
+        micro_batch_size=config.micro_batch_size,
         profile=config.profile_training,
         max_grad_norm=config.max_grad_norm,
         adapter_save_path=str(output_dir / "lora_adapters.safetensors"),
@@ -400,6 +411,27 @@ if __name__ == "__main__":
         help="Optional path to strategic grams JSON (defaults to built-ins)",
     )
     parser.add_argument(
+        "--gradient-checkpointing",
+        action="store_true",
+        help=(
+            "Enable gradient checkpointing — recomputes activations during "
+            "backward pass instead of caching them. This reduces peak "
+            "memory at the cost of additional compute. In this trainer, "
+            "True uses sqrt(n) layer selection."
+        ),
+    )
+    parser.add_argument(
+        "--micro-batch-size",
+        type=int,
+        default=None,
+        help=(
+            "Process at most N episodes per logprob-extraction forward pass "
+            "to reduce peak activation memory. Start with 4, then tune for "
+            "your model/hardware. Combine with --gradient-checkpointing "
+            "when still memory constrained."
+        ),
+    )
+    parser.add_argument(
         "--profile-training",
         action="store_true",
         help="Enable trainer per-phase timing and Amdahl bottleneck summary",
@@ -432,6 +464,8 @@ if __name__ == "__main__":
         hicra_alpha=args.hicra_alpha,
         strategic_grams_path=args.strategic_grams,
         compile_training=compile_mode,
+        gradient_checkpointing=args.gradient_checkpointing,
+        micro_batch_size=args.micro_batch_size,
         profile_training=args.profile_training,
     )
     run_experiment(cfg)

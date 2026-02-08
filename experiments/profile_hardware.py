@@ -62,6 +62,8 @@ class ProfileConfig:
     num_problems: int = 20
     dataset_seed: int = 42
     reference_run_steps: int = 210  # GTPO convergence target
+    gradient_checkpointing: bool = False
+    micro_batch_size: Optional[int] = None
     json_output: bool = False
     output_path: Optional[str] = None
     quick: bool = False
@@ -971,7 +973,8 @@ def build_recommendation(
     if failed:
         next_seq = min(r.seq_length for r in failed)
         notes.append(
-            f"To unlock {next_seq}+ tokens: gradient checkpointing needed"
+            f"To unlock {next_seq}+ tokens: try gradient_checkpointing=True "
+            f"and tune micro_batch_size (start with 4) on your hardware."
         )
 
     # Check if peak memory exceeds or approaches physical RAM
@@ -989,6 +992,11 @@ def build_recommendation(
                 f"Running close to memory limit "
                 f"({highest_ok.peak_memory_mb:.0f} MB / {memory_mb:.0f} MB)"
             )
+            if highest_ok.peak_memory_mb > memory_mb * 0.7:
+                notes.append(
+                    "Consider micro_batch_size=4 to reduce peak memory, or "
+                    "combine with gradient_checkpointing=True if still tight."
+                )
 
     if max_feasible < 4096:
         notes.append(
@@ -1019,7 +1027,8 @@ def build_recommendation(
         if sweet_analysis.regime == "compute-bound":
             optimization_targets.append(
                 "Train phase dominates: consider mx.compile, "
-                "gradient checkpointing, or quantized training"
+                "gradient_checkpointing=True, and tuned micro_batch_size, "
+                "or quantized training"
             )
         elif sweet_analysis.regime == "memory-bandwidth-bound":
             optimization_targets.append(
@@ -1481,6 +1490,7 @@ def build_json_output(
         out["empirical_oom_boundaries"] = oom_boundaries
     if optimal_configs:
         out["optimal_configs"] = [asdict(oc) for oc in optimal_configs]
+    # gradient_checkpointing is surfaced via ProfileConfig → run_profile header
     return out
 
 
@@ -1518,6 +1528,8 @@ def run_profile(config: ProfileConfig) -> None:
         # Disable auto-reload to avoid per-step adapter save I/O.
         auto_reload=False,
         compile_training=False,
+        gradient_checkpointing=config.gradient_checkpointing,
+        micro_batch_size=config.micro_batch_size,
         profile=True,
         max_grad_norm=0.5,
     )
@@ -1534,6 +1546,10 @@ def run_profile(config: ProfileConfig) -> None:
         f"  Memory savings from LoRA: "
         f"{memory_stats.get('memory_savings_percent', 0.0):.1f}%"
     )
+    if config.gradient_checkpointing:
+        print("  Gradient checkpointing: ENABLED")
+    if config.micro_batch_size is not None:
+        print(f"  Micro-batch size: {config.micro_batch_size}")
 
     # 3. Prepare dataset
     print(f"\nGenerating countdown problems (seed={config.dataset_seed})...")
@@ -1762,6 +1778,27 @@ Examples:
         help="Reference training run length for time estimates (default: %(default)s)",
     )
     parser.add_argument(
+        "--gradient-checkpointing",
+        action="store_true",
+        help=(
+            "Enable gradient checkpointing — recomputes activations during "
+            "backward pass instead of caching them. This reduces peak "
+            "memory at the cost of additional compute. In this trainer, "
+            "True uses sqrt(n) layer selection."
+        ),
+    )
+    parser.add_argument(
+        "--micro-batch-size",
+        type=int,
+        default=None,
+        help=(
+            "Process at most N episodes per logprob-extraction forward pass "
+            "to reduce peak activation memory. Start with 4, then tune for "
+            "your model/hardware. Combine with --gradient-checkpointing "
+            "when still memory constrained."
+        ),
+    )
+    parser.add_argument(
         "--timeout",
         type=float,
         default=600.0,
@@ -1774,6 +1811,8 @@ Examples:
         seq_lengths=sorted(args.max_seq_lengths),
         group_size=args.group_size,
         steps_per_probe=args.steps_per_probe,
+        gradient_checkpointing=args.gradient_checkpointing,
+        micro_batch_size=args.micro_batch_size,
         quick=args.quick,
         json_output=args.json_output,
         output_path=args.output,

@@ -139,7 +139,10 @@ def run_training():
         max_grad_norm=0.5,                         # Gradient clipping
         buffer=buffer,
         data_selector_fn=grpo.select_recent_data,  # Use recent episodes
-        compile_training=True                       # MLX compilation for efficiency
+        compile_training=True,                       # MLX compilation for efficiency
+        # Memory optimization (off by default, enable for long sequences):
+        # gradient_checkpointing=True,   # recompute activations to save memory
+        # micro_batch_size=4,            # process 4 episodes per forward pass
     )
     
     # Training loop with proper rollout collection

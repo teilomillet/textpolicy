@@ -818,6 +818,130 @@ class TestCompiledTraining:
         # Verify the compiled function was created
         assert trainer.loss_and_grad_fn is not None, "Compiled loss function should exist"
 
+    def test_compiled_reasoning_transform_prepares_planning_mask(self):
+        """Compiled trainer should precompute HICRA planning mask eagerly.
+
+        Regression: identify_planning_tokens() uses eager token decoding and
+        cannot run inside mx.compile. Trainer must call transform.prepare_batch
+        before entering loss_and_grad_fn.
+        """
+        from textpolicy.training import Trainer, build_gtpo_hicra_transform
+        from textpolicy.algorithms import grpo
+
+        class TinyLM(nn.Module):
+            def __init__(self, vocab_size=32, hidden=16):
+                super().__init__()
+                self.embed = nn.Embedding(vocab_size, hidden)
+                self.proj = nn.Linear(hidden, vocab_size)
+
+            def __call__(self, x):
+                return self.proj(self.embed(x))
+
+        class MockTokenizer:
+            def convert_ids_to_tokens(self, ids):
+                mapping = {
+                    1: "let",
+                    2: "me",
+                    3: "think",
+                }
+                return [mapping.get(int(i), "x") for i in ids]
+
+        model = TinyLM()
+        mx.eval(model.parameters())
+        transform = build_gtpo_hicra_transform(
+            MockTokenizer(),
+            strategic_grams=["let me think"],
+            hicra_alpha=0.2,
+            entropy_weight=0.0,
+        )
+        trainer = Trainer(
+            model=model,
+            loss_fn=grpo.policy_loss,
+            optimizer=optim.Adam(learning_rate=1e-3),
+            advantage_fn=grpo.compute_advantages,
+            compile_training=True,
+            advantage_transform_fn=transform,
+        )
+
+        batch = {
+            "obs": mx.array([9, 8, 7, 6, 5], dtype=mx.int64),
+            "act": mx.array([1, 2, 3, 4, 5], dtype=mx.int64),
+            "logprob": -mx.ones(5, dtype=mx.float32),
+            "rewards": mx.array([0.5, -0.2, 1.0, 0.1, -0.3], dtype=mx.float32),
+        }
+
+        metrics = trainer.train(batch)
+        assert "loss" in metrics
+        assert trainer._compiled is True
+        assert "planning_mask" in batch
+        assert batch["planning_mask"].shape == batch["act"].shape
+        assert mx.sum(batch["planning_mask"]).item() >= 3.0
+
+    def test_compiled_reasoning_with_checkpointing_train_step(self):
+        """Compile + checkpoint + reasoning transform should train end-to-end."""
+        from textpolicy.training import Trainer, build_gtpo_hicra_transform
+        from textpolicy.algorithms import grpo
+
+        class Block(nn.Module):
+            def __init__(self, hidden):
+                super().__init__()
+                self.linear = nn.Linear(hidden, hidden)
+
+            def __call__(self, x, mask=None, cache=None):
+                return nn.relu(self.linear(x))
+
+        class TinyTransformer(nn.Module):
+            def __init__(self, vocab_size=32, hidden=16):
+                super().__init__()
+                self.embed = nn.Embedding(vocab_size, hidden)
+                self.layers = [Block(hidden), Block(hidden)]
+                self.head = nn.Linear(hidden, vocab_size)
+
+            def __call__(self, x):
+                h = self.embed(x)
+                for layer in self.layers:
+                    h = layer(h)
+                return self.head(h)
+
+        class MockTokenizer:
+            def convert_ids_to_tokens(self, ids):
+                mapping = {
+                    1: "let",
+                    2: "me",
+                    3: "think",
+                }
+                return [mapping.get(int(i), "x") for i in ids]
+
+        model = TinyTransformer()
+        mx.eval(model.parameters())
+        transform = build_gtpo_hicra_transform(
+            MockTokenizer(),
+            strategic_grams=["let me think"],
+            hicra_alpha=0.2,
+            entropy_weight=0.0,
+        )
+        trainer = Trainer(
+            model=model,
+            loss_fn=grpo.policy_loss,
+            optimizer=optim.Adam(learning_rate=1e-3),
+            advantage_fn=grpo.compute_advantages,
+            compile_training=True,
+            gradient_checkpointing=True,
+            advantage_transform_fn=transform,
+        )
+
+        batch = {
+            "obs": mx.array([9, 8, 7, 6, 5], dtype=mx.int64),
+            "act": mx.array([1, 2, 3, 4, 5], dtype=mx.int64),
+            "logprob": -mx.ones(5, dtype=mx.float32),
+            "rewards": mx.array([0.5, -0.2, 1.0, 0.1, -0.3], dtype=mx.float32),
+        }
+
+        metrics = trainer.train(batch)
+        assert "loss" in metrics
+        assert trainer._compiled is True
+        assert "planning_mask" in batch
+
 
 @pytest.mark.unit
 class TestAutoCompileDetection:
