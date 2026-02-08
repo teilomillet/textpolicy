@@ -670,7 +670,7 @@ class TestExtractGrpoLogprobsBatched:
         ep2 = SimpleNamespace(obs=[[6, 7]], act=[], rew=[0.0], logprob=[])
         ep3 = SimpleNamespace(obs=[[8, 9]], act=[[10, 11, 12]], rew=[0.5], logprob=[-0.3, -0.4, -0.7])
 
-        batch = _pack_episodes([ep1, ep2, ep3])
+        batch = _pack_episodes([ep1, ep2, ep3], sort_by_length=False)
 
         # act must have same number of rows as obs / episode_lengths
         assert batch['obs'].shape[0] == batch['act'].shape[0] == 3
@@ -1552,3 +1552,170 @@ class TestLazyGradientClipping:
         assert mx.allclose(lazy_qa, ref_qa, atol=1e-5).item(), (
             f"Nested LoRA grad mismatch: lazy={lazy_qa.tolist()} ref={ref_qa.tolist()}"
         )
+
+
+@pytest.mark.unit
+class TestSequencePacking:
+    """Tests for length-sorted micro-batch trimming (sequence packing).
+
+    _pack_episodes sorts episodes by total sequence length so that
+    similarly-sized episodes are adjacent.  Combined with per-chunk
+    trimming in _extract_grpo_logprobs, this reduces wasted padding
+    compute when episode lengths vary widely.
+
+    Hypotheses:
+        H15: Sort correctness — episodes are reordered by total length
+        H16: Trimmed micro-batch equivalence — sorted+trimmed produces
+             the same logprobs as unsorted full-batch
+        H17: sort_by_length=False preserves original order
+        H18: Edge cases — 0 and 1 episode handled gracefully
+    """
+
+    def test_sort_correctness(self):
+        """H15: Episodes sorted by total sequence length (ascending)."""
+        from types import SimpleNamespace
+        from textpolicy.algorithms.grpo import _pack_episodes
+
+        # Total lengths: ep1=150 (100+50), ep2=60 (50+10), ep3=280 (200+80), ep4=100 (75+25)
+        ep1 = SimpleNamespace(obs=[[1]*100], act=[[2]*50], rew=[1.0], logprob=[-0.5]*50)
+        ep2 = SimpleNamespace(obs=[[1]*50], act=[[2]*10], rew=[0.5], logprob=[-0.3]*10)
+        ep3 = SimpleNamespace(obs=[[1]*200], act=[[2]*80], rew=[0.8], logprob=[-0.4]*80)
+        ep4 = SimpleNamespace(obs=[[1]*75], act=[[2]*25], rew=[0.2], logprob=[-0.6]*25)
+
+        result = _pack_episodes([ep1, ep2, ep3, ep4])
+
+        # Sorted order by total length: ep2(60), ep4(100), ep1(150), ep3(280)
+        assert result['episode_lengths'] == [10, 25, 50, 80], (
+            f"Expected [10, 25, 50, 80], got {result['episode_lengths']}"
+        )
+        assert result['prompt_lengths'] == [50, 75, 100, 200], (
+            f"Expected [50, 75, 100, 200], got {result['prompt_lengths']}"
+        )
+        mx.eval(result['rewards'])
+        expected_rewards = [0.5, 0.2, 1.0, 0.8]
+        actual_rewards = result['rewards'].tolist()
+        for i, (got, want) in enumerate(zip(actual_rewards, expected_rewards)):
+            assert abs(got - want) < 1e-6, (
+                f"rewards[{i}]: got {got}, want {want}"
+            )
+
+    def test_trimmed_microbatch_equivalence(self):
+        """H16: Micro-batched logprobs (with trimming) match full-batch logprobs.
+
+        Both paths produce the same set of per-episode logprobs, just in
+        sorted order. We compare by sorting the per-episode segments.
+        """
+        from textpolicy.generation.mlx_generation import compute_logprobs
+        from textpolicy.algorithms.grpo import _pack_episodes
+        from types import SimpleNamespace
+
+        class TinyLM(nn.Module):
+            def __init__(self, vocab_size=16, dim=8):
+                super().__init__()
+                self.embed = nn.Embedding(vocab_size, dim)
+                self.head = nn.Linear(dim, vocab_size)
+            def __call__(self, x):
+                return self.head(self.embed(x))
+
+        model = TinyLM()
+        mx.eval(model.parameters())
+
+        # 4 episodes with varying lengths (prompt + response)
+        ep1 = SimpleNamespace(obs=[[1, 2, 3]], act=[[4, 5]], rew=[1.0], logprob=[-0.5, -0.6])
+        ep2 = SimpleNamespace(obs=[[6, 7, 8, 9]], act=[[10]], rew=[0.5], logprob=[-0.3])
+        ep3 = SimpleNamespace(obs=[[1, 2]], act=[[3, 4, 5]], rew=[0.8], logprob=[-0.4, -0.2, -0.1])
+        ep4 = SimpleNamespace(obs=[[6, 7, 8]], act=[[9, 10, 11, 12]], rew=[0.2], logprob=[-0.7, -0.8, -0.9, -1.0])
+
+        # Sequential reference: compute logprobs per episode independently
+        ref_lps = []
+        for ep in [ep1, ep2, ep3, ep4]:
+            obs_flat = [t for step in ep.obs for t in (step if isinstance(step, list) else [step])]
+            act_flat = [t for step in ep.act for t in (step if isinstance(step, list) else [step])]
+            lp = compute_logprobs(model, mx.array(obs_flat), mx.array(act_flat))
+            mx.eval(lp)
+            ref_lps.append(lp)
+
+        # Pack with sorting (default)
+        batch = _pack_episodes([ep1, ep2, ep3, ep4])
+
+        from textpolicy.training import Trainer
+        from textpolicy.algorithms import grpo
+
+        trainer = Trainer(
+            model=model,
+            loss_fn=grpo.policy_loss,
+            optimizer=optim.Adam(learning_rate=1e-3),
+            advantage_fn=grpo.compute_advantages,
+            compile_training=False,
+            micro_batch_size=2,
+        )
+
+        result = trainer._extract_grpo_logprobs(
+            batch['obs'], batch['act'], batch['logprob'],
+            batch['episode_lengths'], batch['prompt_lengths'],
+        )
+        mx.eval(result)
+
+        # Extract per-episode logprob segments from the sorted result
+        sorted_ep_lps = []
+        offset = 0
+        for length in batch['episode_lengths']:
+            sorted_ep_lps.append(result[offset:offset + length])
+            offset += length
+
+        # The sorted episode_lengths tell us the order: match each segment
+        # to its reference by episode length
+        ref_by_len = {}
+        for i, ep in enumerate([ep1, ep2, ep3, ep4]):
+            act_flat = [t for step in ep.act for t in (step if isinstance(step, list) else [step])]
+            ref_by_len[len(act_flat)] = ref_lps[i]
+
+        for seg, length in zip(sorted_ep_lps, batch['episode_lengths']):
+            ref = ref_by_len[length]
+            mx.eval(seg, ref)
+            assert mx.allclose(seg, ref, atol=1e-5).item(), (
+                f"Segment mismatch for length {length}: "
+                f"got {seg.tolist()}, want {ref.tolist()}"
+            )
+
+    def test_sort_by_length_false_preserves_order(self):
+        """H17: sort_by_length=False preserves original episode ordering."""
+        from types import SimpleNamespace
+        from textpolicy.algorithms.grpo import _pack_episodes
+
+        # Same episodes as H15
+        ep1 = SimpleNamespace(obs=[[1]*100], act=[[2]*50], rew=[1.0], logprob=[-0.5]*50)
+        ep2 = SimpleNamespace(obs=[[1]*50], act=[[2]*10], rew=[0.5], logprob=[-0.3]*10)
+        ep3 = SimpleNamespace(obs=[[1]*200], act=[[2]*80], rew=[0.8], logprob=[-0.4]*80)
+        ep4 = SimpleNamespace(obs=[[1]*75], act=[[2]*25], rew=[0.2], logprob=[-0.6]*25)
+
+        result = _pack_episodes([ep1, ep2, ep3, ep4], sort_by_length=False)
+
+        # Original order preserved
+        assert result['episode_lengths'] == [50, 10, 80, 25], (
+            f"Expected [50, 10, 80, 25], got {result['episode_lengths']}"
+        )
+        assert result['prompt_lengths'] == [100, 50, 200, 75], (
+            f"Expected [100, 50, 200, 75], got {result['prompt_lengths']}"
+        )
+
+    def test_empty_episodes_edge_case(self):
+        """H18: Zero episodes — no crash, returns empty batch."""
+        from textpolicy.algorithms.grpo import _pack_episodes
+
+        result = _pack_episodes([])
+        assert result['episode_lengths'] == []
+        assert result['prompt_lengths'] == []
+
+    def test_single_episode_edge_case(self):
+        """H18: Single episode — sorting is a no-op."""
+        from types import SimpleNamespace
+        from textpolicy.algorithms.grpo import _pack_episodes
+
+        ep = SimpleNamespace(obs=[[1, 2, 3]], act=[[4, 5]], rew=[1.0], logprob=[-0.5, -0.6])
+        result = _pack_episodes([ep])
+
+        assert result['episode_lengths'] == [2]
+        assert result['prompt_lengths'] == [3]
+        mx.eval(result['rewards'])
+        assert result['rewards'].tolist() == [1.0]

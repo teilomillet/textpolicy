@@ -1068,7 +1068,7 @@ def _flatten_tokens(items: List[Any]) -> List:
     return flattened
 
 
-def _pack_episodes(episodes: List[Any]) -> Dict[str, Any]:
+def _pack_episodes(episodes: List[Any], sort_by_length: bool = True) -> Dict[str, Any]:
     """
     Pack episodes into batch data for GRPO training.
 
@@ -1088,8 +1088,17 @@ def _pack_episodes(episodes: List[Any]) -> Dict[str, Any]:
     Logprobs remain flat 1D (unpadded) to preserve the flat-token invariant
     used by ``policy_loss`` and ``_expand_advantages``.
 
+    When ``sort_by_length=True`` (default), episodes are sorted by total
+    sequence length (prompt + response) so that similarly-sized episodes are
+    adjacent. Combined with micro-batch trimming in the Trainer, this reduces
+    wasted padding compute — each chunk is trimmed to its local max instead
+    of the global max.
+
     Args:
         episodes: List of episodes (Episode objects or serialized dicts)
+        sort_by_length: Sort episodes by total sequence length (ascending)
+            before padding. Default True. Pass False to preserve original
+            episode ordering (useful for tests with frozen expected values).
 
     Returns:
         Batch dictionary (see layout above)
@@ -1165,6 +1174,18 @@ def _pack_episodes(episodes: List[Any]) -> Dict[str, Any]:
         values = stacked.tolist()
         for idx, val in zip(indices, values):
             episode_rewards[idx] = float(val)
+
+    # Sort episodes by total sequence length so similarly-sized episodes are
+    # adjacent.  When micro-batching, each chunk is trimmed to its local max
+    # instead of the global max — reducing wasted padding compute.
+    if sort_by_length and len(all_obs) > 1:
+        sort_idx = sorted(range(len(all_obs)), key=lambda i: len(all_obs[i]))
+        all_obs = [all_obs[i] for i in sort_idx]
+        all_acts = [all_acts[i] for i in sort_idx]
+        all_logprobs = [all_logprobs[i] for i in sort_idx]
+        episode_lengths = [episode_lengths[i] for i in sort_idx]
+        prompt_lengths = [prompt_lengths[i] for i in sort_idx]
+        episode_rewards = [episode_rewards[i] for i in sort_idx]
 
     # Find maximum sequence lengths for padding
     max_obs_len = max(len(obs) for obs in all_obs) if all_obs else 0

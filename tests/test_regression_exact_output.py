@@ -311,13 +311,13 @@ class TestRegressionPackEpisodes:
 
     def test_exact_rewards(self):
         """H1: Episode rewards are correctly summed."""
-        result = grpo._pack_episodes(self._make_episodes())
+        result = grpo._pack_episodes(self._make_episodes(), sort_by_length=False)
         mx.eval(result['rewards'])
         assert result['rewards'].tolist() == [1.0, 0.5]
 
     def test_exact_episode_lengths(self):
         """H1: Episode lengths match flattened action counts."""
-        result = grpo._pack_episodes(self._make_episodes())
+        result = grpo._pack_episodes(self._make_episodes(), sort_by_length=False)
         assert result['episode_lengths'] == [2, 3]
 
     def test_flat_1d_logprobs(self):
@@ -414,7 +414,7 @@ class TestRegressionPackEpisodes:
 
     def test_prompt_lengths_present(self):
         """prompt_lengths tracks per-episode prompt token counts."""
-        result = grpo._pack_episodes(self._make_episodes())
+        result = grpo._pack_episodes(self._make_episodes(), sort_by_length=False)
         assert result['prompt_lengths'] == [3, 2], (
             f"Expected [3, 2], got {result['prompt_lengths']}"
         )
@@ -429,7 +429,7 @@ class TestRegressionPackEpisodes:
         ep1 = SimpleNamespace(obs=[[1, 2]], act=[[3]], rew=[1.0], logprob=[-0.5])
         ep2 = SimpleNamespace(obs=[[4, 5]], act=[], rew=[0.0], logprob=[])
         ep3 = SimpleNamespace(obs=[[6, 7]], act=[[8, 9]], rew=[0.5], logprob=[-0.3, -0.4])
-        result = grpo._pack_episodes([ep1, ep2, ep3])
+        result = grpo._pack_episodes([ep1, ep2, ep3], sort_by_length=False)
         mx.eval(result['obs'], result['act'])
 
         n_episodes = len(result['episode_lengths'])
@@ -452,7 +452,7 @@ class TestRegressionPackEpisodes:
         """
         ep1 = SimpleNamespace(obs=[[1, 2]], act=[], rew=[0.0], logprob=[])
         ep2 = SimpleNamespace(obs=[[3, 4]], act=[], rew=[0.0], logprob=[])
-        result = grpo._pack_episodes([ep1, ep2])
+        result = grpo._pack_episodes([ep1, ep2], sort_by_length=False)
         mx.eval(result['obs'], result['act'])
 
         assert result['act'].ndim == 2, f"Expected 2D act, got {result['act'].ndim}D"
@@ -502,7 +502,7 @@ class TestRegressionBatchedLogprobEmptyEpisode:
         ep2 = SimpleNamespace(obs=[[6, 7]], act=[], rew=[0.0], logprob=[])
         ep3 = SimpleNamespace(obs=[[8, 9]], act=[[10, 11, 12]], rew=[0.5], logprob=[-0.3, -0.4, -0.7])
 
-        batch = grpo._pack_episodes([ep1, ep2, ep3])
+        batch = grpo._pack_episodes([ep1, ep2, ep3], sort_by_length=False)
 
         # Structural: all tensors must have 3 rows (one per episode)
         assert batch['obs'].shape[0] == 3, f"obs has {batch['obs'].shape[0]} rows, want 3"
@@ -553,7 +553,7 @@ class TestRegressionBatchedLogprobEmptyEpisode:
         ep2 = SimpleNamespace(obs=[[3, 4]], act=[], rew=[0.0], logprob=[])
         ep3 = SimpleNamespace(obs=[[5, 6]], act=[], rew=[0.0], logprob=[])
 
-        batch = grpo._pack_episodes([ep1, ep2, ep3])
+        batch = grpo._pack_episodes([ep1, ep2, ep3], sort_by_length=False)
 
         # Structural: 2D tensors with correct row count
         assert batch['act'].ndim == 2, f"act must be 2D, got {batch['act'].ndim}D"
