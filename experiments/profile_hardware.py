@@ -130,6 +130,8 @@ class ProbeResult:
     trainer_phases: Optional[Dict[str, float]] = None
     # Throughput metrics for Little's Law
     total_tokens_generated: int = 0
+    # Number of fully completed probe steps
+    steps_completed: int = 0
 
 
 def run_probe(
@@ -154,7 +156,8 @@ def run_probe(
     rollout_phase_accum: Dict[str, float] = {}
     trainer_phase_accum: Dict[str, float] = {}
     total_tokens = 0
-    probe_start = time.perf_counter()
+    completed_steps = 0
+    rollout: Optional[RolloutCoordinator] = None
 
     try:
         # Reset peak memory tracking before probe
@@ -204,23 +207,7 @@ def run_probe(
         trainer.link_buffer(buffer, data_selector_fn=grpo.select_recent_data)
 
         for step_i in range(steps):
-            elapsed = time.perf_counter() - probe_start
-            if elapsed > timeout:
-                rollout.close()
-                clear_memory()
-                return ProbeResult(
-                    seq_length=seq_length,
-                    group_size=group_size,
-                    gen_time_s=_mean(gen_times),
-                    train_time_s=_mean(train_times),
-                    total_time_s=_mean(gen_times) + _mean(train_times),
-                    peak_memory_mb=mx.get_peak_memory() / 1024 / 1024,
-                    status="TIMEOUT",
-                    error_msg=f"Exceeded {timeout:.0f}s timeout at step {step_i}",
-                    rollout_phases=_average_phases(rollout_phase_accum, max(1, step_i)),
-                    trainer_phases=_average_phases(trainer_phase_accum, max(1, step_i)),
-                    total_tokens_generated=total_tokens,
-                )
+            step_start = time.perf_counter()
 
             buffer.clear()
 
@@ -232,6 +219,30 @@ def run_probe(
             mx.eval()  # Force sync for accurate timing
             gen_time = time.perf_counter() - gen_start
             gen_times.append(gen_time)
+
+            # Per-step timeout is checked at phase boundaries.
+            if time.perf_counter() - step_start > timeout:
+                return ProbeResult(
+                    seq_length=seq_length,
+                    group_size=group_size,
+                    gen_time_s=_mean(gen_times),
+                    train_time_s=_mean(train_times),
+                    total_time_s=_mean(gen_times) + _mean(train_times),
+                    peak_memory_mb=mx.get_peak_memory() / 1024 / 1024,
+                    status="TIMEOUT",
+                    error_msg=(
+                        f"Exceeded {timeout:.0f}s timeout during generation "
+                        f"at step {step_i + 1}"
+                    ),
+                    rollout_phases=_average_phases(
+                        rollout_phase_accum, max(1, len(gen_times))
+                    ),
+                    trainer_phases=_average_phases(
+                        trainer_phase_accum, max(1, len(train_times))
+                    ),
+                    total_tokens_generated=total_tokens,
+                    steps_completed=completed_steps,
+                )
 
             # Accumulate rollout sub-phase timing
             for phase, secs in rollout.get_rollout_timing().items():
@@ -262,10 +273,32 @@ def run_probe(
                     trainer_phase_accum[phase] = (
                         trainer_phase_accum.get(phase, 0.0) + float(value)
                     )
+            completed_steps += 1
 
-        rollout.close()
+            if time.perf_counter() - step_start > timeout:
+                return ProbeResult(
+                    seq_length=seq_length,
+                    group_size=group_size,
+                    gen_time_s=_mean(gen_times),
+                    train_time_s=_mean(train_times),
+                    total_time_s=_mean(gen_times) + _mean(train_times),
+                    peak_memory_mb=mx.get_peak_memory() / 1024 / 1024,
+                    status="TIMEOUT",
+                    error_msg=(
+                        f"Exceeded {timeout:.0f}s timeout during training "
+                        f"at step {step_i + 1}"
+                    ),
+                    rollout_phases=_average_phases(
+                        rollout_phase_accum, max(1, len(gen_times))
+                    ),
+                    trainer_phases=_average_phases(
+                        trainer_phase_accum, max(1, len(train_times))
+                    ),
+                    total_tokens_generated=total_tokens,
+                    steps_completed=completed_steps,
+                )
+
         peak_mem = mx.get_peak_memory() / 1024 / 1024
-        clear_memory()
 
         return ProbeResult(
             seq_length=seq_length,
@@ -278,10 +311,10 @@ def run_probe(
             rollout_phases=_average_phases(rollout_phase_accum, steps),
             trainer_phases=_average_phases(trainer_phase_accum, steps),
             total_tokens_generated=total_tokens,
+            steps_completed=completed_steps,
         )
 
     except Exception as e:
-        clear_memory()
         error_str = str(e)
         status = "OOM" if "memory" in error_str.lower() else "ERROR"
         return ProbeResult(
@@ -296,7 +329,15 @@ def run_probe(
             rollout_phases=_average_phases(rollout_phase_accum, max(1, len(gen_times))),
             trainer_phases=_average_phases(trainer_phase_accum, max(1, len(train_times))),
             total_tokens_generated=total_tokens,
+            steps_completed=completed_steps,
         )
+    finally:
+        if rollout is not None:
+            try:
+                rollout.close()
+            except Exception:
+                pass
+        clear_memory()
 
 
 def _mean(values: List[float]) -> float:
@@ -452,9 +493,12 @@ def analyze_bottlenecks(results: List[ProbeResult]) -> List[BottleneckAnalysis]:
 
         # Little's Law: tokens/second
         tokens_gen = r.total_tokens_generated
-        tps_gen = tokens_gen / r.gen_time_s if r.gen_time_s > 0 else 0.0
+        steps_completed = max(1, r.steps_completed)
+        total_gen_time = r.gen_time_s * steps_completed
+        total_train_time = r.train_time_s * steps_completed
+        tps_gen = tokens_gen / total_gen_time if total_gen_time > 0 else 0.0
         # For training, total tokens pass through forward + backward
-        tps_train = tokens_gen / r.train_time_s if r.train_time_s > 0 else 0.0
+        tps_train = tokens_gen / total_train_time if total_train_time > 0 else 0.0
 
         # Regime classification based on fraction of time in loss_and_grad
         # (the O(n^2) attention bottleneck) vs generation (memory-bandwidth).
@@ -1308,7 +1352,9 @@ def run_profile(config: ProfileConfig) -> None:
     model = trainer.model
 
     mem_after = get_memory_stats()
-    model_memory_mb = mem_after.get("mlx_memory_mb", 0.0)
+    mem_before_mlx = mem_before.get("mlx_memory_mb", 0.0)
+    mem_after_mlx = mem_after.get("mlx_memory_mb", 0.0)
+    model_memory_mb = max(0.0, mem_after_mlx - mem_before_mlx)
     lora_overhead = memory_stats.get("trainable_params", 0) * 4 / 1024 / 1024
 
     print(f"  Model memory: ~{model_memory_mb / 1024:.1f} GB")
