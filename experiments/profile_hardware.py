@@ -62,6 +62,8 @@ class ProfileConfig:
     num_problems: int = 20
     dataset_seed: int = 42
     reference_run_steps: int = 210  # GTPO convergence target
+    gradient_checkpointing: bool = False
+    micro_batch_size: Optional[int] = None
     json_output: bool = False
     output_path: Optional[str] = None
     quick: bool = False
@@ -1481,6 +1483,7 @@ def build_json_output(
         out["empirical_oom_boundaries"] = oom_boundaries
     if optimal_configs:
         out["optimal_configs"] = [asdict(oc) for oc in optimal_configs]
+    # gradient_checkpointing is surfaced via ProfileConfig → run_profile header
     return out
 
 
@@ -1518,6 +1521,8 @@ def run_profile(config: ProfileConfig) -> None:
         # Disable auto-reload to avoid per-step adapter save I/O.
         auto_reload=False,
         compile_training=False,
+        gradient_checkpointing=config.gradient_checkpointing,
+        micro_batch_size=config.micro_batch_size,
         profile=True,
         max_grad_norm=0.5,
     )
@@ -1534,6 +1539,10 @@ def run_profile(config: ProfileConfig) -> None:
         f"  Memory savings from LoRA: "
         f"{memory_stats.get('memory_savings_percent', 0.0):.1f}%"
     )
+    if config.gradient_checkpointing:
+        print("  Gradient checkpointing: ENABLED")
+    if config.micro_batch_size is not None:
+        print(f"  Micro-batch size: {config.micro_batch_size}")
 
     # 3. Prepare dataset
     print(f"\nGenerating countdown problems (seed={config.dataset_seed})...")
@@ -1762,6 +1771,17 @@ Examples:
         help="Reference training run length for time estimates (default: %(default)s)",
     )
     parser.add_argument(
+        "--gradient-checkpointing",
+        action="store_true",
+        help="Enable gradient checkpointing (trades compute for memory)",
+    )
+    parser.add_argument(
+        "--micro-batch-size",
+        type=int,
+        default=None,
+        help="Process at most N episodes per forward pass to reduce peak memory",
+    )
+    parser.add_argument(
         "--timeout",
         type=float,
         default=600.0,
@@ -1774,6 +1794,8 @@ Examples:
         seq_lengths=sorted(args.max_seq_lengths),
         group_size=args.group_size,
         steps_per_probe=args.steps_per_probe,
+        gradient_checkpointing=args.gradient_checkpointing,
+        micro_batch_size=args.micro_batch_size,
         quick=args.quick,
         json_output=args.json_output,
         output_path=args.output,

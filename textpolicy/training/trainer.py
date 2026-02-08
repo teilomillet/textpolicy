@@ -53,6 +53,8 @@ class Trainer:
         metrics_fn: Optional[Callable] = None,
         max_grad_norm: Optional[float] = 0.5,
         compile_training: Union[bool, str] = "auto",
+        gradient_checkpointing: bool = False,
+        micro_batch_size: Optional[int] = None,
         buffer: Optional[Buffer] = None,
         data_selector_fn: Optional[Callable] = None,
         auto_save_lora: Optional[str] = None,
@@ -76,6 +78,14 @@ class Trainer:
                 ``"auto"`` (default) compiles when model has ≥ 1M parameters
                 (compilation overhead is only amortized for larger models).
                 ``True`` always compiles.  ``False`` never compiles.
+            gradient_checkpointing: When True, wraps each transformer layer's
+                forward pass with ``mx.checkpoint`` to trade ~30% more compute
+                for ~60% less activation memory. Incompatible with
+                ``mx.compile`` — compilation is forced off with a warning.
+            micro_batch_size: When set, processes at most this many episodes
+                per model forward pass during logprob extraction, reducing
+                peak activation memory by factor ``N / micro_batch_size``.
+                ``None`` (default) processes all episodes in one pass.
             buffer: Optional linked buffer for automatic data selection
             data_selector_fn: Algorithm-specific function to select data from buffer
             auto_save_lora: Optional path to auto-save LoRA adapters after training
@@ -157,6 +167,26 @@ class Trainer:
             raise ValueError(
                 f"compile_training must be True, False, or 'auto', "
                 f"got {compile_training!r}"
+            )
+
+        # Gradient checkpointing: incompatible with mx.compile.
+        # mx.checkpoint inside mx.compile raises an error, so we force
+        # compilation off when checkpointing is requested.
+        self._gradient_checkpointing = gradient_checkpointing
+        self._micro_batch_size = micro_batch_size
+        if gradient_checkpointing:
+            if should_compile:
+                logger.warning(
+                    "gradient_checkpointing=True is incompatible with "
+                    "mx.compile — forcing compilation off. To silence this "
+                    "warning, set compile_training=False explicitly."
+                )
+                should_compile = False
+
+            from .gradient_checkpointing import apply_gradient_checkpointing
+            n_layers = apply_gradient_checkpointing(model)
+            logger.info(
+                "Gradient checkpointing applied to %d layers", n_layers
             )
 
         self._compiled = should_compile
@@ -616,18 +646,46 @@ class Trainer:
 
                 from textpolicy.generation.mlx_generation import compute_logprobs_batched
 
-                batched_out = compute_logprobs_batched(
-                    self.model,
-                    observations,   # [N, max_obs_len]
-                    actions,        # [N, max_act_len]
-                    prompt_lengths,
-                    episode_lengths,
-                    return_token_entropies=return_token_entropies,
-                )
-                if return_token_entropies:
-                    new_logprobs, token_entropies = batched_out
+                M = self._micro_batch_size
+                if M is not None and M < num_episodes:
+                    # Micro-batched: process M episodes at a time to reduce
+                    # peak activation memory (logits tensor scales as
+                    # [M, max_seq_len, vocab] instead of [N, ...]).
+                    all_logprobs = []
+                    all_entropies = []
+                    for start in range(0, num_episodes, M):
+                        end = min(start + M, num_episodes)
+                        chunk_out = compute_logprobs_batched(
+                            self.model,
+                            observations[start:end],
+                            actions[start:end],
+                            prompt_lengths[start:end],
+                            episode_lengths[start:end],
+                            return_token_entropies=return_token_entropies,
+                        )
+                        if return_token_entropies:
+                            chunk_lp, chunk_ent = chunk_out
+                            all_logprobs.append(chunk_lp)
+                            all_entropies.append(chunk_ent)
+                        else:
+                            all_logprobs.append(chunk_out)
+                    new_logprobs = mx.concatenate(all_logprobs)
+                    if return_token_entropies:
+                        token_entropies = mx.concatenate(all_entropies)
                 else:
-                    new_logprobs = batched_out
+                    # Full batch: single forward pass for all episodes.
+                    batched_out = compute_logprobs_batched(
+                        self.model,
+                        observations,   # [N, max_obs_len]
+                        actions,        # [N, max_act_len]
+                        prompt_lengths,
+                        episode_lengths,
+                        return_token_entropies=return_token_entropies,
+                    )
+                    if return_token_entropies:
+                        new_logprobs, token_entropies = batched_out
+                    else:
+                        new_logprobs = batched_out
             else:
                 # Path 2: Sequential compat — N per-episode forward passes
                 from textpolicy.generation.mlx_generation import compute_logprobs

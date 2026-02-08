@@ -180,6 +180,8 @@ def create_tinylora_reasoning_setup(
     hicra_alpha: float = 0.2,
     entropy_weight: float = 0.1,
     compile_training: Union[bool, str] = "auto",
+    gradient_checkpointing: bool = False,
+    micro_batch_size: Optional[int] = None,
     auto_reload: bool = True,
     adapter_save_path: str = "./lora_adapters.safetensors",
     max_grad_norm: Optional[float] = 0.5,
@@ -217,6 +219,8 @@ def create_tinylora_reasoning_setup(
         optimizer=optimizer,
         max_grad_norm=max_grad_norm,
         compile_training=compile_training,
+        gradient_checkpointing=gradient_checkpointing,
+        micro_batch_size=micro_batch_size,
         advantage_transform_fn=transform,
         **trainer_kwargs,
     )
