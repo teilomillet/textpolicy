@@ -278,6 +278,28 @@ class TestReasoningStackPublicAPI:
         from textpolicy.training import create_tinylora_reasoning_setup
         assert callable(create_tinylora_reasoning_setup)
 
+    def test_build_gtpo_transform_importable(self):
+        """build_gtpo_transform (canonical GTPO builder) must be importable."""
+        from textpolicy.training import build_gtpo_transform
+        assert callable(build_gtpo_transform)
+
+    def test_build_gtpo_transform_signature(self):
+        """build_gtpo_transform must accept the expected GTPO + HICRA params."""
+        import inspect
+        from textpolicy.training import build_gtpo_transform
+
+        sig = inspect.signature(build_gtpo_transform)
+        for param_name in ("alpha_1", "alpha_2", "reward_threshold",
+                           "tokenizer", "hicra_gamma", "strategic_grams"):
+            assert param_name in sig.parameters, (
+                f"build_gtpo_transform must accept '{param_name}'."
+            )
+
+    def test_build_gtpo_faithful_transform_is_alias(self):
+        """build_gtpo_faithful_transform must be an alias for build_gtpo_transform."""
+        from textpolicy.training import build_gtpo_transform, build_gtpo_faithful_transform
+        assert build_gtpo_faithful_transform is build_gtpo_transform
+
 
 # ---------------------------------------------------------------------------
 # DI enforcement: advantage_transform_fn injection

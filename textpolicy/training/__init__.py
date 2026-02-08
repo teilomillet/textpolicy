@@ -42,6 +42,7 @@ __all__.extend(
 try:
     from .reasoning_stack import (
         build_gtpo_hicra_transform,
+        build_gtpo_transform,
         build_gtpo_faithful_transform,
         create_tinylora_reasoning_setup,
     )
@@ -49,6 +50,7 @@ try:
     __all__.extend(
         [
             "build_gtpo_hicra_transform",
+            "build_gtpo_transform",
             "build_gtpo_faithful_transform",
             "create_tinylora_reasoning_setup",
         ]

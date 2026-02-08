@@ -585,7 +585,7 @@ def compute_advantages_gtpo(
 
 
 # ---------------------------------------------------------------------------
-# GTPO Faithful: Paper-Exact Implementation (arXiv 2508.04349)
+# GTPO: Paper-Exact Implementation (arXiv 2508.04349)
 # ---------------------------------------------------------------------------
 #
 # The functions below implement GTPO as described in:

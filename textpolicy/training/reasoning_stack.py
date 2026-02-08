@@ -237,8 +237,8 @@ def build_gtpo_hicra_transform(
     )
 
 
-class _GTPOFaithfulTransform:
-    """Trainer transform for paper-faithful GTPO (arXiv 2508.04349).
+class _GTPOTransform:
+    """Trainer transform for GTPO (arXiv 2508.04349).
 
     Computes entropy-shaped, separately-normalized advantages per Eq. 3, 5, 6,
     completely replacing the standard GRPO advantages.  All operations are
@@ -309,21 +309,21 @@ class _GTPOFaithfulTransform:
         episode_lengths = batch_data.get("episode_lengths")
         if episode_lengths is None:
             raise ValueError(
-                "batch_data must include 'episode_lengths' for faithful GTPO. "
+                "batch_data must include 'episode_lengths' for GTPO. "
                 "Ensure the rollout pipeline provides episode_lengths in the batch."
             )
 
         token_entropies = batch_data.get("token_entropies")
         if token_entropies is None:
             raise ValueError(
-                "batch_data must include 'token_entropies' for faithful GTPO. "
+                "batch_data must include 'token_entropies' for GTPO. "
                 "This is auto-computed when advantage_transform_fn is set."
             )
 
         rewards = batch_data.get("rewards")
         if rewards is None:
             raise ValueError(
-                "batch_data must include 'rewards' for faithful GTPO. "
+                "batch_data must include 'rewards' for GTPO. "
                 "Ensure the rollout pipeline provides episode-level rewards."
             )
 
@@ -383,7 +383,13 @@ class _GTPOFaithfulTransform:
         return faithful_advantages
 
 
-def build_gtpo_faithful_transform(
+# Backward-compat alias: the "faithful" qualifier is removed since the
+# paper-exact implementation *is* GTPO.  Existing code that imports the
+# old name continues to work.
+_GTPOFaithfulTransform = _GTPOTransform
+
+
+def build_gtpo_transform(
     *,
     alpha_1: float = 1.0,
     alpha_2: float = 0.1,
@@ -394,11 +400,14 @@ def build_gtpo_faithful_transform(
     hicra_gamma: float = 0.0,
 ) -> Callable[[mx.array, Dict[str, Any]], mx.array]:
     """
-    Build a Trainer-compatible transform for paper-faithful GTPO.
+    Build a Trainer-compatible transform for GTPO (arXiv 2508.04349).
 
     Implements Eq. 3, 5, 6 from arXiv 2508.04349. The returned transform
     completely replaces standard GRPO advantages with entropy-shaped,
     separately-normalized advantages.
+
+    This is the default advantage transform used by
+    ``create_tinylora_reasoning_setup`` when no custom transform is provided.
 
     PPO clipping (Eq. 7) is handled by the Trainer's ``loss_fn`` — use
     ``functools.partial(grpo.policy_loss, clip_ratio=0.2)`` or similar.
@@ -416,7 +425,7 @@ def build_gtpo_faithful_transform(
 
     Example::
 
-        from textpolicy.training import Trainer, build_gtpo_faithful_transform
+        from textpolicy.training import Trainer, build_gtpo_transform
         from textpolicy.algorithms import grpo
         from functools import partial
 
@@ -425,7 +434,7 @@ def build_gtpo_faithful_transform(
             advantage_fn=grpo.compute_advantages,
             loss_fn=partial(grpo.policy_loss, clip_ratio=0.2),
             optimizer=optimizer,
-            advantage_transform_fn=build_gtpo_faithful_transform(
+            advantage_transform_fn=build_gtpo_transform(
                 alpha_1=1.0, alpha_2=0.1,
                 tokenizer=tokenizer, hicra_gamma=0.3,
             ),
@@ -458,7 +467,7 @@ def build_gtpo_faithful_transform(
             "hicra_gamma > 0 requires a tokenizer for planning token identification."
         )
 
-    return _GTPOFaithfulTransform(
+    return _GTPOTransform(
         alpha_1=alpha_1,
         alpha_2=alpha_2,
         reward_threshold=reward_threshold,
@@ -469,6 +478,10 @@ def build_gtpo_faithful_transform(
     )
 
 
+# Backward-compat alias for the builder function.
+build_gtpo_faithful_transform = build_gtpo_transform
+
+
 def create_tinylora_reasoning_setup(
     model: nn.Module,
     tokenizer: Any,
@@ -477,6 +490,10 @@ def create_tinylora_reasoning_setup(
     lora_config: Optional[Dict[str, Any]] = None,
     advantage_transform_fn: Optional[Callable[[mx.array, Dict[str, Any]], mx.array]] = None,
     strategic_grams: Optional[List[str]] = None,
+    alpha_1: float = 1.0,
+    alpha_2: float = 0.1,
+    reward_threshold: float = 0.5,
+    hicra_gamma: float = 0.3,
     hicra_alpha: float = 0.2,
     entropy_weight: float = 0.1,
     compile_training: Union[bool, str] = "auto",
@@ -492,9 +509,9 @@ def create_tinylora_reasoning_setup(
 
     The advantage transform is injectable: pass any ``(advantages, batch_data)
     -> advantages`` callable via ``advantage_transform_fn``.  When ``None``
-    (the default), a simplified GTPO+HICRA transform is built from the
-    ``tokenizer``, ``strategic_grams``, ``hicra_alpha``, and
-    ``entropy_weight`` parameters.
+    (the default), a GTPO transform (arXiv 2508.04349 Eq. 3, 5, 6) is built
+    from the ``alpha_1``, ``alpha_2``, ``reward_threshold``, ``hicra_gamma``,
+    and ``strategic_grams`` parameters.
 
     TinyLoRA-style here means a compact LoRA default configuration
     (small rank + fewer adapted layers).  Exact TinyLoRA internals from
@@ -502,16 +519,22 @@ def create_tinylora_reasoning_setup(
 
     Examples::
 
-        # Default: simplified GTPO + HICRA (backward compatible)
+        # Default: GTPO (Eq. 3, 5, 6) with HICRA fusion
         trainer, stats = create_tinylora_reasoning_setup(
             model, tokenizer, optimizer,
         )
 
-        # Inject faithful GTPO + HICRA fusion
+        # Custom GTPO parameters
         trainer, stats = create_tinylora_reasoning_setup(
             model, tokenizer, optimizer,
-            advantage_transform_fn=build_gtpo_faithful_transform(
-                tokenizer=tokenizer, hicra_gamma=0.3,
+            alpha_1=0.9, alpha_2=0.2, hicra_gamma=0.5,
+        )
+
+        # Inject the simplified GTPO+HICRA transform for ablation
+        trainer, stats = create_tinylora_reasoning_setup(
+            model, tokenizer, optimizer,
+            advantage_transform_fn=build_gtpo_hicra_transform(
+                tokenizer, entropy_weight=0.1, hicra_alpha=0.2,
             ),
         )
 
@@ -521,16 +544,25 @@ def create_tinylora_reasoning_setup(
         optimizer: MLX optimizer instance (e.g. ``optim.Adam``).
         lora_config: Override default LoRA hyper-parameters (rank, alpha, layers).
         advantage_transform_fn: Custom advantage transform to inject.  When
-            ``None``, a default GTPO+HICRA transform is built from the other
-            parameters.  The ``strategic_grams``, ``hicra_alpha``, and
-            ``entropy_weight`` params are ignored when a custom transform is
-            provided.
-        strategic_grams: Path or list of strategic n-grams for HICRA.
+            ``None``, a default GTPO transform is built from the other
+            parameters.  All GTPO/HICRA params below are ignored when a
+            custom transform is provided.
+        strategic_grams: Planning phrases for HICRA (defaults to built-in list).
             Only used when ``advantage_transform_fn`` is ``None``.
-        hicra_alpha: Blend weight for HICRA credit assignment (default 0.2).
+        alpha_1: GTPO base reward weight (Eq. 3, default 1.0).
             Only used when ``advantage_transform_fn`` is ``None``.
-        entropy_weight: GTPO entropy re-weighting coefficient beta (default 0.1).
+        alpha_2: GTPO entropy-shaped weight (Eq. 3, default 0.1).
             Only used when ``advantage_transform_fn`` is ``None``.
+        reward_threshold: GTPO O+/O- partition threshold (default 0.5).
+            Only used when ``advantage_transform_fn`` is ``None``.
+        hicra_gamma: HICRA entropy boost factor for GTPO fusion (default 0.3).
+            Only used when ``advantage_transform_fn`` is ``None``.
+        hicra_alpha: Blend weight for the *simplified* GTPO+HICRA transform
+            (default 0.2).  Only used when an explicit simplified transform
+            is injected via ``advantage_transform_fn``.
+        entropy_weight: Simplified GTPO entropy re-weighting coefficient beta
+            (default 0.1).  Only used when an explicit simplified transform
+            is injected via ``advantage_transform_fn``.
         compile_training: ``True``, ``False``, or ``"auto"`` for mx.compile.
         gradient_checkpointing: Re-compute activations during backward pass
             instead of caching them.  ``True`` uses sqrt(n) layer selection
@@ -569,11 +601,13 @@ def create_tinylora_reasoning_setup(
     )
 
     if advantage_transform_fn is None:
-        advantage_transform_fn = build_gtpo_hicra_transform(
-            tokenizer,
+        advantage_transform_fn = build_gtpo_transform(
+            alpha_1=alpha_1,
+            alpha_2=alpha_2,
+            reward_threshold=reward_threshold,
+            tokenizer=tokenizer,
             strategic_grams=strategic_grams,
-            hicra_alpha=hicra_alpha,
-            entropy_weight=entropy_weight,
+            hicra_gamma=hicra_gamma,
         )
 
     trainer = Trainer(

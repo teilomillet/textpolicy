@@ -41,10 +41,7 @@ from textpolicy.tasks.countdown import (
     format_countdown_prompt,
     generate_countdown_problems,
 )
-from textpolicy.training import (
-    build_gtpo_faithful_transform,
-    create_tinylora_reasoning_setup,
-)
+from textpolicy.training import create_tinylora_reasoning_setup
 
 
 @dataclass
@@ -61,12 +58,9 @@ class ReasoningConfig:
     lora_dropout: float = 0.0
 
     # Reasoning shaping
-    entropy_weight: float = 0.1
-    hicra_alpha: float = 0.2
     strategic_grams_path: Optional[str] = None
 
-    # Paper-faithful GTPO (arXiv 2508.04349 Eq. 3, 5, 6)
-    faithful: bool = False
+    # GTPO (arXiv 2508.04349 Eq. 3, 5, 6)
     alpha_1: float = 1.0
     alpha_2: float = 0.1
     reward_threshold: float = 0.5
@@ -235,10 +229,6 @@ def init_wandb(config: ReasoningConfig) -> bool:
         return False
 
     tags = ["gtpo", "hicra", "tinylora", "countdown"]
-    if config.faithful:
-        tags.append("faithful-gtpo")
-    else:
-        tags.append("simplified-gtpo")
 
     wandb.init(
         project=config.wandb_project,
@@ -366,7 +356,8 @@ def log_wandb_step(
         log["policy/mean_advantage"] = train_metrics["mean_advantage"]
         log["policy/std_advantage"] = train_metrics["std_advantage"]
 
-    wandb.log(log)
+    # Keep wandb's internal global step aligned with our explicit training step.
+    wandb.log(log, step=step)
 
 
 def log_wandb_completions(
@@ -379,6 +370,33 @@ def log_wandb_completions(
     if not use_wandb or step % 10 != 0:
         return
 
+    def _as_list(value: Any) -> List[Any]:
+        """Normalize list/tuple/array/scalar values into a Python list."""
+        if value is None:
+            return []
+        if hasattr(value, "tolist"):
+            value = value.tolist()
+        if isinstance(value, tuple):
+            return list(value)
+        if isinstance(value, list):
+            return value
+        return [value]
+
+    def _flatten_token_ids(value: Any) -> List[int]:
+        """Flatten one level of token nesting and coerce to integer token IDs."""
+        seq = _as_list(value)
+        flat: List[int] = []
+        for item in seq:
+            if hasattr(item, "tolist"):
+                item = item.tolist()
+            if isinstance(item, tuple):
+                item = list(item)
+            if isinstance(item, list):
+                flat.extend(int(t) for t in item)
+            else:
+                flat.append(int(item))
+        return flat
+
     rows = []
     for ep in episodes:
         if isinstance(ep, dict):
@@ -390,18 +408,22 @@ def log_wandb_completions(
             act = ep.act
             rew = ep.rew
 
-        prompt_tokens = obs[0] if obs else []
-        completion_tokens = act[0] if act else []
-        reward_val = float(rew[0]) if rew else 0.0
+        obs_list = _as_list(obs)
+        act_list = _as_list(act)
+        rew_list = _as_list(rew)
 
-        # Flatten if nested
-        if isinstance(prompt_tokens, (list, tuple)) and prompt_tokens and isinstance(prompt_tokens[0], (list, tuple)):
-            prompt_tokens = [t for sub in prompt_tokens for t in sub]
-        if isinstance(completion_tokens, (list, tuple)) and completion_tokens and isinstance(completion_tokens[0], (list, tuple)):
-            completion_tokens = [t for sub in completion_tokens for t in sub]
+        prompt_tokens = _flatten_token_ids(obs_list[0]) if obs_list else []
+        completion_tokens = _flatten_token_ids(act_list[0]) if act_list else []
 
-        prompt_text = tokenizer.decode(prompt_tokens) if prompt_tokens else ""
-        completion_text = tokenizer.decode(completion_tokens) if completion_tokens else ""
+        reward_raw: Any = rew_list[0] if rew_list else 0.0
+        if isinstance(reward_raw, (list, tuple)):
+            reward_raw = reward_raw[0] if reward_raw else 0.0
+        if hasattr(reward_raw, "item"):
+            reward_raw = reward_raw.item()
+        reward_val = float(reward_raw)
+
+        prompt_text = tokenizer.decode(prompt_tokens) if len(prompt_tokens) > 0 else ""
+        completion_text = tokenizer.decode(completion_tokens) if len(completion_tokens) > 0 else ""
 
         rows.append([
             step,
@@ -443,27 +465,16 @@ def run_experiment(config: ReasoningConfig) -> None:
 
     optimizer = optim.Adam(learning_rate=config.learning_rate)
 
-    # Build advantage transform: faithful GTPO or simplified GTPO+HICRA.
-    advantage_transform_fn = None
-    if config.faithful:
-        advantage_transform_fn = build_gtpo_faithful_transform(
-            alpha_1=config.alpha_1,
-            alpha_2=config.alpha_2,
-            reward_threshold=config.reward_threshold,
-            tokenizer=tokenizer,
-            strategic_grams=strategic_grams,
-            hicra_gamma=config.hicra_gamma,
-        )
-        print(
-            f"Using paper-faithful GTPO (Eq. 3,5,6): "
-            f"α₁={config.alpha_1}, α₂={config.alpha_2}, "
-            f"threshold={config.reward_threshold}, γ_hicra={config.hicra_gamma}"
-        )
+    print(
+        f"GTPO (Eq. 3,5,6): α₁={config.alpha_1}, α₂={config.alpha_2}, "
+        f"threshold={config.reward_threshold}, γ_hicra={config.hicra_gamma}"
+    )
 
-    # When wandb is configured, enable policy metrics (clip fraction, KL, etc.)
-    # via metrics_fn injection through **trainer_kwargs.
+    # Enable per-step policy metrics only when wandb will actually be active.
+    # Otherwise this triggers an extra model forward pass every step with no
+    # consumer (wasted compute when --wandb-project is set but wandb missing).
     trainer_kwargs: Dict[str, Any] = {}
-    if config.wandb_project:
+    if config.wandb_project and HAS_WANDB:
         trainer_kwargs["metrics_fn"] = grpo.compute_metrics
         trainer_kwargs["metrics_interval"] = 1
 
@@ -477,10 +488,11 @@ def run_experiment(config: ReasoningConfig) -> None:
             "lora_scale": config.lora_scale,
             "lora_dropout": config.lora_dropout,
         },
-        advantage_transform_fn=advantage_transform_fn,
         strategic_grams=strategic_grams,
-        hicra_alpha=config.hicra_alpha,
-        entropy_weight=config.entropy_weight,
+        alpha_1=config.alpha_1,
+        alpha_2=config.alpha_2,
+        reward_threshold=config.reward_threshold,
+        hicra_gamma=config.hicra_gamma,
         compile_training=config.compile_training,
         gradient_checkpointing=config.gradient_checkpointing,
         micro_batch_size=config.micro_batch_size,
@@ -492,8 +504,7 @@ def run_experiment(config: ReasoningConfig) -> None:
     model = trainer.model
 
     print(
-        "Reasoning stack ready: "
-        f"entropy_weight={config.entropy_weight}, hicra_alpha={config.hicra_alpha}"
+        "Reasoning stack ready"
     )
     print(
         "  Memory savings: "
@@ -644,8 +655,6 @@ if __name__ == "__main__":
     parser.add_argument("--lora-rank", type=int, default=2, help="LoRA rank")
     parser.add_argument("--lora-layers", type=int, default=4, help="LoRA layers")
     parser.add_argument("--lora-scale", type=float, default=8.0, help="LoRA scale")
-    parser.add_argument("--entropy-weight", type=float, default=0.1, help="GTPO entropy weight")
-    parser.add_argument("--hicra-alpha", type=float, default=0.2, help="HICRA amplification alpha")
     parser.add_argument(
         "--compile-training",
         choices=["false", "true", "auto"],
@@ -683,15 +692,10 @@ if __name__ == "__main__":
         action="store_true",
         help="Enable trainer per-phase timing and Amdahl bottleneck summary",
     )
-    parser.add_argument(
-        "--faithful",
-        action="store_true",
-        help="Use paper-faithful GTPO (Eq. 3,5,6 from arXiv 2508.04349) with HICRA fusion",
-    )
-    parser.add_argument("--alpha-1", type=float, default=1.0, help="Faithful GTPO: base reward weight")
-    parser.add_argument("--alpha-2", type=float, default=0.1, help="Faithful GTPO: entropy-shaped weight")
-    parser.add_argument("--reward-threshold", type=float, default=0.5, help="Faithful GTPO: O+/O- partition threshold")
-    parser.add_argument("--hicra-gamma", type=float, default=0.3, help="Faithful GTPO: HICRA entropy boost factor")
+    parser.add_argument("--alpha-1", type=float, default=1.0, help="GTPO: base reward weight (Eq. 3)")
+    parser.add_argument("--alpha-2", type=float, default=0.1, help="GTPO: entropy-shaped weight (Eq. 3)")
+    parser.add_argument("--reward-threshold", type=float, default=0.5, help="GTPO: O+/O- partition threshold")
+    parser.add_argument("--hicra-gamma", type=float, default=0.3, help="HICRA entropy boost factor for GTPO fusion")
     parser.add_argument("--wandb-project", default=None, help="Wandb project name (enables wandb logging)")
     parser.add_argument("--wandb-run-name", default=None, help="Wandb run name (optional)")
     args = parser.parse_args()
@@ -718,14 +722,11 @@ if __name__ == "__main__":
         lora_rank=args.lora_rank,
         lora_layers=args.lora_layers,
         lora_scale=args.lora_scale,
-        entropy_weight=args.entropy_weight,
-        hicra_alpha=args.hicra_alpha,
         strategic_grams_path=args.strategic_grams,
         compile_training=compile_mode,
         gradient_checkpointing=args.gradient_checkpointing,
         micro_batch_size=args.micro_batch_size,
         profile_training=args.profile_training,
-        faithful=args.faithful,
         alpha_1=args.alpha_1,
         alpha_2=args.alpha_2,
         reward_threshold=args.reward_threshold,
