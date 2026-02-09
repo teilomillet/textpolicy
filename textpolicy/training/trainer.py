@@ -885,6 +885,20 @@ class Trainer:
         prepare_fn = getattr(self.advantage_transform_fn, "prepare_batch", None)
         if callable(prepare_fn):
             prepare_fn(batch_data)
+
+    def _postprocess_advantage_transform_batch(
+        self, batch_data: Dict[str, Any]
+    ) -> None:
+        """Allow transforms to update state after loss/grad execution.
+
+        This hook runs outside ``mx.compile`` after ``loss_and_grad_fn`` so
+        transforms can safely perform eager scalar extraction/state updates.
+        """
+        if self.advantage_transform_fn is None:
+            return
+        postprocess_fn = getattr(self.advantage_transform_fn, "postprocess_batch", None)
+        if callable(postprocess_fn):
+            postprocess_fn(batch_data)
     
     def train(self, rollout_data: Optional[Union[Buffer, Dict[str, Any]]] = None) -> Dict[str, float]:
         """
@@ -950,6 +964,10 @@ class Trainer:
             timer.start("loss_and_grad")
 
         loss, grads = self.loss_and_grad_fn(batch_data)
+
+        # Let transforms update any schedule/state that depends on values
+        # produced during loss computation (e.g. token_entropies).
+        self._postprocess_advantage_transform_batch(batch_data)
 
         if timer is not None:
             # Eval both loss AND grads so the backward pass cost is attributed

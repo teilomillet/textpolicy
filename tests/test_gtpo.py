@@ -1501,7 +1501,7 @@ class TestHICRAFusionTrainerIntegration:
 @pytest.mark.unit
 @pytest.mark.algorithm
 class TestSEPATransform:
-    """H11a-h: Tests for SEPA (Selective Entropy Pooling with Annealing)."""
+    """H11: Tests for SEPA (Selective Entropy Pooling with Annealing)."""
 
     def test_h11a_sepa_at_lambda_zero_is_pure_gtpo(self):
         """H11a: At step=0 (λ=0), SEPA produces identical results to no HICRA."""
@@ -1907,6 +1907,135 @@ class TestSEPATransform:
             )
             assert len(w) == 1
             assert "ignored" in str(w[0].message).lower()
+
+    def test_h11l_invalid_sepa_schedule_rejected(self):
+        """H11l: Invalid sepa_schedule values are rejected by builder."""
+        from textpolicy.training import build_gtpo_transform
+
+        tokenizer = _MockTokenizer({1: "let", 2: "me", 3: "think"})
+        with pytest.raises(ValueError, match="sepa_schedule"):
+            build_gtpo_transform(
+                tokenizer=tokenizer,
+                sepa_schedule="not-a-schedule",
+            )
+
+    def test_h11m_auto_sepa_without_tokenizer_raises(self):
+        """H11m: auto SEPA requires tokenizer."""
+        from textpolicy.training import build_gtpo_transform
+
+        with pytest.raises(ValueError, match="tokenizer"):
+            build_gtpo_transform(sepa_schedule="auto")
+
+    def test_h11n_auto_sepa_with_gamma_warns(self):
+        """H11n: auto SEPA with hicra_gamma warns that gamma is ignored."""
+        import warnings as _warnings
+        from textpolicy.training import build_gtpo_transform
+
+        tokenizer = _MockTokenizer({1: "let", 2: "me", 3: "think"})
+        with _warnings.catch_warnings(record=True) as w:
+            _warnings.simplefilter("always")
+            build_gtpo_transform(
+                tokenizer=tokenizer,
+                sepa_schedule="auto",
+                hicra_gamma=0.3,
+            )
+            assert len(w) == 1
+            assert "ignored" in str(w[0].message).lower()
+
+    def test_h11o_auto_schedule_updates_lambda_after_postprocess(self):
+        """H11o: auto schedule raises λ after execution entropy variance drops."""
+        from textpolicy.training.reasoning_stack import _GTPOTransform
+
+        tokenizer = _MockTokenizer({1: "let", 2: "me", 3: "think", 4: "x"})
+        transform = _GTPOTransform(
+            alpha_1=1.0, alpha_2=0.1,
+            tokenizer=tokenizer,
+            strategic_grams=["let me think"],
+            sepa_schedule="auto",
+            sepa_ema_decay=0.0,      # no smoothing for deterministic test behavior
+            sepa_var_threshold=0.5,  # start ramping once variance halves
+            sepa_warmup=1,
+        )
+
+        rewards = mx.array([1.0, 1.0, 0.0, 0.0])
+        episode_lengths = [3, 3, 3, 3]
+        act = mx.array([[1, 2, 3], [4, 4, 4], [4, 4, 4], [4, 4, 4]])
+        advantages = mx.zeros((12,))
+
+        # Batch 1: high execution-entropy variance initializes var_0.
+        batch_high = {
+            "rewards": rewards,
+            "token_entropies": mx.array([
+                2.0, 3.0, 1.0,  # planning
+                0.5, 4.5, 0.5,  # execution
+                4.5, 0.5, 4.5,  # execution
+                0.5, 4.5, 0.5,  # execution
+            ]),
+            "episode_lengths": episode_lengths,
+            "act": act,
+            "step": 0,
+        }
+        transform.prepare_batch(batch_high)
+        assert batch_high["sepa_lambda"] == 0.0
+        r0 = transform(advantages, batch_high)
+        mx.eval(r0)
+        transform.postprocess_batch(batch_high)
+
+        # Batch 2: low variance updates EMA toward smaller variance.
+        batch_low = {
+            "rewards": rewards,
+            "token_entropies": mx.array([
+                2.0, 3.0, 1.0,  # planning
+                2.0, 2.0, 2.0,  # execution
+                2.0, 2.0, 2.0,  # execution
+                2.0, 2.0, 2.0,  # execution
+            ]),
+            "episode_lengths": episode_lengths,
+            "act": act,
+            "step": 1,
+        }
+        transform.prepare_batch(batch_low)
+        # λ uses previous state; should still be at boundary before this update.
+        assert 0.0 <= batch_low["sepa_lambda"] <= 1.0
+        r1 = transform(advantages, batch_low)
+        mx.eval(r1)
+        transform.postprocess_batch(batch_low)
+
+        # Batch 3: prepare should now observe the reduced variance and raise λ.
+        batch_low_next = dict(batch_low)
+        batch_low_next["step"] = 2
+        transform.prepare_batch(batch_low_next)
+        assert batch_low_next["sepa_lambda"] > 0.0
+        assert batch_low_next["sepa_lambda"] <= 1.0
+
+    def test_h11p_auto_schedule_uses_linear_cap(self):
+        """H11p: auto schedule obeys fallback linear cap via sepa_steps."""
+        from textpolicy.training.reasoning_stack import _GTPOTransform
+
+        tokenizer = _MockTokenizer({1: "let", 2: "me", 3: "think", 4: "x"})
+        transform = _GTPOTransform(
+            alpha_1=1.0, alpha_2=0.1,
+            tokenizer=tokenizer,
+            strategic_grams=["let me think"],
+            sepa_schedule="auto",
+            sepa_steps=3,  # cap: λ must be 1.0 at step >= 3
+            sepa_warmup=50,
+        )
+
+        batch = {
+            "rewards": mx.array([1.0, 0.0]),
+            "token_entropies": mx.array([2.0, 3.0, 1.0, 4.0, 1.0, 2.0]),
+            "episode_lengths": [3, 3],
+            "act": mx.array([[1, 2, 3], [4, 4, 4]]),
+            "step": 3,
+        }
+        transform.prepare_batch(batch)
+        assert batch["sepa_lambda"] == 1.0
+
+        result = transform(mx.zeros((6,)), batch)
+        mx.eval(result)
+        assert result.shape == (6,)
+        assert not mx.any(mx.isnan(result)).item()
 
 
 if __name__ == "__main__":

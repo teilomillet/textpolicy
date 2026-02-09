@@ -289,6 +289,11 @@ class TestReasoningStackPublicAPI:
         from textpolicy.training import build_gtpo_transform
         assert callable(build_gtpo_transform)
 
+    def test_sepa_controller_importable(self):
+        """SEPAController should be importable as a standalone component."""
+        from textpolicy.training import SEPAController
+        assert callable(SEPAController)
+
     def test_build_gtpo_transform_signature(self):
         """build_gtpo_transform must accept the expected GTPO + HICRA params."""
         import inspect
@@ -296,7 +301,8 @@ class TestReasoningStackPublicAPI:
 
         sig = inspect.signature(build_gtpo_transform)
         for param_name in ("alpha_1", "alpha_2", "reward_threshold",
-                           "tokenizer", "hicra_gamma", "strategic_grams"):
+                           "tokenizer", "hicra_gamma", "strategic_grams",
+                           "sepa_steps", "sepa_schedule"):
             assert param_name in sig.parameters, (
                 f"build_gtpo_transform must accept '{param_name}'."
             )
@@ -443,4 +449,3 @@ class TestCreateTinyloraDeprecatedWrapper:
         """Ensure the test uses the same defaults as the module."""
         assert _LEGACY_HICRA_ALPHA_DEFAULT == 0.2
         assert _LEGACY_ENTROPY_WEIGHT_DEFAULT == 0.1
-

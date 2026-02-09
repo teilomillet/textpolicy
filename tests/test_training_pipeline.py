@@ -942,6 +942,62 @@ class TestCompiledTraining:
         assert trainer._compiled is True
         assert "planning_mask" in batch
 
+    def test_trainer_calls_postprocess_batch_hook(self):
+        """Trainer should call transform.postprocess_batch after loss/grad."""
+        from textpolicy.training import Trainer
+        from textpolicy.algorithms import grpo
+
+        class TinyLM(nn.Module):
+            def __init__(self, vocab_size=32, hidden=16):
+                super().__init__()
+                self.embed = nn.Embedding(vocab_size, hidden)
+                self.proj = nn.Linear(hidden, vocab_size)
+
+            def __call__(self, x):
+                return self.proj(self.embed(x))
+
+        class HookTransform:
+            def __init__(self):
+                self.prepare_calls = 0
+                self.postprocess_calls = 0
+
+            def prepare_batch(self, batch):
+                self.prepare_calls += 1
+                batch["prepare_seen"] = True
+
+            def __call__(self, advantages, batch):
+                return advantages
+
+            def postprocess_batch(self, batch):
+                self.postprocess_calls += 1
+                batch["postprocess_seen"] = True
+
+        model = TinyLM()
+        mx.eval(model.parameters())
+        transform = HookTransform()
+        trainer = Trainer(
+            model=model,
+            loss_fn=grpo.policy_loss,
+            optimizer=optim.Adam(learning_rate=1e-3),
+            advantage_fn=grpo.compute_advantages,
+            compile_training=True,
+            advantage_transform_fn=transform,
+        )
+
+        batch = {
+            "obs": mx.array([9, 8, 7, 6, 5], dtype=mx.int64),
+            "act": mx.array([1, 2, 3, 4, 5], dtype=mx.int64),
+            "logprob": -mx.ones(5, dtype=mx.float32),
+            "rewards": mx.array([0.5, -0.2, 1.0, 0.1, -0.3], dtype=mx.float32),
+        }
+
+        metrics = trainer.train(batch)
+        assert "loss" in metrics
+        assert transform.prepare_calls == 1
+        assert transform.postprocess_calls == 1
+        assert batch["prepare_seen"] is True
+        assert batch["postprocess_seen"] is True
+
 
 @pytest.mark.unit
 class TestAutoCompileDetection:

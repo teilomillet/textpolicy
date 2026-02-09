@@ -29,12 +29,15 @@ from .gradient_checkpointing import (
     is_gradient_checkpointing_active,
     remove_gradient_checkpointing,
 )
+from .sepa import SEPAController, normalize_sepa_schedule
 
 __all__.extend(
     [
         "apply_gradient_checkpointing",
         "remove_gradient_checkpointing",
         "is_gradient_checkpointing_active",
+        "SEPAController",
+        "normalize_sepa_schedule",
     ]
 )
 

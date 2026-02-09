@@ -32,6 +32,7 @@ from textpolicy.algorithms.hicra import (
     identify_planning_tokens,
 )
 from textpolicy.generation.lora import create_lora_setup
+from textpolicy.training.sepa import SEPAController, normalize_sepa_schedule
 from textpolicy.training.trainer import Trainer
 
 
@@ -238,14 +239,13 @@ class _GTPOTransform:
     completely replacing the standard GRPO advantages.  All operations are
     compile-safe (no ``mx.eval`` or ``.item()``).
 
-    Optionally fuses HICRA planning-token amplification.  Two modes:
+    Optionally fuses HICRA planning-token amplification.  Three modes:
 
     **Boost** (``hicra_gamma > 0``, ``sepa_steps == 0``):
         Adds ``gamma * mean(H)`` to planning token entropy before GTPO
         processes it (via ``boost_entropy_with_planning``).
 
-    **SEPA** — Selective Entropy Pooling with Annealing
-    (``hicra_gamma > 0``, ``sepa_steps > 0``):
+    **SEPA (linear)** (``sepa_steps > 0``, ``sepa_schedule='linear'``):
         Pools execution token entropy toward the class mean, removing
         per-token variance without removing tokens from the credit budget.
         Planning tokens pass through untouched.  λ ∈ [0, 1] anneals
@@ -256,6 +256,19 @@ class _GTPOTransform:
         At λ=0 (step 0): pure GTPO, no HICRA influence.
         At λ=1 (step ≥ sepa_steps): execution tokens are uniform,
         entropy gradient operates only among planning tokens.
+
+    **SEPA (auto)** (``sepa_schedule='auto'``):
+        Uses an EMA of execution-token entropy variance as a self-supervised
+        schedule. During warmup, λ stays at 0. After warmup captures a
+        baseline variance, λ rises as variance drops:
+
+            λ_auto = 1 - clamp((var_ema / var_0) / threshold, 0, 1)
+
+        Optional ``sepa_steps > 0`` acts as a one-sided fallback cap:
+
+            λ = max(λ_auto, min(step / sepa_steps, 1))
+
+        This preserves adaptivity while guaranteeing convergence.
 
     The PPO clipped objective (Eq. 7) is handled by the Trainer's ``loss_fn``
     (e.g. ``grpo.policy_loss``).
@@ -272,6 +285,10 @@ class _GTPOTransform:
         strategic_grams: Optional[List[str]] = None,
         hicra_gamma: float = 0.0,
         sepa_steps: int = 0,
+        sepa_schedule: str = "linear",
+        sepa_ema_decay: float = 0.99,
+        sepa_var_threshold: float = 0.2,
+        sepa_warmup: int = 50,
     ) -> None:
         self.alpha_1 = alpha_1
         self.alpha_2 = alpha_2
@@ -284,9 +301,18 @@ class _GTPOTransform:
             else (list(_DEFAULT_STRATEGIC_GRAMS) if tokenizer is not None else None)
         )
         self.hicra_gamma = hicra_gamma
-        self.sepa_steps = sepa_steps
-        # HICRA is active when either mode is enabled.
-        self._hicra_enabled = (hicra_gamma > 0.0 or sepa_steps > 0)
+        self._sepa = SEPAController(
+            sepa_steps=sepa_steps,
+            sepa_schedule=sepa_schedule,
+            sepa_ema_decay=sepa_ema_decay,
+            sepa_var_threshold=sepa_var_threshold,
+            sepa_warmup=sepa_warmup,
+            eps=eps,
+        )
+        self._sepa_enabled = self._sepa.enabled
+
+        # HICRA is active when boost or SEPA is enabled.
+        self._hicra_enabled = (hicra_gamma > 0.0 or self._sepa_enabled)
 
     def _flatten_actions(self, batch_data: Dict[str, Any]) -> mx.array:
         episode_lengths = batch_data.get("episode_lengths")
@@ -309,12 +335,43 @@ class _GTPOTransform:
         """
         if not self._hicra_enabled or self.tokenizer is None or not self.grams:
             return
-        if batch_data.get("planning_mask") is not None:
+        if batch_data.get("planning_mask") is None:
+            token_ids = self._flatten_actions(batch_data)
+            planning_mask = identify_planning_tokens(
+                token_ids, self.tokenizer, self.grams
+            )
+            batch_data["planning_mask"] = planning_mask
+
+        if self._sepa_enabled:
+            self._sepa.prepare_batch(batch_data)
+
+    def postprocess_batch(self, batch_data: Dict[str, Any]) -> None:
+        """Update auto-SEPA state outside ``mx.compile``.
+
+        Trainer calls this hook after ``loss_and_grad_fn`` so token entropies
+        are available and scalar extraction (``.item()``) is safe.
+        """
+        if not self._sepa.requires_postprocess:
             return
-        token_ids = self._flatten_actions(batch_data)
-        batch_data["planning_mask"] = identify_planning_tokens(
-            token_ids, self.tokenizer, self.grams
+
+        token_entropies = batch_data.get("token_entropies")
+        planning_mask = batch_data.get("planning_mask")
+        episode_lengths = batch_data.get("episode_lengths")
+        if token_entropies is None or planning_mask is None or episode_lengths is None:
+            return
+
+        flat_entropies = _flatten_padded_token_rows(
+            token_entropies,
+            episode_lengths,
+            field_name="token_entropies",
         )
+        flat_mask = _flatten_padded_token_rows(
+            planning_mask,
+            episode_lengths,
+            field_name="planning_mask",
+        ).astype(mx.float32)
+
+        self._sepa.update_auto_state(flat_entropies, flat_mask)
 
     def __call__(self, advantages: mx.array, batch_data: Dict[str, Any]) -> mx.array:
         episode_lengths = batch_data.get("episode_lengths")
@@ -372,23 +429,22 @@ class _GTPOTransform:
                     field_name="planning_mask",
                 )
 
-            if self.sepa_steps > 0:
+            if self._sepa_enabled:
                 # SEPA: Selective Entropy Pooling with Annealing.
                 # Pool execution token entropy toward class mean; planning
-                # tokens pass through.  λ anneals 0→1 over sepa_steps.
-                step = batch_data.get("step", 0)
-                lambda_t = min(step / self.sepa_steps, 1.0)
-
-                mask = mx.stop_gradient(planning_mask)
-                exec_mask = 1.0 - mask
-                exec_count = mx.maximum(mx.sum(exec_mask), mx.array(1.0))
-                mean_H_exec = mx.sum(flat_entropies * exec_mask) / exec_count
-
-                flat_entropies = mx.where(
-                    mask.astype(mx.bool_),
+                # tokens pass through.  λ comes from prepare_batch() so the
+                # scheduling logic can remain compile-safe.
+                lambda_t = batch_data.get("sepa_lambda")
+                if lambda_t is None:
+                    # Fallback for direct transform() usage without Trainer.
+                    lambda_t = self._sepa.resolve_lambda(
+                        step=float(batch_data.get("step", 0))
+                    )
+                    batch_data["sepa_lambda"] = lambda_t
+                flat_entropies = self._sepa.apply(
                     flat_entropies,
-                    lambda_t * mean_H_exec
-                    + (1.0 - lambda_t) * flat_entropies,
+                    planning_mask,
+                    lambda_t=lambda_t,
                 )
             else:
                 # Boost mode (legacy): additive entropy boost at planning positions.
@@ -423,6 +479,7 @@ def build_gtpo_transform(
     strategic_grams: Optional[List[str]] = None,
     hicra_gamma: float = 0.0,
     sepa_steps: int = 0,
+    sepa_schedule: str = "linear",
 ) -> Callable[[mx.array, Dict[str, Any]], mx.array]:
     """
     Build a Trainer-compatible transform for GTPO (arXiv 2508.04349).
@@ -434,26 +491,32 @@ def build_gtpo_transform(
     PPO clipping (Eq. 7) is handled by the Trainer's ``loss_fn`` — use
     ``functools.partial(grpo.policy_loss, clip_ratio=0.2)`` or similar.
 
-    **HICRA Fusion (optional):**  When ``hicra_gamma > 0`` and a tokenizer
+    **HICRA Fusion (optional):**  When enabled and a tokenizer
     is provided, the transform modifies per-token entropies *before* GTPO
     processes them.  Two modes are available:
 
     - **Boost** (default, ``sepa_steps == 0``): adds ``gamma * mean(H)``
       to planning token entropy.
-    - **SEPA** — Selective Entropy Pooling with Annealing (``sepa_steps > 0``):
+    - **SEPA** — Selective Entropy Pooling with Annealing:
       pools execution token entropy toward the class mean, removing per-token
       variance without removing tokens from the credit budget.  Planning tokens
-      pass through untouched.  λ anneals linearly from 0 to 1 over
-      ``sepa_steps``.  At λ=1, execution tokens have uniform entropy (no
-      individual differentiation), while planning tokens retain their real
-      entropy for GTPO's Eq. 3/5 weighting.
+      pass through untouched.
+      - ``sepa_schedule='linear'``: λ anneals linearly from 0 to 1 over
+        ``sepa_steps``.
+      - ``sepa_schedule='auto'``: λ follows an EMA of execution-entropy
+        variance with warmup; optional ``sepa_steps`` acts as a fallback cap
+        via ``max(lambda_auto, lambda_linear)``.
+      At λ=1, execution tokens have uniform entropy (no individual
+      differentiation), while planning tokens retain their real entropy for
+      GTPO's Eq. 3/5 weighting.
 
     Expected batch_data keys (auto-populated by the Trainer):
     - ``'rewards'``: episode-level rewards [num_episodes]
     - ``'token_entropies'``: per-token entropy [total_tokens] (auto-computed)
     - ``'episode_lengths'``: token count per episode
-    - ``'act'``: token IDs (required when ``hicra_gamma > 0``)
+    - ``'act'``: token IDs (required when boost/SEPA is active)
     - ``'step'``: training step count (auto-injected by Trainer, used for SEPA)
+    - ``'sepa_lambda'``: optional precomputed λ (injected by Trainer hook)
 
     Example::
 
@@ -473,7 +536,7 @@ def build_gtpo_transform(
             ),
         )
 
-        # SEPA mode (anneals over 500 steps, hicra_gamma not needed)
+        # SEPA mode (linear anneal over 500 steps, hicra_gamma not needed)
         trainer = Trainer(
             model=model,
             advantage_fn=grpo.compute_advantages,
@@ -486,6 +549,20 @@ def build_gtpo_transform(
             ),
         )
 
+        # SEPA auto mode (self-supervised variance schedule + optional cap)
+        trainer = Trainer(
+            model=model,
+            advantage_fn=grpo.compute_advantages,
+            loss_fn=partial(grpo.policy_loss, clip_ratio=0.2),
+            optimizer=optimizer,
+            advantage_transform_fn=build_gtpo_transform(
+                alpha_1=1.0, alpha_2=0.1,
+                tokenizer=tokenizer,
+                sepa_schedule="auto",
+                sepa_steps=1000,  # optional fallback cap
+            ),
+        )
+
     Args:
         alpha_1: Base reward weight (default 1.0).
         alpha_2: Entropy-shaped weight (default 0.1).
@@ -495,16 +572,21 @@ def build_gtpo_transform(
         strategic_grams: Planning phrases for HICRA (defaults to built-in list
                         when tokenizer is provided).
         hicra_gamma: Entropy boost factor for boost mode (default 0.0 = disabled).
-                    Ignored when ``sepa_steps > 0`` (SEPA replaces boost).
+                    Ignored when SEPA is active.
         sepa_steps: SEPA annealing horizon — number of training steps over
-                   which λ anneals from 0 to 1 (default 0 = use boost mode).
-                   When > 0, SEPA is used and ``hicra_gamma`` is ignored.
+                   which λ linearly anneals from 0 to 1 in linear mode.
+                   In auto mode, acts as optional fallback cap (default 0 = no cap).
+        sepa_schedule: ``'linear'`` (default) or ``'auto'``.
+                      ``'linear'`` uses ``sepa_steps`` only.
+                      ``'auto'`` uses variance-driven λ, optionally capped by
+                      linear ``sepa_steps``.
 
     Returns:
         A callable ``(advantages, batch_data) -> advantages``.
 
     Raises:
         ValueError: If ``hicra_gamma < 0``, ``sepa_steps < 0``,
+                   ``sepa_schedule`` is invalid,
                    or HICRA is active without tokenizer.
     """
     if alpha_1 < 0.0:
@@ -517,17 +599,21 @@ def build_gtpo_transform(
         raise ValueError(
             f"sepa_steps must be >= 0, got {sepa_steps}."
         )
-    if sepa_steps > 0 and tokenizer is None:
+    sepa_schedule = normalize_sepa_schedule(sepa_schedule)
+
+    sepa_enabled = (sepa_steps > 0 or sepa_schedule == "auto")
+    if sepa_enabled and tokenizer is None:
         raise ValueError(
-            "sepa_steps > 0 requires a tokenizer for planning token identification."
+            "SEPA requires a tokenizer for planning token identification."
         )
     if hicra_gamma > 0.0 and tokenizer is None:
         raise ValueError(
             "hicra_gamma > 0 requires a tokenizer for planning token identification."
         )
-    if sepa_steps > 0 and hicra_gamma > 0.0:
+    if sepa_enabled and hicra_gamma > 0.0:
         warnings.warn(
-            f"sepa_steps={sepa_steps} activates SEPA mode; "
+            f"SEPA mode (sepa_schedule={sepa_schedule!r}, sepa_steps={sepa_steps}) "
+            f"is active; "
             f"hicra_gamma={hicra_gamma} is ignored (boost is not used "
             f"when SEPA is active).",
             stacklevel=2,
@@ -542,6 +628,7 @@ def build_gtpo_transform(
         strategic_grams=strategic_grams,
         hicra_gamma=hicra_gamma,
         sepa_steps=sepa_steps,
+        sepa_schedule=sepa_schedule,
     )
 
 
@@ -650,5 +737,3 @@ def create_tinylora_reasoning_setup(
         **trainer_kwargs,
     )
     return trainer, memory_stats
-
-
