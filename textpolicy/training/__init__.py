@@ -29,12 +29,23 @@ from .gradient_checkpointing import (
     is_gradient_checkpointing_active,
     remove_gradient_checkpointing,
 )
+from .sepa import SEPAController, normalize_sepa_schedule
+from .semantic_entropy import (
+    SemanticEntropyTracker,
+    build_prompt_group_keys,
+    pool_planning_hidden_states,
+)
 
 __all__.extend(
     [
         "apply_gradient_checkpointing",
         "remove_gradient_checkpointing",
         "is_gradient_checkpointing_active",
+        "SEPAController",
+        "normalize_sepa_schedule",
+        "SemanticEntropyTracker",
+        "build_prompt_group_keys",
+        "pool_planning_hidden_states",
     ]
 )
 

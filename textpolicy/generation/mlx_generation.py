@@ -404,6 +404,7 @@ def compute_logprobs(
     *,
     _compiled: bool = False,
     return_token_entropies: bool = False,
+    return_hidden_states: bool = False,
 ) -> Any:
     """
     Extract log-probabilities of response_tokens under model via teacher-forcing.
@@ -424,13 +425,30 @@ def compute_logprobs(
     """
     if len(response_tokens) == 0:
         empty = mx.array([])
+        if return_hidden_states and return_token_entropies:
+            return empty, empty, None
+        if return_hidden_states:
+            return empty, None
         if return_token_entropies:
             return empty, empty
         return empty
 
     full_sequence = mx.concatenate([prompt_tokens, response_tokens])
     model_input = full_sequence[None] if full_sequence.ndim == 1 else full_sequence
-    logits = model(model_input)
+
+    # Decompose model call for hidden-state capture when possible.
+    h_full = None
+    can_decompose = (
+        return_hidden_states
+        and hasattr(model, "model")
+        and hasattr(model, "lm_head")
+    )
+    if can_decompose:
+        h_full = model.model(model_input)  # [1, seq_len, hidden_dim]
+        logits = model.lm_head(h_full)     # [1, seq_len, vocab]
+    else:
+        logits = model(model_input)
+
     prompt_len, response_len = len(prompt_tokens), len(response_tokens)
     prediction_logits = logits[0, prompt_len-1:prompt_len-1+response_len, :]
     if prediction_logits.shape[0] != response_len:
@@ -441,6 +459,14 @@ def compute_logprobs(
     log_probs = prediction_logits - mx.logsumexp(prediction_logits, axis=-1, keepdims=True)
     selected = log_probs[mx.arange(response_len), response_tokens]
     token_entropies = -mx.sum(mx.exp(log_probs) * log_probs, axis=-1)
+
+    # Extract response-aligned hidden states: [response_len, hidden_dim]
+    # Note: h[prompt_len:prompt_len+response_len] (NOT prompt_len-1), because
+    # hidden states represent the token at that position, while logits at
+    # position (p-1) predict token p.
+    flat_hidden = None
+    if h_full is not None:
+        flat_hidden = h_full[0, prompt_len : prompt_len + response_len, :]
 
     if _compiled:
         # Inside mx.compile: Python ``if`` on ``mx.any(...)`` is illegal
@@ -469,6 +495,10 @@ def compute_logprobs(
         if mx.any(mx.isnan(token_entropies)) or mx.any(mx.isinf(token_entropies)):
             raise ValueError("Invalid token entropies (nan/inf)")
 
+    if return_hidden_states and return_token_entropies:
+        return selected, token_entropies, flat_hidden
+    if return_hidden_states:
+        return selected, flat_hidden
     if return_token_entropies:
         return selected, token_entropies
     return selected
@@ -606,6 +636,7 @@ def compute_logprobs_batched(
     prompt_lengths: list,
     response_lengths: list,
     return_token_entropies: bool = False,
+    return_hidden_states: bool = False,
 ) -> Any:
     """
     Batched log-probability extraction: single forward pass for N episodes.
@@ -625,12 +656,20 @@ def compute_logprobs_batched(
         Flat 1D unpadded logprobs — ``shape[0] == sum(response_lengths)``.
         When ``return_token_entropies=True``, returns a tuple
         ``(logprobs, token_entropies)`` with matching flat 1D shapes.
+        When ``return_hidden_states=True``, an additional flat 2D
+        ``[sum(response_lengths), hidden_dim]`` tensor of response-aligned
+        hidden states is appended to the return tuple.  The hidden states
+        are extracted by decomposing ``model.model(x)`` + ``model.lm_head(h)``
+        when the model supports it; otherwise ``return_hidden_states`` is
+        silently ignored and the extra element is ``None``.
 
     Safety notes:
         - Right-padding is safe for causal models (padded tokens are right of
           real tokens and cannot influence them via causal attention).
         - The Python loop over episodes is cheap indexing, not model calls.
-        - No ``.item()`` or ``mx.eval()`` calls — safe inside ``mx.compile``.
+        - No ``.item()`` or ``mx.eval()`` calls — safe inside ``mx.compile``
+          (except when ``return_hidden_states=True`` forces decomposed calls
+          outside compilation).
     """
     if full_sequences.ndim != 2:
         raise ValueError(
@@ -647,6 +686,10 @@ def compute_logprobs_batched(
 
     if n_episodes == 0:
         empty = mx.array([], dtype=mx.float32)
+        if return_hidden_states and return_token_entropies:
+            return empty, empty, None
+        if return_hidden_states:
+            return empty, None
         if return_token_entropies:
             return empty, empty
         return empty
@@ -678,11 +721,25 @@ def compute_logprobs_batched(
         )
 
     # Single batched forward pass: [N, max_seq_len] → [N, max_seq_len, vocab]
-    logits = model(full_sequences)
+    # When hidden states are requested, decompose model(x) into
+    # model.model(x) → h and model.lm_head(h) → logits so we can
+    # capture h without extra inference.
+    h_full = None
+    can_decompose = (
+        return_hidden_states
+        and hasattr(model, "model")
+        and hasattr(model, "lm_head")
+    )
+    if can_decompose:
+        h_full = model.model(full_sequences)       # [N, max_seq_len, hidden_dim]
+        logits = model.lm_head(h_full)              # [N, max_seq_len, vocab]
+    else:
+        logits = model(full_sequences)
 
     # Extract per-episode logprobs (cheap indexing, not model calls)
     per_episode = []
     per_episode_entropies = []
+    per_episode_hidden = []
     for i in range(n_episodes):
         p_len = prompt_lengths[i]
         r_len = response_lengths[i]
@@ -714,8 +771,18 @@ def compute_logprobs_batched(
         per_episode.append(selected)
         per_episode_entropies.append(entropies)
 
+        # Hidden states: aligned to response token positions, NOT the
+        # prediction offset. h[i, p_len:p_len+r_len] gives the hidden
+        # state at each response token position (not p_len-1).
+        if h_full is not None:
+            per_episode_hidden.append(h_full[i, p_len : p_len + r_len, :])
+
     if not per_episode:
         empty = mx.array([], dtype=mx.float32)
+        if return_hidden_states and return_token_entropies:
+            return empty, empty, None
+        if return_hidden_states:
+            return empty, None
         if return_token_entropies:
             return empty, empty
         return empty
@@ -739,6 +806,15 @@ def compute_logprobs_batched(
         entropy_result,
     )
 
+    # Build flat response-aligned hidden states: [sum(response_lengths), hidden_dim]
+    flat_hidden = None
+    if per_episode_hidden:
+        flat_hidden = mx.concatenate(per_episode_hidden)
+
+    if return_hidden_states and return_token_entropies:
+        return result, entropy_result, flat_hidden
+    if return_hidden_states:
+        return result, flat_hidden
     if return_token_entropies:
         return result, entropy_result
     return result

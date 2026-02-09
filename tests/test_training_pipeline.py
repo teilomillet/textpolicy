@@ -942,6 +942,64 @@ class TestCompiledTraining:
         assert trainer._compiled is True
         assert "planning_mask" in batch
 
+    def test_trainer_calls_postprocess_batch_hook(self):
+        """Trainer should call transform.postprocess_batch after loss/grad."""
+        from textpolicy.training import Trainer
+        from textpolicy.algorithms import grpo
+
+        class TinyLM(nn.Module):
+            def __init__(self, vocab_size=32, hidden=16):
+                super().__init__()
+                self.embed = nn.Embedding(vocab_size, hidden)
+                self.proj = nn.Linear(hidden, vocab_size)
+
+            def __call__(self, x):
+                return self.proj(self.embed(x))
+
+        class HookTransform:
+            def __init__(self):
+                self.prepare_calls = 0
+                self.postprocess_calls = 0
+
+            def prepare_batch(self, batch):
+                self.prepare_calls += 1
+                batch["prepare_seen"] = True
+
+            def __call__(self, advantages, batch):
+                return advantages
+
+            def postprocess_batch(self, batch):
+                self.postprocess_calls += 1
+                batch["postprocess_seen"] = True
+                batch["transform_metrics"] = {"hook_metric": 7.5}
+
+        model = TinyLM()
+        mx.eval(model.parameters())
+        transform = HookTransform()
+        trainer = Trainer(
+            model=model,
+            loss_fn=grpo.policy_loss,
+            optimizer=optim.Adam(learning_rate=1e-3),
+            advantage_fn=grpo.compute_advantages,
+            compile_training=True,
+            advantage_transform_fn=transform,
+        )
+
+        batch = {
+            "obs": mx.array([9, 8, 7, 6, 5], dtype=mx.int64),
+            "act": mx.array([1, 2, 3, 4, 5], dtype=mx.int64),
+            "logprob": -mx.ones(5, dtype=mx.float32),
+            "rewards": mx.array([0.5, -0.2, 1.0, 0.1, -0.3], dtype=mx.float32),
+        }
+
+        metrics = trainer.train(batch)
+        assert "loss" in metrics
+        assert transform.prepare_calls == 1
+        assert transform.postprocess_calls == 1
+        assert batch["prepare_seen"] is True
+        assert batch["postprocess_seen"] is True
+        assert metrics["hook_metric"] == pytest.approx(7.5)
+
 
 @pytest.mark.unit
 class TestAutoCompileDetection:
@@ -1719,3 +1777,205 @@ class TestSequencePacking:
         assert result['prompt_lengths'] == [3]
         mx.eval(result['rewards'])
         assert result['rewards'].tolist() == [1.0]
+
+
+@pytest.mark.integration
+class TestHiddenStateCapture:
+    """Test hidden-state capture through the logprob extraction pipeline."""
+
+    def _make_decomposable_model(self, vocab_size=50, hidden=16):
+        """Create a model with .model and .lm_head attributes."""
+        class Backbone(nn.Module):
+            def __init__(self):
+                super().__init__()
+                self.embed = nn.Embedding(vocab_size, hidden)
+                self.linear = nn.Linear(hidden, hidden)
+
+            def __call__(self, x):
+                return self.linear(self.embed(x))
+
+        class DecomposableLM(nn.Module):
+            def __init__(self):
+                super().__init__()
+                self.model = Backbone()
+                self.lm_head = nn.Linear(hidden, vocab_size)
+
+            def __call__(self, x):
+                h = self.model(x)
+                return self.lm_head(h)
+
+        model = DecomposableLM()
+        mx.eval(model.parameters())
+        return model
+
+    def test_compute_logprobs_batched_hidden_state_parity(self):
+        """Logprobs from decomposed path match baseline (no hidden states)."""
+        from textpolicy.generation.mlx_generation import compute_logprobs_batched
+
+        model = self._make_decomposable_model()
+
+        # 2 episodes: prompt 2 tokens + response 3 tokens each
+        full_sequences = mx.array([
+            [1, 2, 3, 4, 5],
+            [6, 7, 8, 9, 10],
+        ], dtype=mx.int32)
+        response_tokens = mx.array([
+            [3, 4, 5],
+            [8, 9, 10],
+        ], dtype=mx.int32)
+        prompt_lengths = [2, 2]
+        response_lengths = [3, 3]
+
+        # Baseline: no hidden states
+        baseline = compute_logprobs_batched(
+            model, full_sequences, response_tokens,
+            prompt_lengths, response_lengths,
+            return_token_entropies=True,
+            return_hidden_states=False,
+        )
+        baseline_lp, baseline_ent = baseline
+
+        # Decomposed: with hidden states
+        decomposed = compute_logprobs_batched(
+            model, full_sequences, response_tokens,
+            prompt_lengths, response_lengths,
+            return_token_entropies=True,
+            return_hidden_states=True,
+        )
+        decomposed_lp, decomposed_ent, hidden_states = decomposed
+
+        mx.eval(baseline_lp, decomposed_lp, baseline_ent, decomposed_ent)
+
+        # Logprobs must match exactly
+        assert baseline_lp.shape == decomposed_lp.shape
+        diff = mx.max(mx.abs(baseline_lp - decomposed_lp)).item()
+        assert diff < 1e-5, f"Logprob parity failed: max diff={diff}"
+
+        # Entropies must match exactly
+        diff_ent = mx.max(mx.abs(baseline_ent - decomposed_ent)).item()
+        assert diff_ent < 1e-5, f"Entropy parity failed: max diff={diff_ent}"
+
+        # Hidden states must be present and correctly shaped
+        assert hidden_states is not None
+        total_tokens = sum(response_lengths)
+        assert hidden_states.shape[0] == total_tokens
+        assert hidden_states.ndim == 2
+
+    def test_compute_logprobs_sequential_hidden_state_parity(self):
+        """Sequential path logprobs from decomposed path match baseline."""
+        from textpolicy.generation.mlx_generation import compute_logprobs
+
+        model = self._make_decomposable_model()
+
+        prompt = mx.array([1, 2], dtype=mx.int32)
+        response = mx.array([3, 4, 5], dtype=mx.int32)
+
+        # Baseline
+        baseline_lp, baseline_ent = compute_logprobs(
+            model, prompt, response,
+            return_token_entropies=True,
+            return_hidden_states=False,
+        )
+
+        # Decomposed
+        decomposed_lp, decomposed_ent, hidden = compute_logprobs(
+            model, prompt, response,
+            return_token_entropies=True,
+            return_hidden_states=True,
+        )
+
+        mx.eval(baseline_lp, decomposed_lp)
+
+        diff = mx.max(mx.abs(baseline_lp - decomposed_lp)).item()
+        assert diff < 1e-5, f"Sequential logprob parity failed: max diff={diff}"
+
+        assert hidden is not None
+        assert hidden.shape == (3, 16)  # response_len=3, hidden=16
+
+    def test_model_without_decomposition_returns_none(self):
+        """Model without .model/.lm_head returns None for hidden states."""
+        from textpolicy.generation.mlx_generation import compute_logprobs_batched
+
+        class SimpleLM(nn.Module):
+            def __init__(self):
+                super().__init__()
+                self.embed = nn.Embedding(50, 16)
+                self.proj = nn.Linear(16, 50)
+
+            def __call__(self, x):
+                return self.proj(self.embed(x))
+
+        model = SimpleLM()
+        mx.eval(model.parameters())
+
+        full_sequences = mx.array([[1, 2, 3, 4]], dtype=mx.int32)
+        response_tokens = mx.array([[3, 4]], dtype=mx.int32)
+
+        result = compute_logprobs_batched(
+            model, full_sequences, response_tokens,
+            [2], [2],
+            return_token_entropies=True,
+            return_hidden_states=True,
+        )
+        lp, ent, hidden = result
+        mx.eval(lp, ent)
+
+        assert lp.shape[0] == 2
+        assert hidden is None  # model has no .model attribute
+
+    def test_trainer_captures_hidden_states_with_transform(self):
+        """Trainer stores hidden states in batch_data when transform needs them."""
+        from textpolicy.algorithms import grpo
+        from textpolicy.training import Trainer
+
+        model = self._make_decomposable_model()
+        optimizer = optim.Adam(learning_rate=1e-4)
+
+        captured = {}
+
+        class MockTransform:
+            needs_hidden_states = True
+
+            def prepare_batch(self, batch_data):
+                pass
+
+            def postprocess_batch(self, batch_data):
+                if "hidden_states" in batch_data:
+                    captured["hidden_states"] = batch_data["hidden_states"]
+
+            def __call__(self, advantages, batch_data):
+                return advantages
+
+        trainer = Trainer(
+            model=model,
+            advantage_fn=grpo.compute_advantages,
+            loss_fn=grpo.policy_loss,
+            optimizer=optimizer,
+            compile_training=False,
+            advantage_transform_fn=MockTransform(),
+        )
+
+        batch = {
+            "obs": mx.array([
+                [1, 2, 3, 4, 5],
+                [6, 7, 8, 9, 10],
+            ], dtype=mx.int32),
+            "act": mx.array([
+                [3, 4, 5],
+                [8, 9, 10],
+            ], dtype=mx.int32),
+            "logprob": mx.array([-1.0, -1.0, -1.0, -1.0, -1.0, -1.0]),
+            "rewards": mx.array([1.0, 0.5]),
+            "episode_lengths": [3, 3],
+            "prompt_lengths": [2, 2],
+        }
+
+        loss = trainer._loss_fn(batch)
+        mx.eval(loss)
+        trainer._postprocess_advantage_transform_batch(batch)
+
+        assert "hidden_states" in batch
+        hs = batch["hidden_states"]
+        assert hs is not None
+        assert hs.shape[0] == 6  # 3 + 3 response tokens
+        assert hs.ndim == 2

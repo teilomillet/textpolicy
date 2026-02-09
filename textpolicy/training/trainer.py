@@ -538,20 +538,24 @@ class Trainer:
         # For proper logprob extraction, we need the full context (prompt + response)
         # The model needs to see the full sequence to generate logits for all response positions
         # This matches how the model was called during rollout generation
-        
+
         # Forward pass through model to get new logprobs
         # Use the default logprob extraction which works directly with the batch structure
         # This avoids complex prompt/response splitting and matches the old_logprobs format
-        
+
         # The key insight: observations contain concatenated prompt+response sequences
         # actions contain the response portions that need logprob evaluation
         # old_logprobs has the exact shape we need to match
-        
+
         # GRPO-specific logprob extraction: observations contain prompt+response,
         # actions contain only response tokens that need logprob evaluation.
         needs_token_entropies = (
             self.advantage_transform_fn is not None
             and batch_data.get("token_entropies") is None
+        )
+        # Dynamic check: does the transform need hidden states this step?
+        needs_hidden_states = getattr(
+            self.advantage_transform_fn, "needs_hidden_states", False
         )
         if 'episode_lengths' in batch_data:
             episode_lengths = batch_data['episode_lengths']
@@ -569,17 +573,24 @@ class Trainer:
                 )
 
             prompt_lengths = batch_data.get('prompt_lengths')
-            if needs_token_entropies:
-                new_logprobs, token_entropies = self._extract_grpo_logprobs(
+            if needs_token_entropies or needs_hidden_states:
+                extraction_result = self._extract_grpo_logprobs(
                     observations,
                     actions,
                     old_logprobs,
                     episode_lengths,
                     prompt_lengths,
                     _compiled=self._compiled,
-                    return_token_entropies=True,
+                    return_token_entropies=needs_token_entropies or True,
+                    return_hidden_states=needs_hidden_states,
                 )
-                batch_data['token_entropies'] = token_entropies
+                if needs_hidden_states:
+                    new_logprobs, token_entropies, hidden_states = extraction_result
+                    batch_data['hidden_states'] = hidden_states
+                else:
+                    new_logprobs, token_entropies = extraction_result
+                if needs_token_entropies:
+                    batch_data['token_entropies'] = token_entropies
             else:
                 new_logprobs = self._extract_grpo_logprobs(
                     observations, actions, old_logprobs, episode_lengths,
@@ -685,6 +696,7 @@ class Trainer:
         *,
         _compiled: bool = False,
         return_token_entropies: bool = False,
+        return_hidden_states: bool = False,
     ) -> Any:
         """
         Compute per-episode logprobs under the current model.
@@ -710,14 +722,22 @@ class Trainer:
             _compiled: When True, use compile-safe validation in Path 2.
                 Callers inside ``mx.compile`` must pass True; callers
                 outside (e.g. metrics) should pass False for eager checks.
+            return_hidden_states: When True, also return flat
+                response-aligned hidden states ``[sum(episode_lengths),
+                hidden_dim]`` as the last element of the return tuple.
+                Requires the model to expose ``.model`` and ``.lm_head``
+                attributes; otherwise the hidden states element is ``None``.
 
         Returns:
             Flat 1D log probabilities matching ``old_logprobs`` shape.
             When ``return_token_entropies=True``, returns a tuple
             ``(new_logprobs, token_entropies)``.
+            When ``return_hidden_states=True``, adds a final element
+            ``hidden_states`` (or ``None``) to the tuple.
         """
         num_episodes = len(episode_lengths)
         expected_tokens = sum(episode_lengths)
+        hidden_states = None  # populated only when return_hidden_states=True
 
         if observations.ndim == 2 and actions.ndim == 2:
             # Path 1: Batched — single model forward pass for all episodes
@@ -744,6 +764,7 @@ class Trainer:
                     # since causal attention is O(n^2) in sequence length.
                     all_logprobs = []
                     all_entropies = []
+                    all_hidden = []
                     for start in range(0, num_episodes, M):
                         end = min(start + M, num_episodes)
                         # Trim to chunk-local max lengths (pure slice, no copy)
@@ -760,8 +781,20 @@ class Trainer:
                             chunk_prompt_lens,
                             chunk_episode_lens,
                             return_token_entropies=return_token_entropies,
+                            return_hidden_states=return_hidden_states,
                         )
-                        if return_token_entropies:
+                        if return_hidden_states and return_token_entropies:
+                            chunk_lp, chunk_ent, chunk_h = chunk_out
+                            all_logprobs.append(chunk_lp)
+                            all_entropies.append(chunk_ent)
+                            if chunk_h is not None:
+                                all_hidden.append(chunk_h)
+                        elif return_hidden_states:
+                            chunk_lp, chunk_h = chunk_out
+                            all_logprobs.append(chunk_lp)
+                            if chunk_h is not None:
+                                all_hidden.append(chunk_h)
+                        elif return_token_entropies:
                             chunk_lp, chunk_ent = chunk_out
                             all_logprobs.append(chunk_lp)
                             all_entropies.append(chunk_ent)
@@ -770,6 +803,8 @@ class Trainer:
                     new_logprobs = mx.concatenate(all_logprobs)
                     if return_token_entropies:
                         token_entropies = mx.concatenate(all_entropies)
+                    if return_hidden_states and all_hidden:
+                        hidden_states = mx.concatenate(all_hidden)
                 else:
                     # Full batch: single forward pass for all episodes.
                     batched_out = compute_logprobs_batched(
@@ -779,8 +814,13 @@ class Trainer:
                         prompt_lengths,
                         episode_lengths,
                         return_token_entropies=return_token_entropies,
+                        return_hidden_states=return_hidden_states,
                     )
-                    if return_token_entropies:
+                    if return_hidden_states and return_token_entropies:
+                        new_logprobs, token_entropies, hidden_states = batched_out
+                    elif return_hidden_states:
+                        new_logprobs, hidden_states = batched_out
+                    elif return_token_entropies:
                         new_logprobs, token_entropies = batched_out
                     else:
                         new_logprobs = batched_out
@@ -790,23 +830,39 @@ class Trainer:
 
                 per_episode = []
                 per_episode_entropies = []
+                per_episode_hidden = []
                 for i in range(num_episodes):
-                    ep_logprobs = compute_logprobs(
+                    ep_result = compute_logprobs(
                         self.model, observations[i], actions[i],
                         _compiled=_compiled,
                         return_token_entropies=return_token_entropies,
+                        return_hidden_states=return_hidden_states,
                     )
-                    if return_token_entropies:
-                        episode_logprobs, episode_entropies = ep_logprobs
-                        per_episode.append(episode_logprobs)
-                        per_episode_entropies.append(episode_entropies)
+                    if return_hidden_states and return_token_entropies:
+                        ep_lp, ep_ent, ep_h = ep_result
+                        per_episode.append(ep_lp)
+                        per_episode_entropies.append(ep_ent)
+                        if ep_h is not None:
+                            per_episode_hidden.append(ep_h)
+                    elif return_hidden_states:
+                        ep_lp, ep_h = ep_result
+                        per_episode.append(ep_lp)
+                        if ep_h is not None:
+                            per_episode_hidden.append(ep_h)
+                    elif return_token_entropies:
+                        ep_lp, ep_ent = ep_result
+                        per_episode.append(ep_lp)
+                        per_episode_entropies.append(ep_ent)
                     else:
-                        per_episode.append(ep_logprobs)
+                        per_episode.append(ep_result)
                 new_logprobs = mx.concatenate(per_episode)
                 if return_token_entropies:
                     token_entropies = mx.concatenate(per_episode_entropies)
+                if return_hidden_states and per_episode_hidden:
+                    hidden_states = mx.concatenate(per_episode_hidden)
         else:
             # Path 3: Flat 1D — multi-step RL generic path.
+            # Hidden state capture is not supported here.
             if observations.ndim == 1:
                 model_input = observations[None]
             else:
@@ -835,7 +891,12 @@ class Trainer:
                     f"match sum(episode_lengths)={expected_tokens}. Entropy extraction "
                     f"must align one value per response token."
                 )
+            if return_hidden_states:
+                return new_logprobs, token_entropies, hidden_states  # type: ignore[name-defined]
             return new_logprobs, token_entropies  # type: ignore[name-defined]
+
+        if return_hidden_states:
+            return new_logprobs, hidden_states
 
         return new_logprobs
 
@@ -885,6 +946,20 @@ class Trainer:
         prepare_fn = getattr(self.advantage_transform_fn, "prepare_batch", None)
         if callable(prepare_fn):
             prepare_fn(batch_data)
+
+    def _postprocess_advantage_transform_batch(
+        self, batch_data: Dict[str, Any]
+    ) -> None:
+        """Allow transforms to update state after loss/grad execution.
+
+        This hook runs outside ``mx.compile`` after ``loss_and_grad_fn`` so
+        transforms can safely perform eager scalar extraction/state updates.
+        """
+        if self.advantage_transform_fn is None:
+            return
+        postprocess_fn = getattr(self.advantage_transform_fn, "postprocess_batch", None)
+        if callable(postprocess_fn):
+            postprocess_fn(batch_data)
     
     def train(self, rollout_data: Optional[Union[Buffer, Dict[str, Any]]] = None) -> Dict[str, float]:
         """
@@ -931,6 +1006,10 @@ class Trainer:
             # Manual mode with preprocessed data
             batch_data = rollout_data
 
+        # Expose training step count for transforms that need scheduling
+        # (e.g. HICRA blend annealing uses batch_data["step"]).
+        batch_data["step"] = self._step_count
+
         # Let transforms eagerly precompute compile-unsafe fields
         # (e.g. planning_mask token matching for HICRA).
         self._prepare_advantage_transform_batch(batch_data)
@@ -946,6 +1025,10 @@ class Trainer:
             timer.start("loss_and_grad")
 
         loss, grads = self.loss_and_grad_fn(batch_data)
+
+        # Let transforms update any schedule/state that depends on values
+        # produced during loss computation (e.g. token_entropies).
+        self._postprocess_advantage_transform_batch(batch_data)
 
         if timer is not None:
             # Eval both loss AND grads so the backward pass cost is attributed
@@ -981,6 +1064,11 @@ class Trainer:
         metrics: Dict[str, float] = {'loss': loss.item(), 'step': self._step_count}
         if self._last_grad_norm is not None:
             metrics['grad_norm'] = self._last_grad_norm
+        transform_metrics = batch_data.get("transform_metrics")
+        if isinstance(transform_metrics, dict):
+            for key, value in transform_metrics.items():
+                if isinstance(value, (int, float)):
+                    metrics[key] = float(value)
         if self.metrics_fn is not None and self._step_count % self.metrics_interval == 0:
             # Compute new logprobs using the same pipeline as training to ensure consistency
             # This properly handles GRPO data structure with format conversion
