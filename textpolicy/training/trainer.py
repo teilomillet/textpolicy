@@ -1010,15 +1010,24 @@ class Trainer:
         # (e.g. HICRA blend annealing uses batch_data["step"]).
         batch_data["step"] = self._step_count
 
-        # Let transforms eagerly precompute compile-unsafe fields
-        # (e.g. planning_mask token matching for HICRA).
-        self._prepare_advantage_transform_batch(batch_data)
-
         if timer is not None:
             # Eval all array values in the batch to flush pending work from
             # data selection (obs, act, logprob, rewards may all be lazy).
             mx.eval(*[v for v in batch_data.values() if isinstance(v, mx.array)])
             timer.stop("data_selection")
+
+        # ── Phase: transform_prepare ──────────────────────────────────
+        if timer is not None:
+            timer.start("transform_prepare")
+
+        # Let transforms eagerly precompute compile-unsafe fields
+        # (e.g. planning_mask token matching for HICRA).
+        self._prepare_advantage_transform_batch(batch_data)
+
+        if timer is not None:
+            # Capture lazy work introduced by transform prepare hooks.
+            mx.eval(*[v for v in batch_data.values() if isinstance(v, mx.array)])
+            timer.stop("transform_prepare")
 
         # ── Phase: loss_and_grad ───────────────────────────────────────
         if timer is not None:
@@ -1026,15 +1035,24 @@ class Trainer:
 
         loss, grads = self.loss_and_grad_fn(batch_data)
 
-        # Let transforms update any schedule/state that depends on values
-        # produced during loss computation (e.g. token_entropies).
-        self._postprocess_advantage_transform_batch(batch_data)
-
         if timer is not None:
             # Eval both loss AND grads so the backward pass cost is attributed
             # here, not to the subsequent grad_clip phase.
             mx.eval(loss, grads)
             timer.stop("loss_and_grad")
+
+        # ── Phase: transform_postprocess ──────────────────────────────
+        if timer is not None:
+            timer.start("transform_postprocess")
+
+        # Let transforms update any schedule/state that depends on values
+        # produced during loss computation (e.g. token_entropies).
+        self._postprocess_advantage_transform_batch(batch_data)
+
+        if timer is not None:
+            # Capture lazy work introduced by transform postprocess hooks.
+            mx.eval(*[v for v in batch_data.values() if isinstance(v, mx.array)])
+            timer.stop("transform_postprocess")
 
         # ── Phase: grad_clip ───────────────────────────────────────────
         if timer is not None:

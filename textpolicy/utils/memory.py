@@ -25,8 +25,8 @@ def get_memory_stats() -> Dict[str, float]:
     if MLX_AVAILABLE:
         try:
             # MLX memory information
-            stats["mlx_memory_mb"] = mx.metal.get_active_memory() / 1024 / 1024
-            stats["mlx_peak_mb"] = mx.metal.get_peak_memory() / 1024 / 1024
+            stats["mlx_memory_mb"] = mx.get_active_memory() / 1024 / 1024
+            stats["mlx_peak_mb"] = mx.get_peak_memory() / 1024 / 1024
         except Exception as e:
             print(f"Error getting MLX memory stats: {e}")
             stats["mlx_memory_mb"] = 0.0
@@ -57,7 +57,7 @@ def clear_memory():
     # MLX memory cleanup
     if MLX_AVAILABLE:
         try:
-            mx.metal.clear_cache()
+            mx.clear_cache()
         except Exception as e:
             print(f"Error clearing MLX memory: {e}")
             pass

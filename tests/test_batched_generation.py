@@ -359,6 +359,31 @@ class TestBatchedRollout:
         buffer = runner.collect_batched(batched_policy, batch_size=1)
         assert len(buffer.episodes) == 3
 
+    def test_collect_batched_exposes_generation_profile(self):
+        model = _TinyLM()
+        tok = _DummyTokenizer()
+        env = _SingleTurnEnv()
+        runner = RolloutRunner(
+            env,
+            policy=_dummy_policy,
+            strategy=create_strategy("grpo"),
+            max_steps=3,
+            profile=True,
+        )
+        batched_policy = create_batched_policy(
+            model,
+            tok,
+            {
+                "max_tokens": 3,
+                "temperature": 0.0,
+                "profile_decode_stats": True,
+            },
+        )
+        _ = runner.collect_batched(batched_policy, batch_size=2)
+        gen_profile = runner.get_generation_profile()
+        assert "decode_tps" in gen_profile
+        assert "shared_prefill_used" in gen_profile
+
 
 @pytest.mark.unit
 class TestGreedyDeterminismAndParity:
@@ -560,6 +585,391 @@ def test_create_batched_policy_forwards_repetition_penalty():
         assert kwargs.get("repetition_penalty") == 1.3, (
             "repetition_penalty was not forwarded to batch_generate_tokens"
         )
+
+
+@pytest.mark.unit
+def test_batch_generate_tokens_unknown_backend_raises():
+    model = _TinyLM()
+    tok = _DummyTokenizer()
+    prompts = [mx.array([3, 4], dtype=mx.int32)]
+    with pytest.raises(ValueError, match="Unknown batched decode backend"):
+        batch_generate_tokens(
+            model,
+            tok,
+            prompts,
+            max_tokens=2,
+            temperature=0.0,
+            backend="does-not-exist",
+        )
+
+
+@pytest.mark.unit
+def test_custom_batched_decode_backend_dispatch():
+    calls = {"count": 0}
+    backend_name = "unit-test-backend"
+
+    def _backend(
+        model,  # noqa: ARG001
+        tokenizer,  # noqa: ARG001
+        prompt_token_lists,
+        max_tokens,  # noqa: ARG001
+        temperature,  # noqa: ARG001
+        top_p,  # noqa: ARG001
+        repetition_penalty,  # noqa: ARG001
+        repetition_context_size,  # noqa: ARG001
+    ):
+        calls["count"] += 1
+        return [
+            (
+                mx.array([9], dtype=mx.int32),
+                {"logprob": mx.array([-0.1], dtype=mx.float32)},
+            )
+            for _ in prompt_token_lists
+        ]
+
+    mlx_generation.register_batched_decode_backend(backend_name, _backend)
+    model = _TinyLM()
+    tok = _DummyTokenizer()
+    prompts = [
+        mx.array([3, 4], dtype=mx.int32),
+        mx.array([5, 6], dtype=mx.int32),
+    ]
+    out = batch_generate_tokens(
+        model,
+        tok,
+        prompts,
+        max_tokens=3,
+        temperature=0.0,
+        backend=backend_name,
+    )
+
+    assert calls["count"] == 1
+    assert len(out) == 2
+    for resp, info in out:
+        assert resp.tolist() == [9]
+        assert info["logprob"].tolist() == pytest.approx([-0.1], abs=1e-6)
+
+
+@pytest.mark.unit
+def test_create_batched_policy_forwards_decode_backend():
+    calls = {"count": 0}
+    backend_name = "unit-test-policy-backend"
+
+    def _backend(
+        model,  # noqa: ARG001
+        tokenizer,  # noqa: ARG001
+        prompt_token_lists,
+        max_tokens,  # noqa: ARG001
+        temperature,  # noqa: ARG001
+        top_p,  # noqa: ARG001
+        repetition_penalty,  # noqa: ARG001
+        repetition_context_size,  # noqa: ARG001
+    ):
+        calls["count"] += 1
+        return [
+            (
+                mx.array([7], dtype=mx.int32),
+                {"logprob": mx.array([-0.2], dtype=mx.float32)},
+            )
+            for _ in prompt_token_lists
+        ]
+
+    mlx_generation.register_batched_decode_backend(backend_name, _backend)
+
+    model = _TinyLM()
+    tok = _DummyTokenizer()
+    policy = create_batched_policy(
+        model,
+        tok,
+        generation_params={
+            "max_tokens": 2,
+            "temperature": 0.0,
+            "decode_backend": backend_name,
+        },
+    )
+
+    results = policy([mx.array([3, 4], dtype=mx.int32)])
+    assert calls["count"] == 1
+    assert results[0][0].tolist() == [7]
+
+
+@pytest.mark.unit
+def test_mlx_native_backend_dispatch_uses_batch_generator(monkeypatch):
+    calls: Dict[str, Any] = {}
+
+    class _FakeBatchGenerator:
+        def __init__(
+            self,
+            model,  # noqa: ARG002
+            max_tokens=128,  # noqa: ARG002
+            stop_tokens=None,
+            sampler=None,  # noqa: ARG002
+            logits_processors=None,  # noqa: ARG002
+            completion_batch_size=32,  # noqa: ARG002
+            prefill_batch_size=8,  # noqa: ARG002
+            prefill_step_size=2048,  # noqa: ARG002
+            prompt_progress_callback=None,  # noqa: ARG002
+            max_kv_size=None,  # noqa: ARG002
+        ):
+            calls["stop_tokens"] = set(stop_tokens or set())
+            self._uids: List[int] = []
+            self._done = False
+
+        def insert(
+            self,
+            prompts,
+            max_tokens=None,  # noqa: ARG002
+            caches=None,  # noqa: ARG002
+            samplers=None,  # noqa: ARG002
+            logits_processors=None,  # noqa: ARG002
+        ):
+            calls["insert_prompts"] = prompts
+            self._uids = list(range(len(prompts)))
+            return self._uids
+
+        def next(self):
+            if self._done:
+                return []
+            self._done = True
+            responses = []
+            for uid in self._uids:
+                lp = [-10.0] * 32
+                lp[2] = -0.1
+                responses.append(
+                    types.SimpleNamespace(
+                        uid=uid,
+                        token=2,
+                        logprobs=mx.array(lp, dtype=mx.float32),
+                        finish_reason="stop",
+                    )
+                )
+            return responses
+
+        def stats(self):
+            n = len(self._uids)
+            return types.SimpleNamespace(
+                prompt_time=0.01,
+                generation_time=0.02,
+                generation_tokens=n,
+                generation_tps=float(n) / 0.02 if n > 0 else 0.0,
+            )
+
+        def close(self):
+            return None
+
+    monkeypatch.setattr(
+        mlx_generation,
+        "_import_mlx_generate_module",
+        lambda: types.SimpleNamespace(BatchGenerator=_FakeBatchGenerator),
+    )
+
+    model = _TinyLM()
+    tok = _DummyTokenizer()
+    profile: Dict[str, float] = {}
+    out = batch_generate_tokens(
+        model,
+        tok,
+        [mx.array([3, 4], dtype=mx.int32), mx.array([5, 6], dtype=mx.int32)],
+        max_tokens=2,
+        temperature=0.0,
+        backend="mlx_native",
+        profile_collector=profile,
+    )
+
+    assert calls["stop_tokens"] == {tok.eos_token_id}
+    assert len(calls["insert_prompts"]) == 2
+    assert len(out) == 2
+    for resp, info in out:
+        assert resp.tolist() == [2]
+        assert info["logprob"].tolist() == pytest.approx([-0.1], abs=1e-6)
+    assert profile.get("backend_mlx_native") == 1.0
+
+
+@pytest.mark.unit
+def test_mlx_speculative_backend_uses_target_logprobs(monkeypatch):
+    calls: Dict[str, Any] = {}
+
+    def _fake_speculative_generate_step(
+        prompt,  # noqa: ARG001
+        model,  # noqa: ARG001
+        draft_model,  # noqa: ARG001
+        **kwargs,
+    ):
+        calls["kwargs"] = kwargs
+        lp_a = [-10.0] * 32
+        lp_b = [-10.0] * 32
+        lp_a[4] = -0.3
+        lp_b[2] = -0.2
+        yield 4, mx.array(lp_a, dtype=mx.float32), True
+        yield 2, mx.array(lp_b, dtype=mx.float32), False
+
+    monkeypatch.setattr(
+        mlx_generation,
+        "_import_mlx_generate_module",
+        lambda: types.SimpleNamespace(speculative_generate_step=_fake_speculative_generate_step),
+    )
+
+    model = _TinyLM()
+    tok = _DummyTokenizer()
+    profile: Dict[str, float] = {}
+    out = batch_generate_tokens(
+        model,
+        tok,
+        [mx.array([3, 4], dtype=mx.int32)],
+        max_tokens=8,
+        temperature=0.0,
+        backend="mlx_speculative",
+        backend_options={"draft_model": object(), "num_draft_tokens": 5},
+        profile_collector=profile,
+    )
+
+    assert out[0][0].tolist() == [4, 2]
+    assert out[0][1]["logprob"].tolist() == pytest.approx([-0.3, -0.2], abs=1e-6)
+    assert calls["kwargs"]["num_draft_tokens"] == 5
+    assert profile.get("backend_mlx_speculative") == 1.0
+    assert profile.get("speculative_tokens_from_draft") == pytest.approx(1.0, abs=1e-6)
+
+
+@pytest.mark.unit
+def test_mlx_speculative_backend_without_draft_falls_back(monkeypatch):
+    calls = {"count": 0}
+
+    def _fallback(*args, **kwargs):  # noqa: ARG001
+        calls["count"] += 1
+        return [
+            (
+                mx.array([9], dtype=mx.int32),
+                {"logprob": mx.array([-0.4], dtype=mx.float32)},
+            )
+        ]
+
+    monkeypatch.setattr(mlx_generation, "_batch_generate_tokens_mlx", _fallback)
+    monkeypatch.setattr(
+        mlx_generation,
+        "_import_mlx_generate_module",
+        lambda: types.SimpleNamespace(speculative_generate_step=lambda *a, **k: iter(())),
+    )
+
+    model = _TinyLM()
+    tok = _DummyTokenizer()
+    out = batch_generate_tokens(
+        model,
+        tok,
+        [mx.array([3, 4], dtype=mx.int32)],
+        max_tokens=2,
+        temperature=0.0,
+        backend="mlx_speculative",
+    )
+
+    assert calls["count"] == 1
+    assert out[0][0].tolist() == [9]
+
+
+@pytest.mark.unit
+def test_create_batched_policy_loads_speculative_draft_once(monkeypatch):
+    calls = {"load": 0, "batch": 0, "draft_obj_ids": []}
+    draft_model_obj = object()
+
+    def _fake_load(path_or_hf_repo, **kwargs):  # noqa: ARG001
+        calls["load"] += 1
+        return draft_model_obj, None
+
+    def _fake_batch_generate_tokens(
+        model,  # noqa: ARG001
+        tokenizer,  # noqa: ARG001
+        prompt_token_lists,
+        max_tokens=50,  # noqa: ARG001
+        temperature=0.7,  # noqa: ARG001
+        top_p=0.9,  # noqa: ARG001
+        repetition_penalty=None,  # noqa: ARG001
+        repetition_context_size=20,  # noqa: ARG001
+        backend="mlx",  # noqa: ARG001
+        profile_collector=None,  # noqa: ARG001
+        backend_options=None,
+    ):
+        calls["batch"] += 1
+        calls["draft_obj_ids"].append(id(backend_options.get("draft_model")))
+        return [
+            (
+                mx.array([2], dtype=mx.int32),
+                {"logprob": mx.array([-0.1], dtype=mx.float32)},
+            )
+            for _ in prompt_token_lists
+        ]
+
+    monkeypatch.setattr(mlx_generation, "HAS_MLX_LM", True)
+    monkeypatch.setattr(mlx_generation, "load", _fake_load)
+    monkeypatch.setattr(
+        mlx_generation,
+        "batch_generate_tokens",
+        _fake_batch_generate_tokens,
+    )
+
+    model = _TinyLM()
+    tok = _DummyTokenizer()
+    policy = create_batched_policy(
+        model,
+        tok,
+        generation_params={
+            "max_tokens": 2,
+            "temperature": 0.0,
+            "decode_backend": "mlx_speculative",
+            "draft_model_id": "dummy/draft-model",
+        },
+    )
+    _ = policy([mx.array([3, 4], dtype=mx.int32)])
+    _ = policy([mx.array([5, 6], dtype=mx.int32)])
+
+    assert calls["load"] == 1
+    assert calls["batch"] == 2
+    assert calls["draft_obj_ids"][0] == calls["draft_obj_ids"][1]
+
+
+@pytest.mark.unit
+def test_batch_generate_tokens_profile_collector_populated():
+    model = _TinyLM()
+    tok = _DummyTokenizer()
+    profile = {}
+    _ = batch_generate_tokens(
+        model,
+        tok,
+        [mx.array([3, 4], dtype=mx.int32)],
+        max_tokens=3,
+        temperature=0.0,
+        profile_collector=profile,
+    )
+    expected_keys = {
+        "prefill_s",
+        "decode_s",
+        "total_s",
+        "decode_tps",
+        "tokens_generated",
+        "shared_prefill_used",
+        "used_cache",
+        "avg_active_batch",
+    }
+    assert expected_keys.issubset(profile.keys()), (
+        f"Missing decode profile keys: {expected_keys - set(profile.keys())}"
+    )
+
+
+@pytest.mark.unit
+def test_create_batched_policy_sets_last_decode_profile_when_enabled():
+    model = _TinyLM()
+    tok = _DummyTokenizer()
+    policy = create_batched_policy(
+        model,
+        tok,
+        generation_params={
+            "max_tokens": 2,
+            "temperature": 0.0,
+            "profile_decode_stats": True,
+        },
+    )
+    _ = policy([mx.array([3, 4], dtype=mx.int32)])
+    profile = getattr(policy, "_tp_last_decode_profile", None)
+    assert isinstance(profile, dict)
+    assert "decode_tps" in profile
 
 
 class _NarrowGapModel:

@@ -14,6 +14,7 @@ Key functions:
 
 from __future__ import annotations
 import importlib
+import time
 from typing import Dict, List, Optional, Tuple, Any, Callable
 import mlx.core as mx
 import mlx.nn as nn
@@ -30,6 +31,43 @@ try:
 except ImportError:
     make_sampler = None
     make_logits_processors = None
+
+
+# Batched decode backend extension point.
+BatchedGenerationOutput = List[Tuple[mx.array, Dict[str, mx.array]]]
+BatchedDecodeBackend = Callable[
+    [nn.Module, Any, List[mx.array], int, float, float, Optional[float], int],
+    BatchedGenerationOutput,
+]
+_BATCHED_DECODE_BACKENDS: Dict[str, BatchedDecodeBackend] = {}
+
+
+def register_batched_decode_backend(
+    name: str,
+    backend_fn: BatchedDecodeBackend,
+) -> None:
+    """Register a batched decode backend by name."""
+    key = str(name).strip().lower()
+    if not key:
+        raise ValueError("backend name must be a non-empty string.")
+    if not callable(backend_fn):
+        raise TypeError("backend_fn must be callable.")
+    _BATCHED_DECODE_BACKENDS[key] = backend_fn
+
+
+def list_batched_decode_backends() -> List[str]:
+    """Return sorted names of available batched decode backends."""
+    return sorted(_BATCHED_DECODE_BACKENDS.keys())
+
+
+def _import_mlx_generate_module() -> Optional[Any]:
+    """Best-effort import for ``mlx_lm.generate``."""
+    if not HAS_MLX_LM:
+        return None
+    try:
+        return importlib.import_module("mlx_lm.generate")
+    except Exception:
+        return None
 
 
 def _get_eos_configs_for_model(
@@ -86,14 +124,17 @@ def _make_eos_safe_sampler(temp: float, top_p: float) -> Any:
         return None
 
 
-def _make_logits_processors(repetition_penalty: float) -> Any:
+def _make_logits_processors(
+    repetition_penalty: float,
+    repetition_context_size: int = 20,
+) -> Any:
     """
     Create logits processors to enforce repetition penalty.
     """
     if make_logits_processors is not None:
         return make_logits_processors(
             repetition_penalty=repetition_penalty,
-            repetition_context_size=20,
+            repetition_context_size=repetition_context_size,
         )
     else:
         # Fallback implementation when mlx_lm.sample_utils is not available
@@ -1019,7 +1060,7 @@ def _model_forward_with_optional_mask_and_cache(
     return model(input_tokens), False
 
 
-def batch_generate_tokens(
+def _batch_generate_tokens_mlx(
     model: nn.Module,
     tokenizer: Any,
     prompt_token_lists: List[mx.array],
@@ -1028,7 +1069,8 @@ def batch_generate_tokens(
     top_p: float = 0.9,
     repetition_penalty: Optional[float] = None,
     repetition_context_size: int = 20,
-) -> List[Tuple[mx.array, Dict[str, mx.array]]]:
+    profile_collector: Optional[Dict[str, float]] = None,
+) -> BatchedGenerationOutput:
     """Generate responses for multiple prompts in a single batched pass.
 
     This bypasses ``stream_generate`` and operates on the model directly,
@@ -1066,6 +1108,17 @@ def batch_generate_tokens(
         ``response_tokens`` includes EOS tokens when sampled; no tokens are
         emitted after EOS for a finished sequence.
     """
+    profile_on = profile_collector is not None
+    total_t0 = time.perf_counter() if profile_on else 0.0
+    prefill_s = 0.0
+    decode_s = 0.0
+    package_s = 0.0
+    decode_steps = 0
+    active_batch_area = 0.0
+    compact_events = 0
+    cache_decode_steps = 0
+    fallback_decode_steps = 0
+
     if repetition_penalty is not None and repetition_penalty <= 0:
         raise ValueError(
             f"repetition_penalty must be a positive float, got {repetition_penalty}"
@@ -1115,6 +1168,7 @@ def batch_generate_tokens(
     )
 
     shared_prefill_ok = False  # tracks whether single-stream prefill succeeded
+    prefill_t0 = time.perf_counter() if profile_on else 0.0
     if all_same_prompt and cache_obj is not None:
         # Prefill with batch_size=1 — single prompt, no padding needed.
         single_prompt = prompts[0][None]  # [1, prompt_len]
@@ -1157,6 +1211,8 @@ def batch_generate_tokens(
             model, prompt_batch, mask=prefill_mask, cache_obj=cache_obj,
         )
         next_logits = prefill_logits[:, max_prompt_len - 1, :]  # [B, vocab]
+    if profile_on:
+        prefill_s = time.perf_counter() - prefill_t0
 
     # 3) Decode loop with batch compaction (Opt 4).
     # When sequences hit EOS, they are removed from the active batch,
@@ -1187,8 +1243,11 @@ def batch_generate_tokens(
     if use_rep_penalty:
         rep_ctx: List[List[int]] = [list(p) for p in prompt_token_lists_py]
 
+    decode_t0 = time.perf_counter() if profile_on else 0.0
     for decode_step in range(max_tokens):
         active_size = len(active_to_orig)
+        decode_steps += 1
+        active_batch_area += float(active_size)
         arange_active = mx.arange(active_size)
 
         # Logprobs from unscaled logits (matches _simple_generate convention).
@@ -1259,6 +1318,7 @@ def batch_generate_tokens(
         # Save feed tokens before compaction remaps indices.
         feed_by_orig: Dict[int, int] = {}
         if newly_finished_ai and _can_compact:
+            compact_events += 1
             keep_ai = [
                 ai for ai in range(active_size)
                 if active_to_orig[ai] not in finished_orig
@@ -1284,6 +1344,7 @@ def batch_generate_tokens(
         active_size = len(active_to_orig)
 
         if used_cache:
+            cache_decode_steps += 1
             # Cache-backed one-token decode.
             feed_tokens = [
                 feed_by_orig.get(oi, pad_id) for oi in active_to_orig
@@ -1307,6 +1368,7 @@ def batch_generate_tokens(
             )
             next_logits = step_logits[:, -1, :]
         else:
+            fallback_decode_steps += 1
             # Fallback for tiny models that do not implement cache:
             # rebuild full sequences for active sequences only.
             for oi in active_to_orig:
@@ -1341,9 +1403,12 @@ def batch_generate_tokens(
                 mx.array(lengths, dtype=mx.int32) - 1,
                 :,
             ]
+    if profile_on:
+        decode_s = time.perf_counter() - decode_t0
 
     # 5) Package results — per-sequence logprob accumulation.
-    results: List[Tuple[mx.array, Dict[str, mx.array]]] = []
+    package_t0 = time.perf_counter() if profile_on else 0.0
+    results: BatchedGenerationOutput = []
     for i in range(batch_size):
         n_tokens = len(per_seq_tokens[i])
         tokens = (
@@ -1357,7 +1422,520 @@ def batch_generate_tokens(
             else mx.array([], dtype=mx.float32)
         )
         results.append((tokens, {"logprob": logprobs}))
+    if profile_on:
+        package_s = time.perf_counter() - package_t0
+        total_s = time.perf_counter() - total_t0
+        tokens_total = float(sum(len(x) for x in per_seq_tokens))
+        decode_tps = tokens_total / decode_s if decode_s > 0 else 0.0
+        total_tps = tokens_total / total_s if total_s > 0 else 0.0
+        avg_active_batch = (
+            active_batch_area / float(max(decode_steps, 1))
+        )
+        profile_collector.clear()
+        profile_collector.update(
+            {
+                "backend_mlx": 1.0,
+                "batch_size": float(batch_size),
+                "prompt_len_mean": float(sum(prompt_lengths) / max(batch_size, 1)),
+                "prompt_len_max": float(max_prompt_len),
+                "all_same_prompt": 1.0 if all_same_prompt else 0.0,
+                "shared_prefill_used": 1.0 if shared_prefill_ok else 0.0,
+                "used_cache": 1.0 if used_cache else 0.0,
+                "prefill_s": float(prefill_s),
+                "decode_s": float(decode_s),
+                "package_s": float(package_s),
+                "total_s": float(total_s),
+                "tokens_generated": float(tokens_total),
+                "decode_tps": float(decode_tps),
+                "total_tps": float(total_tps),
+                "decode_steps": float(decode_steps),
+                "avg_active_batch": float(avg_active_batch),
+                "compact_events": float(compact_events),
+                "cache_decode_steps": float(cache_decode_steps),
+                "fallback_decode_steps": float(fallback_decode_steps),
+                "repetition_penalty_enabled": (
+                    1.0 if use_rep_penalty else 0.0
+                ),
+            }
+        )
     return results
+
+
+def _empty_batched_generation_output(
+    batch_size: int,
+) -> BatchedGenerationOutput:
+    """Return empty generation outputs for each sequence in the batch."""
+    return [
+        (mx.array([], dtype=mx.int32), {"logprob": mx.array([], dtype=mx.float32)})
+        for _ in range(batch_size)
+    ]
+
+
+def _batch_generate_tokens_mlx_native(
+    model: nn.Module,
+    tokenizer: Any,
+    prompt_token_lists: List[mx.array],
+    max_tokens: int = 50,
+    temperature: float = 0.7,
+    top_p: float = 0.9,
+    repetition_penalty: Optional[float] = None,
+    repetition_context_size: int = 20,
+    profile_collector: Optional[Dict[str, float]] = None,
+    backend_options: Optional[Dict[str, Any]] = None,
+) -> BatchedGenerationOutput:
+    """Backend using ``mlx_lm.generate.BatchGenerator`` directly.
+
+    This delegates scheduling/prefill/cache management to MLX-LM internals,
+    while still returning per-token logprobs required by RL training.
+    """
+    if repetition_penalty is not None and repetition_penalty <= 0:
+        raise ValueError(
+            f"repetition_penalty must be a positive float, got {repetition_penalty}"
+        )
+
+    prompts = [mx.array(p, dtype=mx.int32) for p in prompt_token_lists]
+    batch_size = len(prompts)
+    if batch_size == 0:
+        return []
+    if max_tokens <= 0:
+        return _empty_batched_generation_output(batch_size)
+    for i, prompt in enumerate(prompts):
+        if prompt.ndim != 1:
+            raise ValueError(
+                f"Prompt at index {i} must be 1D tokens, got shape {prompt.shape}."
+            )
+        if prompt.shape[0] == 0:
+            raise ValueError(
+                f"Prompt at index {i} is empty. Batched generation requires at least 1 token."
+            )
+
+    generate_mod = _import_mlx_generate_module()
+    if generate_mod is None or not hasattr(generate_mod, "BatchGenerator"):
+        return _batch_generate_tokens_mlx(
+            model=model,
+            tokenizer=tokenizer,
+            prompt_token_lists=prompts,
+            max_tokens=max_tokens,
+            temperature=temperature,
+            top_p=top_p,
+            repetition_penalty=repetition_penalty,
+            repetition_context_size=repetition_context_size,
+            profile_collector=profile_collector,
+        )
+
+    profile_on = profile_collector is not None
+    total_t0 = time.perf_counter() if profile_on else 0.0
+
+    eos_ids = set(_resolve_eos_token_ids(tokenizer))
+    stop_tokens = eos_ids if eos_ids else None
+    prompt_token_lists_py = [p.tolist() for p in prompts]
+
+    if temperature <= 0:
+        sampler = lambda logits: mx.argmax(logits, axis=-1)
+    else:
+        sampler = _make_eos_safe_sampler(temperature, top_p)
+
+    use_rep_penalty = repetition_penalty is not None and repetition_penalty != 1.0
+    logits_processors = (
+        _make_logits_processors(
+            float(repetition_penalty),
+            repetition_context_size=repetition_context_size,
+        )
+        if use_rep_penalty
+        else None
+    )
+
+    options = dict(backend_options or {})
+    completion_batch_size = max(
+        1, int(options.get("completion_batch_size", max(32, batch_size)))
+    )
+    prefill_batch_size = max(1, int(options.get("prefill_batch_size", min(8, batch_size))))
+    prefill_step_size = max(1, int(options.get("prefill_step_size", 2048)))
+    max_kv_size = options.get("max_kv_size")
+
+    gen = generate_mod.BatchGenerator(
+        model,
+        max_tokens=max_tokens,
+        stop_tokens=stop_tokens,
+        sampler=sampler,
+        logits_processors=logits_processors,
+        completion_batch_size=completion_batch_size,
+        prefill_batch_size=prefill_batch_size,
+        prefill_step_size=prefill_step_size,
+        max_kv_size=max_kv_size,
+    )
+    uids = gen.insert(prompt_token_lists_py, max_tokens=max_tokens)
+    per_uid_tokens: Dict[int, List[int]] = {uid: [] for uid in uids}
+    per_uid_logprobs: Dict[int, List[float]] = {uid: [] for uid in uids}
+    stats = None
+    try:
+        while True:
+            responses = gen.next()
+            if not responses:
+                break
+            for response in responses:
+                uid = int(response.uid)
+                token_id = int(response.token)
+                if uid not in per_uid_tokens:
+                    continue
+                per_uid_tokens[uid].append(token_id)
+                logprob_val = float(response.logprobs[token_id])
+                per_uid_logprobs[uid].append(logprob_val)
+        stats = gen.stats()
+    except Exception:
+        try:
+            gen.close()
+        except Exception:
+            pass
+        return _batch_generate_tokens_mlx(
+            model=model,
+            tokenizer=tokenizer,
+            prompt_token_lists=prompts,
+            max_tokens=max_tokens,
+            temperature=temperature,
+            top_p=top_p,
+            repetition_penalty=repetition_penalty,
+            repetition_context_size=repetition_context_size,
+            profile_collector=profile_collector,
+        )
+    finally:
+        try:
+            gen.close()
+        except Exception:
+            pass
+
+    package_t0 = time.perf_counter() if profile_on else 0.0
+    results: BatchedGenerationOutput = []
+    for uid in uids:
+        token_list = per_uid_tokens[uid]
+        logprob_list = per_uid_logprobs[uid]
+        tokens = (
+            mx.array(token_list, dtype=mx.int32)
+            if token_list
+            else mx.array([], dtype=mx.int32)
+        )
+        logprobs = (
+            mx.array(logprob_list, dtype=mx.float32)
+            if logprob_list
+            else mx.array([], dtype=mx.float32)
+        )
+        results.append((tokens, {"logprob": logprobs}))
+
+    if profile_on:
+        package_s = time.perf_counter() - package_t0
+        total_s = time.perf_counter() - total_t0
+        prefill_s = float(getattr(stats, "prompt_time", 0.0) if stats is not None else 0.0)
+        decode_s = float(
+            getattr(stats, "generation_time", 0.0) if stats is not None else 0.0
+        )
+        tokens_total = float(
+            getattr(stats, "generation_tokens", 0) if stats is not None else 0
+        )
+        if tokens_total <= 0:
+            tokens_total = float(sum(len(v) for v in per_uid_tokens.values()))
+        decode_tps = tokens_total / decode_s if decode_s > 0 else 0.0
+        total_tps = tokens_total / total_s if total_s > 0 else 0.0
+        profile_collector.clear()
+        profile_collector.update(
+            {
+                "backend_mlx_native": 1.0,
+                "batch_size": float(batch_size),
+                "prompt_len_mean": float(
+                    sum(int(p.shape[0]) for p in prompts) / max(batch_size, 1)
+                ),
+                "prompt_len_max": float(max(int(p.shape[0]) for p in prompts)),
+                "shared_prefill_used": 0.0,
+                "used_cache": 1.0,
+                "prefill_s": float(prefill_s),
+                "decode_s": float(decode_s),
+                "package_s": float(package_s),
+                "total_s": float(total_s),
+                "tokens_generated": float(tokens_total),
+                "decode_tps": float(decode_tps),
+                "total_tps": float(total_tps),
+                "avg_active_batch": float(batch_size),
+                "compact_events": 0.0,
+                "cache_decode_steps": 0.0,
+                "fallback_decode_steps": 0.0,
+                "repetition_penalty_enabled": 1.0 if use_rep_penalty else 0.0,
+            }
+        )
+    return results
+
+
+def _batch_generate_tokens_mlx_speculative(
+    model: nn.Module,
+    tokenizer: Any,
+    prompt_token_lists: List[mx.array],
+    max_tokens: int = 50,
+    temperature: float = 0.7,
+    top_p: float = 0.9,
+    repetition_penalty: Optional[float] = None,
+    repetition_context_size: int = 20,
+    profile_collector: Optional[Dict[str, float]] = None,
+    backend_options: Optional[Dict[str, Any]] = None,
+) -> BatchedGenerationOutput:
+    """Speculative decode backend using ``mlx_lm.generate.speculative_generate_step``.
+
+    This path is currently prompt-sequential (not cross-prompt batched). It is
+    intended for deep profiling/experimentation and falls back to ``mlx`` when
+    speculative prerequisites are unavailable.
+    """
+    if repetition_penalty is not None and repetition_penalty <= 0:
+        raise ValueError(
+            f"repetition_penalty must be a positive float, got {repetition_penalty}"
+        )
+
+    prompts = [mx.array(p, dtype=mx.int32) for p in prompt_token_lists]
+    batch_size = len(prompts)
+    if batch_size == 0:
+        return []
+    if max_tokens <= 0:
+        return _empty_batched_generation_output(batch_size)
+    for i, prompt in enumerate(prompts):
+        if prompt.ndim != 1:
+            raise ValueError(
+                f"Prompt at index {i} must be 1D tokens, got shape {prompt.shape}."
+            )
+        if prompt.shape[0] == 0:
+            raise ValueError(
+                f"Prompt at index {i} is empty. Batched generation requires at least 1 token."
+            )
+
+    options = dict(backend_options or {})
+    draft_model = options.get("draft_model")
+    if draft_model is None:
+        draft_model_id = options.get("draft_model_id")
+        if isinstance(draft_model_id, str) and draft_model_id.strip() and HAS_MLX_LM:
+            try:
+                draft_model, _ = load(path_or_hf_repo=draft_model_id.strip(), lazy=False)
+            except Exception:
+                draft_model = None
+    if draft_model is None:
+        return _batch_generate_tokens_mlx(
+            model=model,
+            tokenizer=tokenizer,
+            prompt_token_lists=prompts,
+            max_tokens=max_tokens,
+            temperature=temperature,
+            top_p=top_p,
+            repetition_penalty=repetition_penalty,
+            repetition_context_size=repetition_context_size,
+            profile_collector=profile_collector,
+        )
+
+    generate_mod = _import_mlx_generate_module()
+    if generate_mod is None or not hasattr(generate_mod, "speculative_generate_step"):
+        return _batch_generate_tokens_mlx(
+            model=model,
+            tokenizer=tokenizer,
+            prompt_token_lists=prompts,
+            max_tokens=max_tokens,
+            temperature=temperature,
+            top_p=top_p,
+            repetition_penalty=repetition_penalty,
+            repetition_context_size=repetition_context_size,
+            profile_collector=profile_collector,
+        )
+
+    if temperature <= 0:
+        sampler = lambda logits: mx.argmax(logits, axis=-1)
+    else:
+        sampler = _make_eos_safe_sampler(temperature, top_p)
+
+    use_rep_penalty = repetition_penalty is not None and repetition_penalty != 1.0
+    logits_processors = (
+        _make_logits_processors(
+            float(repetition_penalty),
+            repetition_context_size=repetition_context_size,
+        )
+        if use_rep_penalty
+        else None
+    )
+
+    num_draft_tokens = max(1, int(options.get("num_draft_tokens", 3)))
+    prefill_step_size = max(1, int(options.get("prefill_step_size", 512)))
+    kv_bits = options.get("kv_bits")
+    kv_group_size = int(options.get("kv_group_size", 64))
+    quantized_kv_start = int(options.get("quantized_kv_start", 0))
+
+    eos_ids = set(_resolve_eos_token_ids(tokenizer))
+    profile_on = profile_collector is not None
+    total_t0 = time.perf_counter() if profile_on else 0.0
+    accepted_from_draft = 0
+    tokens_total = 0
+
+    results: BatchedGenerationOutput = []
+    try:
+        for prompt in prompts:
+            seq_tokens: List[int] = []
+            seq_logprobs: List[float] = []
+            token_generator = generate_mod.speculative_generate_step(
+                prompt=prompt.astype(mx.uint32),
+                model=model,
+                draft_model=draft_model,
+                num_draft_tokens=num_draft_tokens,
+                max_tokens=max_tokens,
+                sampler=sampler,
+                logits_processors=logits_processors,
+                prefill_step_size=prefill_step_size,
+                kv_bits=kv_bits,
+                kv_group_size=kv_group_size,
+                quantized_kv_start=quantized_kv_start,
+            )
+            for token, logprob_vec, from_draft in token_generator:
+                tok_id = int(token)
+                seq_tokens.append(tok_id)
+                seq_logprobs.append(float(logprob_vec[tok_id]))
+                if bool(from_draft):
+                    accepted_from_draft += 1
+                if tok_id in eos_ids:
+                    break
+
+            tokens_total += len(seq_tokens)
+            tokens_arr = (
+                mx.array(seq_tokens, dtype=mx.int32)
+                if seq_tokens
+                else mx.array([], dtype=mx.int32)
+            )
+            logprobs_arr = (
+                mx.array(seq_logprobs, dtype=mx.float32)
+                if seq_logprobs
+                else mx.array([], dtype=mx.float32)
+            )
+            results.append((tokens_arr, {"logprob": logprobs_arr}))
+    except Exception:
+        return _batch_generate_tokens_mlx(
+            model=model,
+            tokenizer=tokenizer,
+            prompt_token_lists=prompts,
+            max_tokens=max_tokens,
+            temperature=temperature,
+            top_p=top_p,
+            repetition_penalty=repetition_penalty,
+            repetition_context_size=repetition_context_size,
+            profile_collector=profile_collector,
+        )
+
+    if profile_on:
+        total_s = time.perf_counter() - total_t0
+        decode_tps = float(tokens_total) / total_s if total_s > 0 else 0.0
+        accept_ratio = (
+            float(accepted_from_draft) / float(tokens_total)
+            if tokens_total > 0
+            else 0.0
+        )
+        profile_collector.clear()
+        profile_collector.update(
+            {
+                "backend_mlx_speculative": 1.0,
+                "batch_size": float(batch_size),
+                "prefill_s": 0.0,
+                "decode_s": float(total_s),
+                "package_s": 0.0,
+                "total_s": float(total_s),
+                "tokens_generated": float(tokens_total),
+                "decode_tps": float(decode_tps),
+                "total_tps": float(decode_tps),
+                "shared_prefill_used": 0.0,
+                "used_cache": 1.0,
+                "avg_active_batch": 1.0,
+                "compact_events": 0.0,
+                "cache_decode_steps": 0.0,
+                "fallback_decode_steps": 0.0,
+                "repetition_penalty_enabled": 1.0 if use_rep_penalty else 0.0,
+                "speculative_num_draft_tokens": float(num_draft_tokens),
+                "speculative_accept_ratio": float(accept_ratio),
+                "speculative_tokens_from_draft": float(accepted_from_draft),
+            }
+        )
+
+    return results
+
+
+# Register built-in decode backends.
+register_batched_decode_backend("mlx", _batch_generate_tokens_mlx)
+register_batched_decode_backend("mlx_native", _batch_generate_tokens_mlx_native)
+register_batched_decode_backend("mlx_speculative", _batch_generate_tokens_mlx_speculative)
+
+
+def batch_generate_tokens(
+    model: nn.Module,
+    tokenizer: Any,
+    prompt_token_lists: List[mx.array],
+    max_tokens: int = 50,
+    temperature: float = 0.7,
+    top_p: float = 0.9,
+    repetition_penalty: Optional[float] = None,
+    repetition_context_size: int = 20,
+    backend: str = "mlx",
+    profile_collector: Optional[Dict[str, float]] = None,
+    backend_options: Optional[Dict[str, Any]] = None,
+) -> BatchedGenerationOutput:
+    """Generate responses for multiple prompts via a named decode backend.
+
+    The default backend (``"mlx"``) preserves existing behavior. Additional
+    backends can be plugged in via ``register_batched_decode_backend`` to
+    support experimental decode strategies (e.g., quantized/speculative)
+    without changing rollout/trainer call sites.
+    """
+    backend_key = str(backend).strip().lower()
+    backend_fn = _BATCHED_DECODE_BACKENDS.get(backend_key)
+    if backend_fn is None:
+        available = ", ".join(list_batched_decode_backends()) or "<none>"
+        raise ValueError(
+            f"Unknown batched decode backend {backend!r}. "
+            f"Available backends: {available}."
+        )
+    if backend_key == "mlx":
+        return _batch_generate_tokens_mlx(
+            model,
+            tokenizer,
+            prompt_token_lists,
+            max_tokens,
+            temperature,
+            top_p,
+            repetition_penalty,
+            repetition_context_size,
+            profile_collector=profile_collector,
+        )
+    if backend_key == "mlx_native":
+        return _batch_generate_tokens_mlx_native(
+            model,
+            tokenizer,
+            prompt_token_lists,
+            max_tokens,
+            temperature,
+            top_p,
+            repetition_penalty,
+            repetition_context_size,
+            profile_collector=profile_collector,
+            backend_options=backend_options,
+        )
+    if backend_key == "mlx_speculative":
+        return _batch_generate_tokens_mlx_speculative(
+            model,
+            tokenizer,
+            prompt_token_lists,
+            max_tokens,
+            temperature,
+            top_p,
+            repetition_penalty,
+            repetition_context_size,
+            profile_collector=profile_collector,
+            backend_options=backend_options,
+        )
+
+    return backend_fn(
+        model,
+        tokenizer,
+        prompt_token_lists,
+        max_tokens,
+        temperature,
+        top_p,
+        repetition_penalty,
+        repetition_context_size,
+    )
 
 
 def create_batched_policy(
@@ -1379,6 +1957,11 @@ def create_batched_policy(
         model: Causal language model.
         tokenizer: Tokenizer with chat template support.
         generation_params: Generation parameters (max_tokens, temperature, …).
+            Optional ``decode_backend`` selects a registered batched decode
+            backend (default ``"mlx"``).
+            Optional ``profile_decode_stats=True`` collects decode-internal
+            profiling stats for the last call on
+            ``batched_policy_fn._tp_last_decode_profile``.
 
     Returns:
         Function ``(List[mx.array]) -> List[(response_tokens, info)]``.
@@ -1388,6 +1971,17 @@ def create_batched_policy(
     temperature = params.get("temperature", 0.8)
     top_p = params.get("top_p", 0.95)
     rep_penalty = params.get("repetition_penalty", None)
+    decode_backend = str(params.get("decode_backend", "mlx"))
+    profile_decode_stats = bool(params.get("profile_decode_stats", False))
+    backend_options = dict(params.get("decode_backend_options", {}) or {})
+    if "draft_model" in params and "draft_model" not in backend_options:
+        backend_options["draft_model"] = params["draft_model"]
+    if "draft_model_id" in params and "draft_model_id" not in backend_options:
+        backend_options["draft_model_id"] = params["draft_model_id"]
+    if "num_draft_tokens" in params and "num_draft_tokens" not in backend_options:
+        backend_options["num_draft_tokens"] = params["num_draft_tokens"]
+
+    cached_draft_model = backend_options.get("draft_model")
 
     def batched_policy_fn(
         prompt_tokens_list: List[mx.array],
@@ -1399,7 +1993,30 @@ def create_batched_policy(
             for pt in prompt_tokens_list
         ]
         temp = 0.0 if deterministic else temperature
-        return batch_generate_tokens(
+        decode_profile: Optional[Dict[str, float]] = (
+            {} if profile_decode_stats else None
+        )
+        resolved_backend_options = dict(backend_options)
+        nonlocal cached_draft_model
+        if (
+            decode_backend.strip().lower() == "mlx_speculative"
+            and resolved_backend_options.get("draft_model") is None
+            and isinstance(resolved_backend_options.get("draft_model_id"), str)
+            and resolved_backend_options["draft_model_id"].strip()
+            and HAS_MLX_LM
+        ):
+            if cached_draft_model is None:
+                try:
+                    cached_draft_model, _ = load(
+                        path_or_hf_repo=resolved_backend_options["draft_model_id"].strip(),
+                        lazy=False,
+                    )
+                except Exception:
+                    cached_draft_model = None
+            if cached_draft_model is not None:
+                resolved_backend_options["draft_model"] = cached_draft_model
+
+        output = batch_generate_tokens(
             model=model,
             tokenizer=tokenizer,
             prompt_token_lists=processed,
@@ -1407,13 +2024,23 @@ def create_batched_policy(
             temperature=temp,
             top_p=top_p,
             repetition_penalty=rep_penalty,
+            backend=decode_backend,
+            profile_collector=decode_profile,
+            backend_options=resolved_backend_options,
         )
+        setattr(
+            batched_policy_fn,
+            "_tp_last_decode_profile",
+            decode_profile if decode_profile else None,
+        )
+        return output
 
     # Attach metadata so rollout coordination can derive batched policy automatically.
     setattr(batched_policy_fn, "_tp_model", model)
     setattr(batched_policy_fn, "_tp_tokenizer", tokenizer)
     setattr(batched_policy_fn, "_tp_generation_params", dict(params))
     setattr(batched_policy_fn, "_tp_is_batched", True)
+    setattr(batched_policy_fn, "_tp_last_decode_profile", None)
     return batched_policy_fn
 
 

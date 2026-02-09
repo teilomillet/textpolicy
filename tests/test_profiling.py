@@ -178,6 +178,8 @@ class TestTrainerProfiling:
         assert "timing/total_s" in metrics
         assert "timing/loss_and_grad_s" in metrics
         assert "timing/loss_and_grad_pct" in metrics
+        assert "timing/transform_prepare_s" in metrics
+        assert "timing/transform_postprocess_s" in metrics
 
     @pytest.mark.unit
     def test_no_timing_keys_when_not_profiled(self):
