@@ -76,6 +76,9 @@ class ProfileConfig:
     target_gen_time_max_s: Optional[float] = None
     fail_on_target_miss: bool = False
     profile_generation_internals: bool = False
+    decode_backend: str = "mlx"
+    draft_model_id: Optional[str] = None
+    num_draft_tokens: int = 3
 
 
 # ── Hardware detection ───────────────────────────────────────────────────────
@@ -156,6 +159,9 @@ def run_probe(
     prompts: List[str],
     timeout: float,
     profile_generation_internals: bool = False,
+    decode_backend: str = "mlx",
+    draft_model_id: Optional[str] = None,
+    num_draft_tokens: int = 3,
 ) -> ProbeResult:
     """Run a scaling probe at a specific sequence length.
 
@@ -190,6 +196,12 @@ def run_probe(
                 group_size=group_size,
             )
 
+        decode_backend_options: Dict[str, Any] = {}
+        if decode_backend == "mlx_speculative":
+            if draft_model_id:
+                decode_backend_options["draft_model_id"] = draft_model_id
+            decode_backend_options["num_draft_tokens"] = int(num_draft_tokens)
+
         policy_fn = create_policy(
             model,
             tokenizer,
@@ -199,6 +211,8 @@ def run_probe(
                 "top_p": 0.9,
                 "repetition_penalty": 1.1,
                 "profile_decode_stats": profile_generation_internals,
+                "decode_backend": decode_backend,
+                "decode_backend_options": decode_backend_options,
             },
         )
 
@@ -218,6 +232,8 @@ def run_probe(
                 "top_p": 0.9,
                 "repetition_penalty": 1.1,
                 "profile_decode_stats": profile_generation_internals,
+                "decode_backend": decode_backend,
+                "decode_backend_options": decode_backend_options,
             },
             profile=True,  # Enable rollout sub-phase timing
         )
@@ -1795,6 +1811,10 @@ def run_profile(config: ProfileConfig) -> int:
     print(f"\nRunning scaling probes: {seq_lengths}")
     print(f"  Group size: G={config.group_size}")
     print(f"  Steps per probe: {config.steps_per_probe}")
+    print(f"  Decode backend: {config.decode_backend}")
+    if config.decode_backend == "mlx_speculative":
+        print(f"  Draft model: {config.draft_model_id}")
+        print(f"  Num draft tokens: {config.num_draft_tokens}")
     print()
 
     results: List[ProbeResult] = []
@@ -1830,6 +1850,9 @@ def run_profile(config: ProfileConfig) -> int:
             prompts=prompts,
             timeout=config.timeout_per_step,
             profile_generation_internals=config.profile_generation_internals,
+            decode_backend=config.decode_backend,
+            draft_model_id=config.draft_model_id,
+            num_draft_tokens=config.num_draft_tokens,
         )
         results.append(result)
 
@@ -2058,6 +2081,29 @@ Examples:
         ),
     )
     parser.add_argument(
+        "--decode-backend",
+        default="mlx",
+        choices=["mlx", "mlx_native", "mlx_speculative"],
+        help=(
+            "Batched decode backend to benchmark: custom mlx path, "
+            "MLX-LM native batch generator, or speculative decode."
+        ),
+    )
+    parser.add_argument(
+        "--draft-model",
+        default=None,
+        help=(
+            "Draft model ID/path used when --decode-backend=mlx_speculative. "
+            "Must share tokenizer with the main model."
+        ),
+    )
+    parser.add_argument(
+        "--num-draft-tokens",
+        type=int,
+        default=3,
+        help="Number of draft tokens per speculative verification step.",
+    )
+    parser.add_argument(
         "--target-seq-length",
         type=int,
         default=None,
@@ -2105,6 +2151,13 @@ Examples:
         parser.error("--target-gen-time-max-s must be > 0.")
     if args.target_seq_length is not None and args.target_seq_length <= 0:
         parser.error("--target-seq-length must be > 0.")
+    if args.num_draft_tokens <= 0:
+        parser.error("--num-draft-tokens must be > 0.")
+    if args.decode_backend == "mlx_speculative" and not args.draft_model:
+        parser.error(
+            "--decode-backend=mlx_speculative requires --draft-model "
+            "(draft model ID/path)."
+        )
 
     cfg = ProfileConfig(
         model_id=args.model,
@@ -2124,6 +2177,9 @@ Examples:
         target_gen_time_max_s=args.target_gen_time_max_s,
         fail_on_target_miss=args.fail_on_target_miss,
         profile_generation_internals=args.profile_generation_internals,
+        decode_backend=args.decode_backend,
+        draft_model_id=args.draft_model,
+        num_draft_tokens=args.num_draft_tokens,
     )
 
     sys.exit(run_profile(cfg))
