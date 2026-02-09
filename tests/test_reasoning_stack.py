@@ -294,6 +294,11 @@ class TestReasoningStackPublicAPI:
         from textpolicy.training import SEPAController
         assert callable(SEPAController)
 
+    def test_semantic_entropy_tracker_importable(self):
+        """SemanticEntropyTracker should be importable as a standalone component."""
+        from textpolicy.training import SemanticEntropyTracker
+        assert callable(SemanticEntropyTracker)
+
     def test_build_gtpo_transform_signature(self):
         """build_gtpo_transform must accept the expected GTPO + HICRA params."""
         import inspect

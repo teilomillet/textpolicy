@@ -1003,6 +1003,11 @@ class Trainer:
         metrics: Dict[str, float] = {'loss': loss.item(), 'step': self._step_count}
         if self._last_grad_norm is not None:
             metrics['grad_norm'] = self._last_grad_norm
+        transform_metrics = batch_data.get("transform_metrics")
+        if isinstance(transform_metrics, dict):
+            for key, value in transform_metrics.items():
+                if isinstance(value, (int, float)):
+                    metrics[key] = float(value)
         if self.metrics_fn is not None and self._step_count % self.metrics_interval == 0:
             # Compute new logprobs using the same pipeline as training to ensure consistency
             # This properly handles GRPO data structure with format conversion

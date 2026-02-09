@@ -31,6 +31,10 @@ from textpolicy.algorithms.hicra import (
     boost_entropy_with_planning,
     identify_planning_tokens,
 )
+from textpolicy.training.semantic_entropy import (
+    SemanticEntropyTracker,
+    build_prompt_group_keys,
+)
 from textpolicy.generation.lora import create_lora_setup
 from textpolicy.training.sepa import SEPAController, normalize_sepa_schedule
 from textpolicy.training.trainer import Trainer
@@ -289,6 +293,13 @@ class _GTPOTransform:
         sepa_ema_decay: float = 0.99,
         sepa_var_threshold: float = 0.2,
         sepa_warmup: int = 50,
+        semantic_entropy: bool = False,
+        semantic_entropy_ema_decay: float = 0.99,
+        semantic_entropy_stability_tol: float = 1e-3,
+        semantic_entropy_stability_patience: int = 20,
+        semantic_entropy_hash_bins: int = 256,
+        semantic_entropy_positive_only: bool = True,
+        semantic_entropy_on_stable: Optional[Callable[[Dict[str, float]], None]] = None,
     ) -> None:
         self.alpha_1 = alpha_1
         self.alpha_2 = alpha_2
@@ -311,8 +322,31 @@ class _GTPOTransform:
         )
         self._sepa_enabled = self._sepa.enabled
 
+        self._semantic_tracker: Optional[SemanticEntropyTracker]
+        if semantic_entropy:
+            if tokenizer is None:
+                raise ValueError(
+                    "semantic_entropy=True requires a tokenizer for planning "
+                    "token identification."
+                )
+            self._semantic_tracker = SemanticEntropyTracker(
+                ema_decay=semantic_entropy_ema_decay,
+                stability_tol=semantic_entropy_stability_tol,
+                stability_patience=semantic_entropy_stability_patience,
+                hash_bins=semantic_entropy_hash_bins,
+                positive_only=semantic_entropy_positive_only,
+                reward_threshold=reward_threshold,
+                eps=eps,
+                on_stable=semantic_entropy_on_stable,
+            )
+        else:
+            self._semantic_tracker = None
+
         # HICRA is active when boost or SEPA is enabled.
         self._hicra_enabled = (hicra_gamma > 0.0 or self._sepa_enabled)
+        self._needs_planning_mask = (
+            self._hicra_enabled or self._semantic_tracker is not None
+        )
 
     def _flatten_actions(self, batch_data: Dict[str, Any]) -> mx.array:
         episode_lengths = batch_data.get("episode_lengths")
@@ -333,14 +367,16 @@ class _GTPOTransform:
         Called by the Trainer before ``mx.compile``-traced execution.
         Short-circuits when HICRA fusion is disabled.
         """
-        if not self._hicra_enabled or self.tokenizer is None or not self.grams:
-            return
-        if batch_data.get("planning_mask") is None:
+        if (
+            self._needs_planning_mask
+            and self.tokenizer is not None
+            and self.grams
+            and batch_data.get("planning_mask") is None
+        ):
             token_ids = self._flatten_actions(batch_data)
-            planning_mask = identify_planning_tokens(
+            batch_data["planning_mask"] = identify_planning_tokens(
                 token_ids, self.tokenizer, self.grams
             )
-            batch_data["planning_mask"] = planning_mask
 
         if self._sepa_enabled:
             self._sepa.prepare_batch(batch_data)
@@ -351,27 +387,78 @@ class _GTPOTransform:
         Trainer calls this hook after ``loss_and_grad_fn`` so token entropies
         are available and scalar extraction (``.item()``) is safe.
         """
-        if not self._sepa.requires_postprocess:
+        if not self._sepa.requires_postprocess and self._semantic_tracker is None:
             return
 
-        token_entropies = batch_data.get("token_entropies")
         planning_mask = batch_data.get("planning_mask")
         episode_lengths = batch_data.get("episode_lengths")
-        if token_entropies is None or planning_mask is None or episode_lengths is None:
+        if planning_mask is None or episode_lengths is None:
             return
 
-        flat_entropies = _flatten_padded_token_rows(
-            token_entropies,
-            episode_lengths,
-            field_name="token_entropies",
-        )
-        flat_mask = _flatten_padded_token_rows(
-            planning_mask,
-            episode_lengths,
-            field_name="planning_mask",
-        ).astype(mx.float32)
+        if self._sepa.requires_postprocess:
+            token_entropies = batch_data.get("token_entropies")
+            if token_entropies is not None:
+                flat_entropies = _flatten_padded_token_rows(
+                    token_entropies,
+                    episode_lengths,
+                    field_name="token_entropies",
+                )
+                flat_mask = _flatten_padded_token_rows(
+                    planning_mask,
+                    episode_lengths,
+                    field_name="planning_mask",
+                ).astype(mx.float32)
+                self._sepa.update_auto_state(flat_entropies, flat_mask)
 
-        self._sepa.update_auto_state(flat_entropies, flat_mask)
+        if self._semantic_tracker is None:
+            return
+
+        actions = batch_data.get("act")
+        if actions is None:
+            return
+
+        prompt_keys = None
+        obs = batch_data.get("obs")
+        prompt_lengths = batch_data.get("prompt_lengths")
+        if obs is not None and prompt_lengths is not None:
+            try:
+                prompt_keys = build_prompt_group_keys(obs, prompt_lengths)
+            except ValueError:
+                prompt_keys = None
+
+        semantic_stats = self._semantic_tracker.update(
+            actions=actions,
+            planning_mask=planning_mask,
+            episode_lengths=episode_lengths,
+            rewards=batch_data.get("rewards"),
+            prompt_keys=prompt_keys,
+        )
+        if semantic_stats:
+            batch_data["semantic_entropy_stats"] = semantic_stats
+            transform_metrics = batch_data.get("transform_metrics")
+            if not isinstance(transform_metrics, dict):
+                transform_metrics = {}
+                batch_data["transform_metrics"] = transform_metrics
+            transform_metrics.update(semantic_stats)
+
+    def state_dict(self) -> Dict[str, Any]:
+        """Serialize SEPA/semantic tracker state for optional checkpointing."""
+        state: Dict[str, Any] = {"sepa": self._sepa.state_dict()}
+        if self._semantic_tracker is not None:
+            state["semantic_entropy"] = self._semantic_tracker.state_dict()
+        return state
+
+    def load_state_dict(self, state: Dict[str, Any]) -> None:
+        """Restore scheduler/tracker state from ``state_dict`` payload."""
+        if not isinstance(state, dict):
+            raise ValueError(f"state must be a dict, got {type(state)!r}.")
+        if "sepa" in state:
+            self._sepa.load_state_dict(state["sepa"])
+        if (
+            self._semantic_tracker is not None
+            and "semantic_entropy" in state
+        ):
+            self._semantic_tracker.load_state_dict(state["semantic_entropy"])
 
     def __call__(self, advantages: mx.array, batch_data: Dict[str, Any]) -> mx.array:
         episode_lengths = batch_data.get("episode_lengths")
@@ -480,6 +567,7 @@ def build_gtpo_transform(
     hicra_gamma: float = 0.0,
     sepa_steps: int = 0,
     sepa_schedule: str = "linear",
+    semantic_entropy: bool = False,
 ) -> Callable[[mx.array, Dict[str, Any]], mx.array]:
     """
     Build a Trainer-compatible transform for GTPO (arXiv 2508.04349).
@@ -517,6 +605,8 @@ def build_gtpo_transform(
     - ``'act'``: token IDs (required when boost/SEPA is active)
     - ``'step'``: training step count (auto-injected by Trainer, used for SEPA)
     - ``'sepa_lambda'``: optional precomputed λ (injected by Trainer hook)
+    - ``'transform_metrics'``: optional dict populated by transform postprocess
+      (e.g., semantic-entropy tracking stats)
 
     Example::
 
@@ -580,6 +670,9 @@ def build_gtpo_transform(
                       ``'linear'`` uses ``sepa_steps`` only.
                       ``'auto'`` uses variance-driven λ, optionally capped by
                       linear ``sepa_steps``.
+        semantic_entropy: Enable planning-level semantic-entropy tracking in
+                         ``postprocess_batch``. This does not affect gradients
+                         or the GTPO loss path.
 
     Returns:
         A callable ``(advantages, batch_data) -> advantages``.
@@ -587,7 +680,8 @@ def build_gtpo_transform(
     Raises:
         ValueError: If ``hicra_gamma < 0``, ``sepa_steps < 0``,
                    ``sepa_schedule`` is invalid,
-                   or HICRA is active without tokenizer.
+                   or planning-mask-dependent features are active without
+                   tokenizer.
     """
     if alpha_1 < 0.0:
         raise ValueError(f"alpha_1 must be >= 0, got {alpha_1}.")
@@ -605,6 +699,11 @@ def build_gtpo_transform(
     if sepa_enabled and tokenizer is None:
         raise ValueError(
             "SEPA requires a tokenizer for planning token identification."
+        )
+    if semantic_entropy and tokenizer is None:
+        raise ValueError(
+            "semantic_entropy=True requires a tokenizer for planning token "
+            "identification."
         )
     if hicra_gamma > 0.0 and tokenizer is None:
         raise ValueError(
@@ -629,6 +728,7 @@ def build_gtpo_transform(
         hicra_gamma=hicra_gamma,
         sepa_steps=sepa_steps,
         sepa_schedule=sepa_schedule,
+        semantic_entropy=semantic_entropy,
     )
 
 

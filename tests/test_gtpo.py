@@ -2037,6 +2037,137 @@ class TestSEPATransform:
         assert result.shape == (6,)
         assert not mx.any(mx.isnan(result)).item()
 
+    def test_h11q_auto_schedule_drops_lambda_after_variance_spike(self):
+        """H11q: auto schedule is bidirectional when execution variance spikes."""
+        from textpolicy.training.reasoning_stack import _GTPOTransform
+
+        tokenizer = _MockTokenizer({1: "let", 2: "me", 3: "think", 4: "x"})
+        transform = _GTPOTransform(
+            alpha_1=1.0, alpha_2=0.1,
+            tokenizer=tokenizer,
+            strategic_grams=["let me think"],
+            sepa_schedule="auto",
+            sepa_ema_decay=0.0,
+            sepa_var_threshold=0.5,
+            sepa_warmup=1,
+        )
+
+        rewards = mx.array([1.0, 1.0, 0.0, 0.0])
+        episode_lengths = [3, 3, 3, 3]
+        act = mx.array([[1, 2, 3], [4, 4, 4], [4, 4, 4], [4, 4, 4]])
+        advantages = mx.zeros((12,))
+
+        batch_high = {
+            "rewards": rewards,
+            "token_entropies": mx.array([
+                2.0, 3.0, 1.0,
+                0.5, 4.5, 0.5,
+                4.5, 0.5, 4.5,
+                0.5, 4.5, 0.5,
+            ]),
+            "episode_lengths": episode_lengths,
+            "act": act,
+            "step": 0,
+        }
+        transform.prepare_batch(batch_high)
+        transform(advantages, batch_high)
+        transform.postprocess_batch(batch_high)
+
+        batch_low = {
+            "rewards": rewards,
+            "token_entropies": mx.array([
+                2.0, 3.0, 1.0,
+                2.0, 2.0, 2.0,
+                2.0, 2.0, 2.0,
+                2.0, 2.0, 2.0,
+            ]),
+            "episode_lengths": episode_lengths,
+            "act": act,
+            "step": 1,
+        }
+        transform.prepare_batch(batch_low)
+        transform(advantages, batch_low)
+        transform.postprocess_batch(batch_low)
+
+        batch_probe = dict(batch_low)
+        batch_probe["step"] = 2
+        transform.prepare_batch(batch_probe)
+        lambda_after_drop = batch_probe["sepa_lambda"]
+        assert lambda_after_drop > 0.0
+
+        batch_spike = dict(batch_high)
+        batch_spike["step"] = 3
+        transform.prepare_batch(batch_spike)
+        transform(advantages, batch_spike)
+        transform.postprocess_batch(batch_spike)
+
+        batch_probe2 = dict(batch_spike)
+        batch_probe2["step"] = 4
+        transform.prepare_batch(batch_probe2)
+        lambda_after_spike = batch_probe2["sepa_lambda"]
+
+        assert lambda_after_spike < lambda_after_drop
+        assert lambda_after_spike == 0.0
+
+    def test_h11r_semantic_entropy_tracking_emits_metrics(self):
+        """H11r: semantic entropy tracker computes prompt-group dispersion stats."""
+        from textpolicy.training.reasoning_stack import _GTPOTransform
+
+        tokenizer = _MockTokenizer({1: "let", 2: "me", 3: "think", 4: "alt"})
+        transform = _GTPOTransform(
+            alpha_1=1.0,
+            alpha_2=0.1,
+            tokenizer=tokenizer,
+            strategic_grams=["let me think"],
+            semantic_entropy=True,
+            semantic_entropy_ema_decay=0.0,
+            semantic_entropy_stability_patience=1,
+        )
+
+        batch = {
+            "obs": mx.array([
+                [10, 11, 1, 2, 3],  # prompt A
+                [10, 11, 1, 2, 3],  # prompt A
+                [20, 21, 1, 2, 3],  # prompt B
+                [20, 21, 1, 4, 3],  # prompt B (different planning pattern)
+            ], dtype=mx.int32),
+            "act": mx.array([
+                [1, 2, 3],
+                [1, 2, 3],
+                [1, 2, 3],
+                [1, 4, 3],
+            ], dtype=mx.int32),
+            "logprob": mx.array([-1.0] * 12, dtype=mx.float32),
+            "rewards": mx.array([1.0, 1.0, 1.0, 1.0], dtype=mx.float32),
+            "token_entropies": mx.array([
+                2.0, 2.0, 2.0,
+                2.0, 2.0, 2.0,
+                2.0, 2.0, 2.0,
+                2.0, 2.0, 2.0,
+            ], dtype=mx.float32),
+            "episode_lengths": [3, 3, 3, 3],
+            "prompt_lengths": [2, 2, 2, 2],
+            "step": 0,
+        }
+
+        transform.prepare_batch(batch)
+        transformed = transform(mx.zeros((12,), dtype=mx.float32), batch)
+        mx.eval(transformed)
+        transform.postprocess_batch(batch)
+
+        stats = batch.get("semantic_entropy_stats")
+        assert isinstance(stats, dict)
+        assert stats["semantic_entropy_batch"] > 0.0
+        assert stats["semantic_entropy_ema"] > 0.0
+        assert stats["semantic_entropy_group_count"] >= 1.0
+
+    def test_h11s_semantic_entropy_without_tokenizer_raises(self):
+        """H11s: semantic entropy mode requires tokenizer for planning masks."""
+        from textpolicy.training import build_gtpo_transform
+
+        with pytest.raises(ValueError, match="semantic_entropy"):
+            build_gtpo_transform(semantic_entropy=True)
+
 
 if __name__ == "__main__":
     pytest.main([__file__, "-v"])

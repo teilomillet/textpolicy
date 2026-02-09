@@ -971,6 +971,7 @@ class TestCompiledTraining:
             def postprocess_batch(self, batch):
                 self.postprocess_calls += 1
                 batch["postprocess_seen"] = True
+                batch["transform_metrics"] = {"hook_metric": 7.5}
 
         model = TinyLM()
         mx.eval(model.parameters())
@@ -997,6 +998,7 @@ class TestCompiledTraining:
         assert transform.postprocess_calls == 1
         assert batch["prepare_seen"] is True
         assert batch["postprocess_seen"] is True
+        assert metrics["hook_metric"] == pytest.approx(7.5)
 
 
 @pytest.mark.unit

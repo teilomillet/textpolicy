@@ -58,6 +58,30 @@ class TestSEPAController:
         assert sepa.resolve_lambda(step=0.0) == 0.0
         assert sepa.resolve_lambda(step=3.0) == 1.0
 
+    def test_auto_schedule_lambda_decreases_after_variance_spike(self):
+        sepa = SEPAController(
+            sepa_schedule="auto",
+            sepa_ema_decay=0.0,
+            sepa_var_threshold=0.5,
+            sepa_warmup=1,
+        )
+
+        planning_mask = mx.array([1, 1, 1, 0, 0, 0], dtype=mx.float32)
+        high_var = mx.array([2.0, 3.0, 1.0, 0.0, 4.0, 0.0], dtype=mx.float32)
+        low_var = mx.array([2.0, 3.0, 1.0, 2.0, 2.0, 2.0], dtype=mx.float32)
+
+        sepa.update_auto_state(high_var, planning_mask)
+        assert sepa.resolve_lambda(step=0.0) == 0.0
+
+        sepa.update_auto_state(low_var, planning_mask)
+        lam_after_drop = sepa.resolve_lambda(step=0.0)
+        assert lam_after_drop > 0.0
+
+        sepa.update_auto_state(high_var, planning_mask)
+        lam_after_spike = sepa.resolve_lambda(step=0.0)
+        assert lam_after_spike < lam_after_drop
+        assert lam_after_spike == 0.0
+
     def test_apply_pooling_boundaries(self):
         sepa = SEPAController(sepa_steps=10)
         entropies = mx.array([2.0, 3.0, 1.0, 4.0, 1.0, 2.0], dtype=mx.float32)
@@ -83,3 +107,22 @@ class TestSEPAController:
         batch = {"step": 2}
         sepa.prepare_batch(batch)
         assert batch["sepa_lambda"] == 0.5
+
+    def test_state_dict_roundtrip_preserves_auto_state(self):
+        sepa = SEPAController(
+            sepa_schedule="auto",
+            sepa_ema_decay=0.0,
+            sepa_var_threshold=0.5,
+            sepa_warmup=1,
+        )
+        planning_mask = mx.array([1, 1, 1, 0, 0, 0], dtype=mx.float32)
+        high_var = mx.array([2.0, 3.0, 1.0, 0.0, 4.0, 0.0], dtype=mx.float32)
+        low_var = mx.array([2.0, 3.0, 1.0, 2.0, 2.0, 2.0], dtype=mx.float32)
+
+        sepa.update_auto_state(high_var, planning_mask)
+        sepa.update_auto_state(low_var, planning_mask)
+        expected_lambda = sepa.resolve_lambda(step=0.0)
+
+        restored = SEPAController(sepa_schedule="auto")
+        restored.load_state_dict(sepa.state_dict())
+        assert restored.resolve_lambda(step=0.0) == pytest.approx(expected_lambda)

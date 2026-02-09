@@ -185,3 +185,51 @@ class SEPAController:
             self._warmup_seen += 1
             if self._warmup_seen >= self.sepa_warmup:
                 self._var_0 = max(self._var_ema, self.eps)
+
+    def state_dict(self) -> Dict[str, Any]:
+        """Serialize scheduler configuration + runtime state."""
+        return {
+            "sepa_steps": self.sepa_steps,
+            "sepa_schedule": self.sepa_schedule,
+            "sepa_ema_decay": self.sepa_ema_decay,
+            "sepa_var_threshold": self.sepa_var_threshold,
+            "sepa_warmup": self.sepa_warmup,
+            "eps": self.eps,
+            "var_ema": self._var_ema,
+            "var_0": self._var_0,
+            "warmup_seen": self._warmup_seen,
+        }
+
+    def load_state_dict(self, state: Dict[str, Any]) -> None:
+        """Restore runtime state from a state_dict payload."""
+        if not isinstance(state, dict):
+            raise ValueError(f"state must be a dict, got {type(state)!r}.")
+
+        def _maybe_float(key: str) -> Optional[float]:
+            value = state.get(key)
+            if value is None:
+                return None
+            try:
+                parsed = float(value)
+            except (TypeError, ValueError) as exc:
+                raise ValueError(f"state[{key!r}] must be float or None.") from exc
+            if not math.isfinite(parsed):
+                raise ValueError(f"state[{key!r}] must be finite, got {parsed}.")
+            return parsed
+
+        var_ema = _maybe_float("var_ema")
+        var_0 = _maybe_float("var_0")
+
+        warmup_seen = state.get("warmup_seen", self._warmup_seen)
+        try:
+            warmup_seen = int(warmup_seen)
+        except (TypeError, ValueError) as exc:
+            raise ValueError("state['warmup_seen'] must be an integer.") from exc
+        if warmup_seen < 0:
+            raise ValueError(
+                f"state['warmup_seen'] must be >= 0, got {warmup_seen}."
+            )
+
+        self._var_ema = var_ema
+        self._var_0 = var_0
+        self._warmup_seen = warmup_seen
