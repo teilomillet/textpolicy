@@ -70,6 +70,12 @@ class ProfileConfig:
     output_path: Optional[str] = None
     quick: bool = False
     timeout_per_step: float = 600.0  # seconds
+    target_seq_length: Optional[int] = None
+    target_gen_tps_min: Optional[float] = None
+    target_gen_fraction_max: Optional[float] = None
+    target_gen_time_max_s: Optional[float] = None
+    fail_on_target_miss: bool = False
+    profile_generation_internals: bool = False
 
 
 # ── Hardware detection ───────────────────────────────────────────────────────
@@ -132,6 +138,7 @@ class ProbeResult:
     # Sub-phase breakdowns (populated when profiling is enabled)
     rollout_phases: Optional[Dict[str, float]] = None
     trainer_phases: Optional[Dict[str, float]] = None
+    generation_profile: Optional[Dict[str, float]] = None
     # Throughput metrics for Little's Law
     total_tokens_generated: int = 0
     # Number of fully completed probe steps
@@ -148,6 +155,7 @@ def run_probe(
     problems: List[Dict],
     prompts: List[str],
     timeout: float,
+    profile_generation_internals: bool = False,
 ) -> ProbeResult:
     """Run a scaling probe at a specific sequence length.
 
@@ -159,6 +167,7 @@ def run_probe(
     train_times: List[float] = []
     rollout_phase_accum: Dict[str, float] = {}
     trainer_phase_accum: Dict[str, float] = {}
+    generation_profile_accum: Dict[str, float] = {}
     total_tokens = 0
     completed_steps = 0
     rollout: Optional[RolloutCoordinator] = None
@@ -189,6 +198,7 @@ def run_probe(
                 "temperature": 0.7,
                 "top_p": 0.9,
                 "repetition_penalty": 1.1,
+                "profile_decode_stats": profile_generation_internals,
             },
         )
 
@@ -207,6 +217,7 @@ def run_probe(
                 "temperature": 0.7,
                 "top_p": 0.9,
                 "repetition_penalty": 1.1,
+                "profile_decode_stats": profile_generation_internals,
             },
             profile=True,  # Enable rollout sub-phase timing
         )
@@ -253,6 +264,9 @@ def run_probe(
                     trainer_phases=_average_phases(
                         trainer_phase_accum, max(1, len(train_times))
                     ),
+                    generation_profile=_average_phases(
+                        generation_profile_accum, max(1, len(gen_times))
+                    ),
                     total_tokens_generated=total_tokens,
                     steps_completed=completed_steps,
                 )
@@ -260,6 +274,10 @@ def run_probe(
             # Accumulate rollout sub-phase timing
             for phase, secs in rollout.get_rollout_timing().items():
                 rollout_phase_accum[phase] = rollout_phase_accum.get(phase, 0.0) + secs
+            for key, value in rollout.get_rollout_generation_profile().items():
+                generation_profile_accum[key] = (
+                    generation_profile_accum.get(key, 0.0) + float(value)
+                )
 
             # Count tokens generated in this step.
             # Episode.act is a list of actions (one per env step).
@@ -311,6 +329,9 @@ def run_probe(
                     trainer_phases=_average_phases(
                         trainer_phase_accum, max(1, len(train_times))
                     ),
+                    generation_profile=_average_phases(
+                        generation_profile_accum, max(1, len(gen_times))
+                    ),
                     total_tokens_generated=total_tokens,
                     steps_completed=completed_steps,
                 )
@@ -327,6 +348,7 @@ def run_probe(
             status="OK",
             rollout_phases=_average_phases(rollout_phase_accum, steps),
             trainer_phases=_average_phases(trainer_phase_accum, steps),
+            generation_profile=_average_phases(generation_profile_accum, steps),
             total_tokens_generated=total_tokens,
             steps_completed=completed_steps,
         )
@@ -345,6 +367,9 @@ def run_probe(
             error_msg=error_str[:200],
             rollout_phases=_average_phases(rollout_phase_accum, max(1, len(gen_times))),
             trainer_phases=_average_phases(trainer_phase_accum, max(1, len(train_times))),
+            generation_profile=_average_phases(
+                generation_profile_accum, max(1, len(gen_times))
+            ),
             total_tokens_generated=total_tokens,
             steps_completed=completed_steps,
         )
@@ -937,6 +962,135 @@ class Recommendation:
     optimization_targets: List[str]  # Where to focus effort
 
 
+@dataclass
+class GenerationTargetCheck:
+    """Outcome of generation-performance target validation."""
+
+    enabled: bool
+    evaluated_seq_length: Optional[int]
+    observed_gen_tps: Optional[float]
+    observed_gen_fraction: Optional[float]
+    observed_gen_time_s: Optional[float]
+    passed: bool
+    failures: List[str]
+
+
+def _has_generation_targets(config: ProfileConfig) -> bool:
+    return (
+        config.target_gen_tps_min is not None
+        or config.target_gen_fraction_max is not None
+        or config.target_gen_time_max_s is not None
+    )
+
+
+def evaluate_generation_target(
+    config: ProfileConfig,
+    results: List[ProbeResult],
+) -> GenerationTargetCheck:
+    """Evaluate generation-performance targets against profiling results."""
+    if not _has_generation_targets(config):
+        return GenerationTargetCheck(
+            enabled=False,
+            evaluated_seq_length=None,
+            observed_gen_tps=None,
+            observed_gen_fraction=None,
+            observed_gen_time_s=None,
+            passed=True,
+            failures=[],
+        )
+
+    failures: List[str] = []
+    ok_results = [r for r in results if r.status == "OK"]
+    if not ok_results:
+        return GenerationTargetCheck(
+            enabled=True,
+            evaluated_seq_length=None,
+            observed_gen_tps=None,
+            observed_gen_fraction=None,
+            observed_gen_time_s=None,
+            passed=False,
+            failures=["No successful probes available for target evaluation."],
+        )
+
+    if config.target_seq_length is not None:
+        probe = next(
+            (r for r in ok_results if r.seq_length == config.target_seq_length), None
+        )
+        if probe is None:
+            return GenerationTargetCheck(
+                enabled=True,
+                evaluated_seq_length=config.target_seq_length,
+                observed_gen_tps=None,
+                observed_gen_fraction=None,
+                observed_gen_time_s=None,
+                passed=False,
+                failures=[
+                    f"No successful probe at seq_length={config.target_seq_length}."
+                ],
+            )
+    else:
+        probe = max(ok_results, key=lambda r: r.seq_length)
+
+    steps = max(1, int(probe.steps_completed))
+    total_gen_s = probe.gen_time_s * steps
+    gen_tps = (
+        float(probe.total_tokens_generated) / total_gen_s
+        if total_gen_s > 0
+        else None
+    )
+
+    generation_phase_s = None
+    if probe.rollout_phases is not None and "generation" in probe.rollout_phases:
+        generation_phase_s = float(probe.rollout_phases["generation"])
+    elif probe.gen_time_s > 0:
+        generation_phase_s = float(probe.gen_time_s)
+
+    gen_fraction = None
+    if generation_phase_s is not None and probe.total_time_s > 0:
+        gen_fraction = generation_phase_s / probe.total_time_s
+
+    if config.target_gen_tps_min is not None:
+        if gen_tps is None:
+            failures.append("Cannot compute generation tokens/sec for target check.")
+        elif gen_tps < config.target_gen_tps_min:
+            failures.append(
+                f"gen_tps {gen_tps:.1f} < target minimum "
+                f"{config.target_gen_tps_min:.1f}"
+            )
+
+    if config.target_gen_fraction_max is not None:
+        if gen_fraction is None:
+            failures.append("Cannot compute generation time fraction for target check.")
+        elif gen_fraction > config.target_gen_fraction_max:
+            failures.append(
+                f"gen_fraction {gen_fraction:.1%} > target maximum "
+                f"{config.target_gen_fraction_max:.1%}"
+            )
+
+    if config.target_gen_time_max_s is not None:
+        if generation_phase_s is None:
+            failures.append("Cannot compute generation phase seconds for target check.")
+        elif generation_phase_s > config.target_gen_time_max_s:
+            failures.append(
+                f"generation_s {generation_phase_s:.2f}s > target maximum "
+                f"{config.target_gen_time_max_s:.2f}s"
+            )
+
+    return GenerationTargetCheck(
+        enabled=True,
+        evaluated_seq_length=int(probe.seq_length),
+        observed_gen_tps=float(gen_tps) if gen_tps is not None else None,
+        observed_gen_fraction=float(gen_fraction) if gen_fraction is not None else None,
+        observed_gen_time_s=(
+            float(generation_phase_s)
+            if generation_phase_s is not None
+            else None
+        ),
+        passed=(len(failures) == 0),
+        failures=failures,
+    )
+
+
 def build_recommendation(
     results: List[ProbeResult],
     total_memory_gb: float,
@@ -1079,6 +1233,7 @@ def format_human_output(
     calibration_scale: Optional[float] = None,
     calibration_diagnostics: Optional[Dict[str, Any]] = None,
     oom_boundaries: Optional[Dict[int, int]] = None,
+    generation_target_check: Optional[GenerationTargetCheck] = None,
 ) -> str:
     """Format the profiling results as a human-readable report."""
     lines: List[str] = []
@@ -1255,6 +1410,36 @@ def format_human_output(
                         "  --> Throughput maintained: scaling is near-linear"
                     )
 
+        lines.append("")
+
+    # ── Deep decode profile ───────────────────────────────────────────
+    deep_profiles = [
+        r for r in results
+        if r.status == "OK" and isinstance(r.generation_profile, dict) and r.generation_profile
+    ]
+    if deep_profiles:
+        lines.append("  " + "=" * 56)
+        lines.append("  GENERATION INTERNALS (DECODE)")
+        lines.append("  " + "=" * 56)
+        lines.append("")
+        header_dp = (
+            f"  {'Seq Len':>8} | {'Decode tok/s':>12} | {'Shared prefill':>14} | "
+            f"{'Avg active B':>12} | {'Compacts':>9} | {'Fallback':>9}"
+        )
+        lines.append(header_dp)
+        lines.append("  " + "-" * len(header_dp.strip()))
+        for r in deep_profiles:
+            gp = r.generation_profile or {}
+            decode_tps = gp.get("decode_tps", 0.0)
+            shared_prefill = gp.get("shared_prefill_used", 0.0)
+            avg_active = gp.get("avg_active_batch", 0.0)
+            compacts = gp.get("compact_events", 0.0)
+            fallback_steps = gp.get("fallback_decode_steps", 0.0)
+            lines.append(
+                f"  {r.seq_length:>8} | {decode_tps:>11.1f} | "
+                f"{shared_prefill:>13.0%} | {avg_active:>11.2f} | "
+                f"{compacts:>8.1f} | {fallback_steps:>8.1f}"
+            )
         lines.append("")
 
     # Extrapolation table
@@ -1443,6 +1628,33 @@ def format_human_output(
         for target in recommendation.optimization_targets:
             lines.append(f"    -> {target}")
 
+    if generation_target_check is not None and generation_target_check.enabled:
+        lines.append("")
+        lines.append("  GENERATION TARGET CHECK")
+        lines.append("  " + "-" * 25)
+        status = "PASS" if generation_target_check.passed else "FAIL"
+        lines.append(f"  Status: {status}")
+        if generation_target_check.evaluated_seq_length is not None:
+            lines.append(
+                f"  Evaluated seq_length: {generation_target_check.evaluated_seq_length}"
+            )
+        if generation_target_check.observed_gen_tps is not None:
+            lines.append(
+                f"  Observed gen_tps: {generation_target_check.observed_gen_tps:.1f}"
+            )
+        if generation_target_check.observed_gen_fraction is not None:
+            lines.append(
+                "  Observed generation fraction: "
+                f"{generation_target_check.observed_gen_fraction:.1%}"
+            )
+        if generation_target_check.observed_gen_time_s is not None:
+            lines.append(
+                "  Observed generation seconds/step: "
+                f"{generation_target_check.observed_gen_time_s:.2f}s"
+            )
+        for failure in generation_target_check.failures:
+            lines.append(f"    -> {failure}")
+
     lines.append("=" * 60)
     lines.append("")
 
@@ -1466,6 +1678,7 @@ def build_json_output(
     calibration_scale: Optional[float] = None,
     calibration_diagnostics: Optional[Dict[str, Any]] = None,
     oom_boundaries: Optional[Dict[int, int]] = None,
+    generation_target_check: Optional[GenerationTargetCheck] = None,
 ) -> Dict[str, Any]:
     """Build the machine-readable JSON output."""
     out: Dict[str, Any] = {
@@ -1492,6 +1705,8 @@ def build_json_output(
         out["empirical_oom_boundaries"] = oom_boundaries
     if optimal_configs:
         out["optimal_configs"] = [asdict(oc) for oc in optimal_configs]
+    if generation_target_check is not None:
+        out["generation_target_check"] = asdict(generation_target_check)
     # gradient_checkpointing is surfaced via ProfileConfig → run_profile header
     return out
 
@@ -1499,8 +1714,8 @@ def build_json_output(
 # ── Main pipeline ────────────────────────────────────────────────────────────
 
 
-def run_profile(config: ProfileConfig) -> None:
-    """Execute the full profiling pipeline."""
+def run_profile(config: ProfileConfig) -> int:
+    """Execute the full profiling pipeline and return a process exit code."""
 
     # 1. Hardware detection
     print("Detecting hardware...")
@@ -1614,6 +1829,7 @@ def run_profile(config: ProfileConfig) -> None:
             problems=problems,
             prompts=prompts,
             timeout=config.timeout_per_step,
+            profile_generation_internals=config.profile_generation_internals,
         )
         results.append(result)
 
@@ -1670,6 +1886,7 @@ def run_profile(config: ProfileConfig) -> None:
     recommendation = build_recommendation(
         results, total_memory_gb, config.reference_run_steps, bottleneck_analyses
     )
+    generation_target_check = evaluate_generation_target(config, results)
 
     # 7. Output
     if config.json_output:
@@ -1690,6 +1907,7 @@ def run_profile(config: ProfileConfig) -> None:
             calibration_scale=cal_scale,
             calibration_diagnostics=cal_diag,
             oom_boundaries=oom_boundaries,
+            generation_target_check=generation_target_check,
         )
         json_str = json.dumps(output, indent=2)
 
@@ -1720,6 +1938,7 @@ def run_profile(config: ProfileConfig) -> None:
             calibration_scale=cal_scale,
             calibration_diagnostics=cal_diag,
             oom_boundaries=oom_boundaries,
+            generation_target_check=generation_target_check,
         )
         print(report)
 
@@ -1728,6 +1947,16 @@ def run_profile(config: ProfileConfig) -> None:
             out_path.parent.mkdir(parents=True, exist_ok=True)
             out_path.write_text(report)
             print(f"Report saved to {out_path}")
+
+    if generation_target_check.enabled and not generation_target_check.passed:
+        print("\nGeneration target check: FAIL")
+        if config.fail_on_target_miss:
+            print("Exiting with code 2 due to --fail-on-target-miss")
+            return 2
+    elif generation_target_check.enabled:
+        print("\nGeneration target check: PASS")
+
+    return 0
 
 
 # ── CLI ──────────────────────────────────────────────────────────────────────
@@ -1743,6 +1972,8 @@ Examples:
   uv run python experiments/profile_hardware.py --quick
   uv run python experiments/profile_hardware.py --json --output results/hw.json
   uv run python experiments/profile_hardware.py --max-seq-lengths 256 512 1024 2048 4096
+  uv run python experiments/profile_hardware.py --target-gen-tps-min 250 --target-seq-length 512
+  uv run python experiments/profile_hardware.py --quick --profile-generation-internals
         """,
     )
     parser.add_argument(
@@ -1818,7 +2049,62 @@ Examples:
         default=600.0,
         help="Timeout per probe step in seconds (default: %(default)s)",
     )
+    parser.add_argument(
+        "--profile-generation-internals",
+        action="store_true",
+        help=(
+            "Enable deep decode-internal profiling (prefill/decode/compaction/cache "
+            "metrics) for non-quantized generation optimization."
+        ),
+    )
+    parser.add_argument(
+        "--target-seq-length",
+        type=int,
+        default=None,
+        help=(
+            "Seq length at which generation targets are evaluated. "
+            "Default: largest successful probe."
+        ),
+    )
+    parser.add_argument(
+        "--target-gen-tps-min",
+        type=float,
+        default=None,
+        help="Minimum generation tokens/sec target.",
+    )
+    parser.add_argument(
+        "--target-gen-fraction-max",
+        type=float,
+        default=None,
+        help=(
+            "Maximum allowed generation fraction of end-to-end step time "
+            "(0..1)."
+        ),
+    )
+    parser.add_argument(
+        "--target-gen-time-max-s",
+        type=float,
+        default=None,
+        help="Maximum allowed generation seconds per step.",
+    )
+    parser.add_argument(
+        "--fail-on-target-miss",
+        action="store_true",
+        help="Exit with code 2 when generation targets are enabled and missed.",
+    )
     args = parser.parse_args()
+
+    if (
+        args.target_gen_fraction_max is not None
+        and not (0.0 <= args.target_gen_fraction_max <= 1.0)
+    ):
+        parser.error("--target-gen-fraction-max must be in [0, 1].")
+    if args.target_gen_tps_min is not None and args.target_gen_tps_min <= 0:
+        parser.error("--target-gen-tps-min must be > 0.")
+    if args.target_gen_time_max_s is not None and args.target_gen_time_max_s <= 0:
+        parser.error("--target-gen-time-max-s must be > 0.")
+    if args.target_seq_length is not None and args.target_seq_length <= 0:
+        parser.error("--target-seq-length must be > 0.")
 
     cfg = ProfileConfig(
         model_id=args.model,
@@ -1832,6 +2118,12 @@ Examples:
         output_path=args.output,
         reference_run_steps=args.reference_steps,
         timeout_per_step=args.timeout,
+        target_seq_length=args.target_seq_length,
+        target_gen_tps_min=args.target_gen_tps_min,
+        target_gen_fraction_max=args.target_gen_fraction_max,
+        target_gen_time_max_s=args.target_gen_time_max_s,
+        fail_on_target_miss=args.fail_on_target_miss,
+        profile_generation_internals=args.profile_generation_internals,
     )
 
-    run_profile(cfg)
+    sys.exit(run_profile(cfg))

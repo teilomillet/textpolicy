@@ -215,6 +215,12 @@ class RolloutCoordinator:
         if hasattr(self, "runner"):
             self.runner.reset_timing()
 
+    def get_rollout_generation_profile(self) -> dict:
+        """Return decode-internal generation profile from the runner."""
+        if hasattr(self, "runner"):
+            return self.runner.get_generation_profile()
+        return {}
+
     def close(self):
         """Cleanup resources."""
         if self.workers:

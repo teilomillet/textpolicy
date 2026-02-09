@@ -61,6 +61,7 @@ class RolloutRunner:
         self.buffer = Buffer(max_episodes=self._buffer_capacity)
         self.step_count = 0  # Track total steps collected for test compatibility
         self._timer: Optional[Timer] = Timer() if profile else None
+        self._generation_profiles: List[Dict[str, float]] = []
 
     def _normalize_step_result(self, step_result):
         """
@@ -127,6 +128,7 @@ class RolloutRunner:
         if timer is not None:
             timer.reset()
             timer.start("total")
+        self._generation_profiles = []
 
         # Use a fresh buffer per collect() so repeated calls do not leak or mutate
         # previously returned buffers.
@@ -346,6 +348,7 @@ class RolloutRunner:
         if timer is not None:
             timer.reset()
             timer.start("total")
+        self._generation_profiles = []
 
         self.buffer = Buffer(max_episodes=self._buffer_capacity)
         steps_remaining = self.max_steps
@@ -371,6 +374,16 @@ class RolloutRunner:
                 timer.start("generation")
             prompt_obs_list = [mx.array(obs) for obs in obs_batch]
             results = batched_policy_fn(prompt_obs_list)
+            last_decode_profile = getattr(
+                batched_policy_fn, "_tp_last_decode_profile", None
+            )
+            if isinstance(last_decode_profile, dict):
+                numeric_profile: Dict[str, float] = {}
+                for key, value in last_decode_profile.items():
+                    if isinstance(value, (int, float)):
+                        numeric_profile[key] = float(value)
+                if numeric_profile:
+                    self._generation_profiles.append(numeric_profile)
             if timer is not None:
                 # Force lazy MLX arrays to evaluate so generation cost isn't
                 # leaked into env_step or buffer_store phases.
@@ -464,3 +477,15 @@ class RolloutRunner:
         """Reset timing accumulators (call per step to avoid unbounded growth)."""
         if self._timer is not None:
             self._timer.reset()
+        self._generation_profiles = []
+
+    def get_generation_profile(self) -> Dict[str, float]:
+        """Return averaged decode-internal generation profile for last collect."""
+        if not self._generation_profiles:
+            return {}
+        totals: Dict[str, float] = {}
+        for profile in self._generation_profiles:
+            for key, value in profile.items():
+                totals[key] = totals.get(key, 0.0) + float(value)
+        count = float(len(self._generation_profiles))
+        return {key: val / count for key, val in totals.items()}

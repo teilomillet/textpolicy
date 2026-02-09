@@ -359,6 +359,31 @@ class TestBatchedRollout:
         buffer = runner.collect_batched(batched_policy, batch_size=1)
         assert len(buffer.episodes) == 3
 
+    def test_collect_batched_exposes_generation_profile(self):
+        model = _TinyLM()
+        tok = _DummyTokenizer()
+        env = _SingleTurnEnv()
+        runner = RolloutRunner(
+            env,
+            policy=_dummy_policy,
+            strategy=create_strategy("grpo"),
+            max_steps=3,
+            profile=True,
+        )
+        batched_policy = create_batched_policy(
+            model,
+            tok,
+            {
+                "max_tokens": 3,
+                "temperature": 0.0,
+                "profile_decode_stats": True,
+            },
+        )
+        _ = runner.collect_batched(batched_policy, batch_size=2)
+        gen_profile = runner.get_generation_profile()
+        assert "decode_tps" in gen_profile
+        assert "shared_prefill_used" in gen_profile
+
 
 @pytest.mark.unit
 class TestGreedyDeterminismAndParity:
@@ -560,6 +585,159 @@ def test_create_batched_policy_forwards_repetition_penalty():
         assert kwargs.get("repetition_penalty") == 1.3, (
             "repetition_penalty was not forwarded to batch_generate_tokens"
         )
+
+
+@pytest.mark.unit
+def test_batch_generate_tokens_unknown_backend_raises():
+    model = _TinyLM()
+    tok = _DummyTokenizer()
+    prompts = [mx.array([3, 4], dtype=mx.int32)]
+    with pytest.raises(ValueError, match="Unknown batched decode backend"):
+        batch_generate_tokens(
+            model,
+            tok,
+            prompts,
+            max_tokens=2,
+            temperature=0.0,
+            backend="does-not-exist",
+        )
+
+
+@pytest.mark.unit
+def test_custom_batched_decode_backend_dispatch():
+    calls = {"count": 0}
+    backend_name = "unit-test-backend"
+
+    def _backend(
+        model,  # noqa: ARG001
+        tokenizer,  # noqa: ARG001
+        prompt_token_lists,
+        max_tokens,  # noqa: ARG001
+        temperature,  # noqa: ARG001
+        top_p,  # noqa: ARG001
+        repetition_penalty,  # noqa: ARG001
+        repetition_context_size,  # noqa: ARG001
+    ):
+        calls["count"] += 1
+        return [
+            (
+                mx.array([9], dtype=mx.int32),
+                {"logprob": mx.array([-0.1], dtype=mx.float32)},
+            )
+            for _ in prompt_token_lists
+        ]
+
+    mlx_generation.register_batched_decode_backend(backend_name, _backend)
+    model = _TinyLM()
+    tok = _DummyTokenizer()
+    prompts = [
+        mx.array([3, 4], dtype=mx.int32),
+        mx.array([5, 6], dtype=mx.int32),
+    ]
+    out = batch_generate_tokens(
+        model,
+        tok,
+        prompts,
+        max_tokens=3,
+        temperature=0.0,
+        backend=backend_name,
+    )
+
+    assert calls["count"] == 1
+    assert len(out) == 2
+    for resp, info in out:
+        assert resp.tolist() == [9]
+        assert info["logprob"].tolist() == pytest.approx([-0.1], abs=1e-6)
+
+
+@pytest.mark.unit
+def test_create_batched_policy_forwards_decode_backend():
+    calls = {"count": 0}
+    backend_name = "unit-test-policy-backend"
+
+    def _backend(
+        model,  # noqa: ARG001
+        tokenizer,  # noqa: ARG001
+        prompt_token_lists,
+        max_tokens,  # noqa: ARG001
+        temperature,  # noqa: ARG001
+        top_p,  # noqa: ARG001
+        repetition_penalty,  # noqa: ARG001
+        repetition_context_size,  # noqa: ARG001
+    ):
+        calls["count"] += 1
+        return [
+            (
+                mx.array([7], dtype=mx.int32),
+                {"logprob": mx.array([-0.2], dtype=mx.float32)},
+            )
+            for _ in prompt_token_lists
+        ]
+
+    mlx_generation.register_batched_decode_backend(backend_name, _backend)
+
+    model = _TinyLM()
+    tok = _DummyTokenizer()
+    policy = create_batched_policy(
+        model,
+        tok,
+        generation_params={
+            "max_tokens": 2,
+            "temperature": 0.0,
+            "decode_backend": backend_name,
+        },
+    )
+
+    results = policy([mx.array([3, 4], dtype=mx.int32)])
+    assert calls["count"] == 1
+    assert results[0][0].tolist() == [7]
+
+
+@pytest.mark.unit
+def test_batch_generate_tokens_profile_collector_populated():
+    model = _TinyLM()
+    tok = _DummyTokenizer()
+    profile = {}
+    _ = batch_generate_tokens(
+        model,
+        tok,
+        [mx.array([3, 4], dtype=mx.int32)],
+        max_tokens=3,
+        temperature=0.0,
+        profile_collector=profile,
+    )
+    expected_keys = {
+        "prefill_s",
+        "decode_s",
+        "total_s",
+        "decode_tps",
+        "tokens_generated",
+        "shared_prefill_used",
+        "used_cache",
+        "avg_active_batch",
+    }
+    assert expected_keys.issubset(profile.keys()), (
+        f"Missing decode profile keys: {expected_keys - set(profile.keys())}"
+    )
+
+
+@pytest.mark.unit
+def test_create_batched_policy_sets_last_decode_profile_when_enabled():
+    model = _TinyLM()
+    tok = _DummyTokenizer()
+    policy = create_batched_policy(
+        model,
+        tok,
+        generation_params={
+            "max_tokens": 2,
+            "temperature": 0.0,
+            "profile_decode_stats": True,
+        },
+    )
+    _ = policy([mx.array([3, 4], dtype=mx.int32)])
+    profile = getattr(policy, "_tp_last_decode_profile", None)
+    assert isinstance(profile, dict)
+    assert "decode_tps" in profile
 
 
 class _NarrowGapModel:

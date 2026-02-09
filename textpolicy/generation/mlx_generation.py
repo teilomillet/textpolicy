@@ -14,6 +14,7 @@ Key functions:
 
 from __future__ import annotations
 import importlib
+import time
 from typing import Dict, List, Optional, Tuple, Any, Callable
 import mlx.core as mx
 import mlx.nn as nn
@@ -30,6 +31,33 @@ try:
 except ImportError:
     make_sampler = None
     make_logits_processors = None
+
+
+# Batched decode backend extension point.
+BatchedGenerationOutput = List[Tuple[mx.array, Dict[str, mx.array]]]
+BatchedDecodeBackend = Callable[
+    [nn.Module, Any, List[mx.array], int, float, float, Optional[float], int],
+    BatchedGenerationOutput,
+]
+_BATCHED_DECODE_BACKENDS: Dict[str, BatchedDecodeBackend] = {}
+
+
+def register_batched_decode_backend(
+    name: str,
+    backend_fn: BatchedDecodeBackend,
+) -> None:
+    """Register a batched decode backend by name."""
+    key = str(name).strip().lower()
+    if not key:
+        raise ValueError("backend name must be a non-empty string.")
+    if not callable(backend_fn):
+        raise TypeError("backend_fn must be callable.")
+    _BATCHED_DECODE_BACKENDS[key] = backend_fn
+
+
+def list_batched_decode_backends() -> List[str]:
+    """Return sorted names of available batched decode backends."""
+    return sorted(_BATCHED_DECODE_BACKENDS.keys())
 
 
 def _get_eos_configs_for_model(
@@ -1019,7 +1047,7 @@ def _model_forward_with_optional_mask_and_cache(
     return model(input_tokens), False
 
 
-def batch_generate_tokens(
+def _batch_generate_tokens_mlx(
     model: nn.Module,
     tokenizer: Any,
     prompt_token_lists: List[mx.array],
@@ -1028,7 +1056,8 @@ def batch_generate_tokens(
     top_p: float = 0.9,
     repetition_penalty: Optional[float] = None,
     repetition_context_size: int = 20,
-) -> List[Tuple[mx.array, Dict[str, mx.array]]]:
+    profile_collector: Optional[Dict[str, float]] = None,
+) -> BatchedGenerationOutput:
     """Generate responses for multiple prompts in a single batched pass.
 
     This bypasses ``stream_generate`` and operates on the model directly,
@@ -1066,6 +1095,17 @@ def batch_generate_tokens(
         ``response_tokens`` includes EOS tokens when sampled; no tokens are
         emitted after EOS for a finished sequence.
     """
+    profile_on = profile_collector is not None
+    total_t0 = time.perf_counter() if profile_on else 0.0
+    prefill_s = 0.0
+    decode_s = 0.0
+    package_s = 0.0
+    decode_steps = 0
+    active_batch_area = 0.0
+    compact_events = 0
+    cache_decode_steps = 0
+    fallback_decode_steps = 0
+
     if repetition_penalty is not None and repetition_penalty <= 0:
         raise ValueError(
             f"repetition_penalty must be a positive float, got {repetition_penalty}"
@@ -1115,6 +1155,7 @@ def batch_generate_tokens(
     )
 
     shared_prefill_ok = False  # tracks whether single-stream prefill succeeded
+    prefill_t0 = time.perf_counter() if profile_on else 0.0
     if all_same_prompt and cache_obj is not None:
         # Prefill with batch_size=1 — single prompt, no padding needed.
         single_prompt = prompts[0][None]  # [1, prompt_len]
@@ -1157,6 +1198,8 @@ def batch_generate_tokens(
             model, prompt_batch, mask=prefill_mask, cache_obj=cache_obj,
         )
         next_logits = prefill_logits[:, max_prompt_len - 1, :]  # [B, vocab]
+    if profile_on:
+        prefill_s = time.perf_counter() - prefill_t0
 
     # 3) Decode loop with batch compaction (Opt 4).
     # When sequences hit EOS, they are removed from the active batch,
@@ -1187,8 +1230,11 @@ def batch_generate_tokens(
     if use_rep_penalty:
         rep_ctx: List[List[int]] = [list(p) for p in prompt_token_lists_py]
 
+    decode_t0 = time.perf_counter() if profile_on else 0.0
     for decode_step in range(max_tokens):
         active_size = len(active_to_orig)
+        decode_steps += 1
+        active_batch_area += float(active_size)
         arange_active = mx.arange(active_size)
 
         # Logprobs from unscaled logits (matches _simple_generate convention).
@@ -1259,6 +1305,7 @@ def batch_generate_tokens(
         # Save feed tokens before compaction remaps indices.
         feed_by_orig: Dict[int, int] = {}
         if newly_finished_ai and _can_compact:
+            compact_events += 1
             keep_ai = [
                 ai for ai in range(active_size)
                 if active_to_orig[ai] not in finished_orig
@@ -1284,6 +1331,7 @@ def batch_generate_tokens(
         active_size = len(active_to_orig)
 
         if used_cache:
+            cache_decode_steps += 1
             # Cache-backed one-token decode.
             feed_tokens = [
                 feed_by_orig.get(oi, pad_id) for oi in active_to_orig
@@ -1307,6 +1355,7 @@ def batch_generate_tokens(
             )
             next_logits = step_logits[:, -1, :]
         else:
+            fallback_decode_steps += 1
             # Fallback for tiny models that do not implement cache:
             # rebuild full sequences for active sequences only.
             for oi in active_to_orig:
@@ -1341,9 +1390,12 @@ def batch_generate_tokens(
                 mx.array(lengths, dtype=mx.int32) - 1,
                 :,
             ]
+    if profile_on:
+        decode_s = time.perf_counter() - decode_t0
 
     # 5) Package results — per-sequence logprob accumulation.
-    results: List[Tuple[mx.array, Dict[str, mx.array]]] = []
+    package_t0 = time.perf_counter() if profile_on else 0.0
+    results: BatchedGenerationOutput = []
     for i in range(batch_size):
         n_tokens = len(per_seq_tokens[i])
         tokens = (
@@ -1357,7 +1409,99 @@ def batch_generate_tokens(
             else mx.array([], dtype=mx.float32)
         )
         results.append((tokens, {"logprob": logprobs}))
+    if profile_on:
+        package_s = time.perf_counter() - package_t0
+        total_s = time.perf_counter() - total_t0
+        tokens_total = float(sum(len(x) for x in per_seq_tokens))
+        decode_tps = tokens_total / decode_s if decode_s > 0 else 0.0
+        total_tps = tokens_total / total_s if total_s > 0 else 0.0
+        avg_active_batch = (
+            active_batch_area / float(max(decode_steps, 1))
+        )
+        profile_collector.clear()
+        profile_collector.update(
+            {
+                "backend_mlx": 1.0,
+                "batch_size": float(batch_size),
+                "prompt_len_mean": float(sum(prompt_lengths) / max(batch_size, 1)),
+                "prompt_len_max": float(max_prompt_len),
+                "all_same_prompt": 1.0 if all_same_prompt else 0.0,
+                "shared_prefill_used": 1.0 if shared_prefill_ok else 0.0,
+                "used_cache": 1.0 if used_cache else 0.0,
+                "prefill_s": float(prefill_s),
+                "decode_s": float(decode_s),
+                "package_s": float(package_s),
+                "total_s": float(total_s),
+                "tokens_generated": float(tokens_total),
+                "decode_tps": float(decode_tps),
+                "total_tps": float(total_tps),
+                "decode_steps": float(decode_steps),
+                "avg_active_batch": float(avg_active_batch),
+                "compact_events": float(compact_events),
+                "cache_decode_steps": float(cache_decode_steps),
+                "fallback_decode_steps": float(fallback_decode_steps),
+                "repetition_penalty_enabled": (
+                    1.0 if use_rep_penalty else 0.0
+                ),
+            }
+        )
     return results
+
+
+# Register the built-in MLX decode backend.
+register_batched_decode_backend("mlx", _batch_generate_tokens_mlx)
+
+
+def batch_generate_tokens(
+    model: nn.Module,
+    tokenizer: Any,
+    prompt_token_lists: List[mx.array],
+    max_tokens: int = 50,
+    temperature: float = 0.7,
+    top_p: float = 0.9,
+    repetition_penalty: Optional[float] = None,
+    repetition_context_size: int = 20,
+    backend: str = "mlx",
+    profile_collector: Optional[Dict[str, float]] = None,
+) -> BatchedGenerationOutput:
+    """Generate responses for multiple prompts via a named decode backend.
+
+    The default backend (``"mlx"``) preserves existing behavior. Additional
+    backends can be plugged in via ``register_batched_decode_backend`` to
+    support experimental decode strategies (e.g., quantized/speculative)
+    without changing rollout/trainer call sites.
+    """
+    backend_key = str(backend).strip().lower()
+    backend_fn = _BATCHED_DECODE_BACKENDS.get(backend_key)
+    if backend_fn is None:
+        available = ", ".join(list_batched_decode_backends()) or "<none>"
+        raise ValueError(
+            f"Unknown batched decode backend {backend!r}. "
+            f"Available backends: {available}."
+        )
+    if backend_key == "mlx":
+        return _batch_generate_tokens_mlx(
+            model,
+            tokenizer,
+            prompt_token_lists,
+            max_tokens,
+            temperature,
+            top_p,
+            repetition_penalty,
+            repetition_context_size,
+            profile_collector=profile_collector,
+        )
+
+    return backend_fn(
+        model,
+        tokenizer,
+        prompt_token_lists,
+        max_tokens,
+        temperature,
+        top_p,
+        repetition_penalty,
+        repetition_context_size,
+    )
 
 
 def create_batched_policy(
@@ -1379,6 +1523,11 @@ def create_batched_policy(
         model: Causal language model.
         tokenizer: Tokenizer with chat template support.
         generation_params: Generation parameters (max_tokens, temperature, …).
+            Optional ``decode_backend`` selects a registered batched decode
+            backend (default ``"mlx"``).
+            Optional ``profile_decode_stats=True`` collects decode-internal
+            profiling stats for the last call on
+            ``batched_policy_fn._tp_last_decode_profile``.
 
     Returns:
         Function ``(List[mx.array]) -> List[(response_tokens, info)]``.
@@ -1388,6 +1537,8 @@ def create_batched_policy(
     temperature = params.get("temperature", 0.8)
     top_p = params.get("top_p", 0.95)
     rep_penalty = params.get("repetition_penalty", None)
+    decode_backend = str(params.get("decode_backend", "mlx"))
+    profile_decode_stats = bool(params.get("profile_decode_stats", False))
 
     def batched_policy_fn(
         prompt_tokens_list: List[mx.array],
@@ -1399,7 +1550,10 @@ def create_batched_policy(
             for pt in prompt_tokens_list
         ]
         temp = 0.0 if deterministic else temperature
-        return batch_generate_tokens(
+        decode_profile: Optional[Dict[str, float]] = (
+            {} if profile_decode_stats else None
+        )
+        output = batch_generate_tokens(
             model=model,
             tokenizer=tokenizer,
             prompt_token_lists=processed,
@@ -1407,13 +1561,22 @@ def create_batched_policy(
             temperature=temp,
             top_p=top_p,
             repetition_penalty=rep_penalty,
+            backend=decode_backend,
+            profile_collector=decode_profile,
         )
+        setattr(
+            batched_policy_fn,
+            "_tp_last_decode_profile",
+            decode_profile if decode_profile else None,
+        )
+        return output
 
     # Attach metadata so rollout coordination can derive batched policy automatically.
     setattr(batched_policy_fn, "_tp_model", model)
     setattr(batched_policy_fn, "_tp_tokenizer", tokenizer)
     setattr(batched_policy_fn, "_tp_generation_params", dict(params))
     setattr(batched_policy_fn, "_tp_is_batched", True)
+    setattr(batched_policy_fn, "_tp_last_decode_profile", None)
     return batched_policy_fn
 
 
