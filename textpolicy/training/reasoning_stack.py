@@ -285,6 +285,8 @@ class _GTPOTransform:
         )
         self.hicra_gamma = hicra_gamma
         self.sepa_steps = sepa_steps
+        # HICRA is active when either mode is enabled.
+        self._hicra_enabled = (hicra_gamma > 0.0 or sepa_steps > 0)
 
     def _flatten_actions(self, batch_data: Dict[str, Any]) -> mx.array:
         episode_lengths = batch_data.get("episode_lengths")
@@ -303,9 +305,9 @@ class _GTPOTransform:
         """Eagerly compute planning_mask for compile-safe training.
 
         Called by the Trainer before ``mx.compile``-traced execution.
-        Short-circuits when HICRA fusion is disabled (``hicra_gamma == 0``).
+        Short-circuits when HICRA fusion is disabled.
         """
-        if self.hicra_gamma == 0.0 or self.tokenizer is None or not self.grams:
+        if not self._hicra_enabled or self.tokenizer is None or not self.grams:
             return
         if batch_data.get("planning_mask") is not None:
             return
@@ -344,7 +346,7 @@ class _GTPOTransform:
         )
 
         # Optional HICRA fusion: modify entropies using planning token mask
-        if self.hicra_gamma > 0.0 and self.tokenizer is not None:
+        if self._hicra_enabled and self.tokenizer is not None:
             planning_mask = batch_data.get("planning_mask")
             if planning_mask is None:
                 # On-demand computation (mirrors _GTPOHICRATransform pattern).
@@ -471,7 +473,7 @@ def build_gtpo_transform(
             ),
         )
 
-        # SEPA mode (anneals over 500 steps)
+        # SEPA mode (anneals over 500 steps, hicra_gamma not needed)
         trainer = Trainer(
             model=model,
             advantage_fn=grpo.compute_advantages,
@@ -479,7 +481,7 @@ def build_gtpo_transform(
             optimizer=optimizer,
             advantage_transform_fn=build_gtpo_transform(
                 alpha_1=1.0, alpha_2=0.1,
-                tokenizer=tokenizer, hicra_gamma=0.3,
+                tokenizer=tokenizer,
                 sepa_steps=500,
             ),
         )
@@ -489,20 +491,21 @@ def build_gtpo_transform(
         alpha_2: Entropy-shaped weight (default 0.1).
         reward_threshold: Threshold for O+/O- partition (default 0.5).
         eps: Numerical stability constant (Remark 2.1).
-        tokenizer: HF-compatible tokenizer (required when ``hicra_gamma > 0``).
+        tokenizer: HF-compatible tokenizer (required when HICRA is active).
         strategic_grams: Planning phrases for HICRA (defaults to built-in list
                         when tokenizer is provided).
-        hicra_gamma: Entropy boost factor for HICRA fusion (default 0.0 = disabled).
-                    In SEPA mode, any value > 0 enables pooling (magnitude unused).
+        hicra_gamma: Entropy boost factor for boost mode (default 0.0 = disabled).
+                    Ignored when ``sepa_steps > 0`` (SEPA replaces boost).
         sepa_steps: SEPA annealing horizon — number of training steps over
                    which λ anneals from 0 to 1 (default 0 = use boost mode).
+                   When > 0, SEPA is used and ``hicra_gamma`` is ignored.
 
     Returns:
         A callable ``(advantages, batch_data) -> advantages``.
 
     Raises:
         ValueError: If ``hicra_gamma < 0``, ``sepa_steps < 0``,
-                   or ``hicra_gamma > 0`` without tokenizer.
+                   or HICRA is active without tokenizer.
     """
     if alpha_1 < 0.0:
         raise ValueError(f"alpha_1 must be >= 0, got {alpha_1}.")
@@ -514,9 +517,20 @@ def build_gtpo_transform(
         raise ValueError(
             f"sepa_steps must be >= 0, got {sepa_steps}."
         )
+    if sepa_steps > 0 and tokenizer is None:
+        raise ValueError(
+            "sepa_steps > 0 requires a tokenizer for planning token identification."
+        )
     if hicra_gamma > 0.0 and tokenizer is None:
         raise ValueError(
             "hicra_gamma > 0 requires a tokenizer for planning token identification."
+        )
+    if sepa_steps > 0 and hicra_gamma > 0.0:
+        warnings.warn(
+            f"sepa_steps={sepa_steps} activates SEPA mode; "
+            f"hicra_gamma={hicra_gamma} is ignored (boost is not used "
+            f"when SEPA is active).",
+            stacklevel=2,
         )
 
     return _GTPOTransform(

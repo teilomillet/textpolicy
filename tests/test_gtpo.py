@@ -1842,6 +1842,72 @@ class TestSEPATransform:
         assert differs_from_start or differs_from_end, \
             "Intermediate λ should produce intermediate results"
 
+    def test_h11i_sepa_without_hicra_gamma(self):
+        """H11i: sepa_steps > 0 alone enables SEPA (no hicra_gamma needed)."""
+        from textpolicy.training.reasoning_stack import _GTPOTransform
+
+        tokenizer = _MockTokenizer({1: "let", 2: "me", 3: "think", 4: "x"})
+
+        transform = _GTPOTransform(
+            alpha_1=1.0, alpha_2=0.1,
+            tokenizer=tokenizer,
+            strategic_grams=["let me think"],
+            sepa_steps=100,  # no hicra_gamma
+        )
+
+        rewards = mx.array([1.0, 1.0, 0.0, 0.0])
+        episode_lengths = [3, 3, 3, 3]
+        token_entropies = mx.array([
+            2.0, 3.0, 1.0,
+            4.0, 1.0, 2.0,
+            3.0, 2.0, 1.0,
+            1.0, 3.0, 2.0,
+        ])
+        act = mx.array([[1, 2, 3], [4, 4, 4], [4, 4, 4], [4, 4, 4]])
+
+        batch = {
+            "rewards": rewards,
+            "token_entropies": token_entropies,
+            "episode_lengths": episode_lengths,
+            "act": act,
+            "step": 100,  # λ = 1.0
+        }
+        transform.prepare_batch(batch)
+
+        # Should compute planning mask and run SEPA
+        assert "planning_mask" in batch, "SEPA should compute planning mask"
+
+        advantages = mx.zeros((12,))
+        result = transform(advantages, batch)
+        mx.eval(result)
+
+        assert result.shape == (12,)
+        assert not mx.any(mx.isnan(result)).item()
+
+    def test_h11j_sepa_without_tokenizer_raises(self):
+        """H11j: sepa_steps > 0 without tokenizer raises ValueError."""
+        from textpolicy.training import build_gtpo_transform
+
+        with pytest.raises(ValueError, match="tokenizer"):
+            build_gtpo_transform(sepa_steps=500)
+
+    def test_h11k_sepa_with_gamma_warns(self):
+        """H11k: sepa_steps > 0 with hicra_gamma > 0 warns that gamma is ignored."""
+        import warnings as _warnings
+        from textpolicy.training import build_gtpo_transform
+
+        tokenizer = _MockTokenizer({1: "let", 2: "me", 3: "think"})
+
+        with _warnings.catch_warnings(record=True) as w:
+            _warnings.simplefilter("always")
+            build_gtpo_transform(
+                tokenizer=tokenizer,
+                hicra_gamma=0.3,
+                sepa_steps=500,
+            )
+            assert len(w) == 1
+            assert "ignored" in str(w[0].message).lower()
+
 
 if __name__ == "__main__":
     pytest.main([__file__, "-v"])
