@@ -2168,6 +2168,90 @@ class TestSEPATransform:
         with pytest.raises(ValueError, match="semantic_entropy"):
             build_gtpo_transform(semantic_entropy=True)
 
+    def test_h11t_hidden_state_mode_passes_embeddings_to_tracker(self):
+        """H11t: _GTPOTransform with hidden_states mode extracts from batch_data."""
+        from textpolicy.training.reasoning_stack import _GTPOTransform
+
+        tokenizer = _MockTokenizer({1: "let", 2: "me", 3: "think", 4: "alt"})
+        transform = _GTPOTransform(
+            alpha_1=1.0,
+            alpha_2=0.1,
+            tokenizer=tokenizer,
+            strategic_grams=["let me think"],
+            semantic_entropy=True,
+            semantic_entropy_ema_decay=0.0,
+            semantic_entropy_embedding_mode="hidden_states",
+        )
+
+        assert transform.needs_hidden_states is True
+
+        # 4 episodes, 3 response tokens each, hidden_dim=8
+        n_eps = 4
+        ep_len = 3
+        total_tokens = n_eps * ep_len
+        hidden_dim = 8
+
+        batch = {
+            "obs": mx.array([
+                [10, 11, 1, 2, 3],
+                [10, 11, 1, 2, 3],
+                [20, 21, 1, 2, 3],
+                [20, 21, 1, 4, 3],
+            ], dtype=mx.int32),
+            "act": mx.array([
+                [1, 2, 3],
+                [1, 2, 3],
+                [1, 2, 3],
+                [1, 4, 3],
+            ], dtype=mx.int32),
+            "logprob": mx.array([-1.0] * total_tokens, dtype=mx.float32),
+            "rewards": mx.array([1.0, 1.0, 1.0, 1.0], dtype=mx.float32),
+            "token_entropies": mx.array(
+                [2.0] * total_tokens, dtype=mx.float32,
+            ),
+            "episode_lengths": [ep_len] * n_eps,
+            "prompt_lengths": [2] * n_eps,
+            "step": 0,
+            # Flat response-aligned hidden states: [total_tokens, hidden_dim]
+            "hidden_states": mx.random.normal((total_tokens, hidden_dim)),
+        }
+
+        transform.prepare_batch(batch)
+        transformed = transform(mx.zeros((total_tokens,), dtype=mx.float32), batch)
+        mx.eval(transformed)
+        transform.postprocess_batch(batch)
+
+        stats = batch.get("semantic_entropy_stats")
+        assert isinstance(stats, dict)
+        assert stats["semantic_entropy_batch"] >= 0.0
+
+    def test_h11u_hidden_state_mode_without_semantic_entropy_raises(self):
+        """H11u: embedding_mode='hidden_states' without semantic_entropy raises."""
+        from textpolicy.training import build_gtpo_transform
+
+        tokenizer = _MockTokenizer({1: "let", 2: "me", 3: "think"})
+        with pytest.raises(ValueError, match="semantic_entropy_embedding_mode"):
+            build_gtpo_transform(
+                tokenizer=tokenizer,
+                semantic_entropy=False,
+                semantic_entropy_embedding_mode="hidden_states",
+            )
+
+    def test_h11v_hash_mode_does_not_need_hidden_states(self):
+        """H11v: Default hash mode does not set needs_hidden_states."""
+        from textpolicy.training.reasoning_stack import _GTPOTransform
+
+        tokenizer = _MockTokenizer({1: "let", 2: "me", 3: "think"})
+        transform = _GTPOTransform(
+            alpha_1=1.0,
+            alpha_2=0.1,
+            tokenizer=tokenizer,
+            strategic_grams=["let me think"],
+            semantic_entropy=True,
+            semantic_entropy_embedding_mode="hash",
+        )
+        assert transform.needs_hidden_states is False
+
 
 if __name__ == "__main__":
     pytest.main([__file__, "-v"])

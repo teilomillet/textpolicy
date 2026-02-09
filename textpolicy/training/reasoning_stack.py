@@ -34,6 +34,7 @@ from textpolicy.algorithms.hicra import (
 from textpolicy.training.semantic_entropy import (
     SemanticEntropyTracker,
     build_prompt_group_keys,
+    pool_planning_hidden_states,
 )
 from textpolicy.generation.lora import create_lora_setup
 from textpolicy.training.sepa import SEPAController, normalize_sepa_schedule
@@ -300,6 +301,7 @@ class _GTPOTransform:
         semantic_entropy_hash_bins: int = 256,
         semantic_entropy_positive_only: bool = True,
         semantic_entropy_on_stable: Optional[Callable[[Dict[str, float]], None]] = None,
+        semantic_entropy_embedding_mode: str = "hash",
     ) -> None:
         self.alpha_1 = alpha_1
         self.alpha_2 = alpha_2
@@ -338,6 +340,7 @@ class _GTPOTransform:
                 reward_threshold=reward_threshold,
                 eps=eps,
                 on_stable=semantic_entropy_on_stable,
+                embedding_mode=semantic_entropy_embedding_mode,
             )
         else:
             self._semantic_tracker = None
@@ -346,6 +349,19 @@ class _GTPOTransform:
         self._hicra_enabled = (hicra_gamma > 0.0 or self._sepa_enabled)
         self._needs_planning_mask = (
             self._hicra_enabled or self._semantic_tracker is not None
+        )
+
+    @property
+    def needs_hidden_states(self) -> bool:
+        """Whether the Trainer should capture hidden states for this transform.
+
+        Checked dynamically each train step (cheap bool check).  Returns True
+        only when the semantic-entropy tracker is configured to use
+        ``embedding_mode="hidden_states"``.
+        """
+        return (
+            self._semantic_tracker is not None
+            and self._semantic_tracker.embedding_mode == "hidden_states"
         )
 
     def _flatten_actions(self, batch_data: Dict[str, Any]) -> mx.array:
@@ -426,12 +442,27 @@ class _GTPOTransform:
             except ValueError:
                 prompt_keys = None
 
+        # Extract planning embeddings from hidden states when available.
+        planning_embeds = None
+        if self.needs_hidden_states:
+            hs = batch_data.get("hidden_states")
+            flat_mask = _flatten_padded_token_rows(
+                planning_mask,
+                episode_lengths,
+                field_name="planning_mask",
+            )
+            if hs is not None:
+                planning_embeds = pool_planning_hidden_states(
+                    hs, flat_mask, episode_lengths,
+                )
+
         semantic_stats = self._semantic_tracker.update(
             actions=actions,
             planning_mask=planning_mask,
             episode_lengths=episode_lengths,
             rewards=batch_data.get("rewards"),
             prompt_keys=prompt_keys,
+            planning_embeddings=planning_embeds,
         )
         if semantic_stats:
             batch_data["semantic_entropy_stats"] = semantic_stats
@@ -568,6 +599,7 @@ def build_gtpo_transform(
     sepa_steps: int = 0,
     sepa_schedule: str = "linear",
     semantic_entropy: bool = False,
+    semantic_entropy_embedding_mode: str = "hash",
 ) -> Callable[[mx.array, Dict[str, Any]], mx.array]:
     """
     Build a Trainer-compatible transform for GTPO (arXiv 2508.04349).
@@ -705,6 +737,11 @@ def build_gtpo_transform(
             "semantic_entropy=True requires a tokenizer for planning token "
             "identification."
         )
+    if semantic_entropy_embedding_mode == "hidden_states" and not semantic_entropy:
+        raise ValueError(
+            "semantic_entropy_embedding_mode='hidden_states' requires "
+            "semantic_entropy=True."
+        )
     if hicra_gamma > 0.0 and tokenizer is None:
         raise ValueError(
             "hicra_gamma > 0 requires a tokenizer for planning token identification."
@@ -729,6 +766,7 @@ def build_gtpo_transform(
         sepa_steps=sepa_steps,
         sepa_schedule=sepa_schedule,
         semantic_entropy=semantic_entropy,
+        semantic_entropy_embedding_mode=semantic_entropy_embedding_mode,
     )
 
 

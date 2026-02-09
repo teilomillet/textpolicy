@@ -15,6 +15,91 @@ from typing import Any, Callable, Dict, Hashable, List, Optional, Sequence, Tupl
 
 import mlx.core as mx  # type: ignore
 
+_VALID_EMBEDDING_MODES = ("hash", "hidden_states")
+
+
+def pool_planning_hidden_states(
+    hidden_states: mx.array,
+    planning_mask: mx.array,
+    episode_lengths: Sequence[int],
+    eps: float = 1e-8,
+) -> List[Optional[List[float]]]:
+    """Extract per-episode mean-pooled, L2-normalized planning embeddings.
+
+    For each episode, slices the response-aligned hidden states, applies the
+    planning mask, mean-pools over planning positions, and L2-normalizes.
+
+    Args:
+        hidden_states: Flat response-aligned ``[total_response_tokens,
+            hidden_dim]`` hidden states from the model backbone.  These must
+            already be aligned to response tokens (i.e. the prompt prefix has
+            been stripped during extraction in ``compute_logprobs_batched``).
+        planning_mask: Flat 1D ``[total_response_tokens]`` binary mask where
+            1.0 = planning token.
+        episode_lengths: Per-episode response token counts (sums to
+            ``hidden_states.shape[0]`` and ``planning_mask.shape[0]``).
+        eps: Numerical stability constant for L2 normalization.
+
+    Returns:
+        List of length ``len(episode_lengths)``.  Each entry is either a
+        ``List[float]`` embedding (L2-normalized) or ``None`` when the episode
+        has zero planning tokens.
+    """
+    if hidden_states.ndim != 2:
+        raise ValueError(
+            f"hidden_states must be 2D [total_response_tokens, hidden_dim], "
+            f"got {hidden_states.ndim}D."
+        )
+
+    total_tokens = int(hidden_states.shape[0])
+    expected_tokens = sum(int(l) for l in episode_lengths)
+    if total_tokens != expected_tokens:
+        raise ValueError(
+            f"hidden_states has {total_tokens} rows but "
+            f"sum(episode_lengths)={expected_tokens}."
+        )
+
+    mask_size = int(planning_mask.shape[0])
+    if mask_size != expected_tokens:
+        raise ValueError(
+            f"planning_mask has {mask_size} tokens but "
+            f"sum(episode_lengths)={expected_tokens}."
+        )
+
+    # Split flat planning_mask into per-episode segments.
+    mask_list = planning_mask.tolist()
+
+    results: List[Optional[List[float]]] = []
+    cursor = 0
+    for ep_len in episode_lengths:
+        ep_len = int(ep_len)
+        ep_mask = mask_list[cursor : cursor + ep_len]
+
+        count = sum(1 for m in ep_mask if float(m) > 0.5)
+        if count == 0:
+            results.append(None)
+            cursor += ep_len
+            continue
+
+        # Slice this episode's response-aligned hidden states: [ep_len, hidden_dim]
+        h = hidden_states[cursor : cursor + ep_len, :]
+        # Mask: [ep_len, 1] broadcast multiply
+        mask_arr = mx.array(ep_mask, dtype=h.dtype).reshape(-1, 1)
+        h_masked = h * mask_arr
+        # Mean pool over planning positions
+        mean_h = mx.sum(h_masked, axis=0) / float(count)
+        # L2 normalize
+        norm = mx.sqrt(mx.sum(mean_h * mean_h))
+        mx.eval(norm)
+        norm_val = norm.item()
+        if norm_val > eps:
+            mean_h = mean_h / norm
+        mx.eval(mean_h)
+        results.append(mean_h.tolist())
+        cursor += ep_len
+
+    return results
+
 
 def _to_episode_rows(
     values: mx.array,
@@ -126,6 +211,7 @@ class SemanticEntropyTracker:
         reward_threshold: float = 0.5,
         eps: float = 1e-8,
         on_stable: Optional[Callable[[Dict[str, float]], None]] = None,
+        embedding_mode: str = "hash",
     ) -> None:
         if not (0.0 <= ema_decay <= 1.0):
             raise ValueError(f"ema_decay must be in [0, 1], got {ema_decay}.")
@@ -141,6 +227,11 @@ class SemanticEntropyTracker:
             raise ValueError(f"hash_bins must be >= 2, got {hash_bins}.")
         if eps <= 0.0:
             raise ValueError(f"eps must be > 0, got {eps}.")
+        if embedding_mode not in _VALID_EMBEDDING_MODES:
+            raise ValueError(
+                f"embedding_mode must be one of {_VALID_EMBEDDING_MODES}, "
+                f"got {embedding_mode!r}."
+            )
 
         self.ema_decay = float(ema_decay)
         self.stability_tol = float(stability_tol)
@@ -150,6 +241,7 @@ class SemanticEntropyTracker:
         self.reward_threshold = float(reward_threshold)
         self.eps = float(eps)
         self.on_stable = on_stable
+        self.embedding_mode = embedding_mode
 
         self._ema: Optional[float] = None
         self._stable_steps: int = 0
@@ -205,9 +297,17 @@ class SemanticEntropyTracker:
         rewards: Optional[mx.array] = None,
         prompt_keys: Optional[Sequence[Hashable]] = None,
         group_ids: Optional[Sequence[Hashable]] = None,
+        planning_embeddings: Optional[Sequence[Optional[Sequence[float]]]] = None,
     ) -> Optional[Dict[str, float]]:
         """
         Update semantic-entropy statistics from one training batch.
+
+        Args:
+            planning_embeddings: Optional pre-computed per-episode embeddings
+                (e.g. from ``pool_planning_hidden_states``).  When provided and
+                ``embedding_mode="hidden_states"``, these replace the hash
+                embedding.  Each entry is a ``Sequence[float]`` or ``None``
+                (when an episode has no planning tokens).
 
         Returns:
             Dict of scalar stats or None when the batch has insufficient
@@ -226,15 +326,25 @@ class SemanticEntropyTracker:
                 f"({n_episodes})."
             )
 
-        planning_sequences: List[List[int]] = []
-        for tokens, mask in zip(action_rows, mask_rows):
-            planning_sequences.append(
-                [
-                    int(tok)
-                    for tok, m in zip(tokens, mask)
-                    if float(m) > 0.5
-                ]
-            )
+        # Determine whether to use hidden-state embeddings or hash fallback.
+        use_hidden_embeddings = (
+            self.embedding_mode == "hidden_states"
+            and planning_embeddings is not None
+            and len(planning_embeddings) == n_episodes
+        )
+
+        # Build hash-based planning sequences only when needed.
+        planning_sequences: Optional[List[List[int]]] = None
+        if not use_hidden_embeddings:
+            planning_sequences = []
+            for tokens, mask in zip(action_rows, mask_rows):
+                planning_sequences.append(
+                    [
+                        int(tok)
+                        for tok, m in zip(tokens, mask)
+                        if float(m) > 0.5
+                    ]
+                )
 
         usable_indices = list(range(n_episodes))
         if self.positive_only and rewards is not None:
@@ -276,8 +386,23 @@ class SemanticEntropyTracker:
         for indices in groups.values():
             if len(indices) < 2:
                 continue
-            embeds = [self._embed_planning_tokens(planning_sequences[i]) for i in indices]
-            dispersion = self._mean_pairwise_cosine_distance(embeds)
+
+            if use_hidden_embeddings:
+                assert planning_embeddings is not None  # for type checker
+                # Use pre-computed hidden-state embeddings; skip None entries.
+                embeds = [
+                    planning_embeddings[i]
+                    for i in indices
+                    if planning_embeddings[i] is not None
+                ]
+            else:
+                assert planning_sequences is not None  # for type checker
+                embeds = [
+                    self._embed_planning_tokens(planning_sequences[i])
+                    for i in indices
+                ]
+
+            dispersion = self._mean_pairwise_cosine_distance(embeds)  # type: ignore[arg-type]
             if dispersion is not None and math.isfinite(dispersion):
                 group_dispersions.append(dispersion)
 
@@ -331,6 +456,7 @@ class SemanticEntropyTracker:
             "positive_only": self.positive_only,
             "reward_threshold": self.reward_threshold,
             "eps": self.eps,
+            "embedding_mode": self.embedding_mode,
             "ema": self._ema,
             "stable_steps": self._stable_steps,
             "stability_fired": self._stability_fired,

@@ -30,7 +30,11 @@ from .gradient_checkpointing import (
     remove_gradient_checkpointing,
 )
 from .sepa import SEPAController, normalize_sepa_schedule
-from .semantic_entropy import SemanticEntropyTracker, build_prompt_group_keys
+from .semantic_entropy import (
+    SemanticEntropyTracker,
+    build_prompt_group_keys,
+    pool_planning_hidden_states,
+)
 
 __all__.extend(
     [
@@ -41,6 +45,7 @@ __all__.extend(
         "normalize_sepa_schedule",
         "SemanticEntropyTracker",
         "build_prompt_group_keys",
+        "pool_planning_hidden_states",
     ]
 )
 
