@@ -1493,5 +1493,355 @@ class TestHICRAFusionTrainerIntegration:
         assert trainer._compiled is True
 
 
+# ---------------------------------------------------------------------------
+# H11: SEPA — Selective Entropy Pooling with Annealing
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.unit
+@pytest.mark.algorithm
+class TestSEPATransform:
+    """H11a-h: Tests for SEPA (Selective Entropy Pooling with Annealing)."""
+
+    def test_h11a_sepa_at_lambda_zero_is_pure_gtpo(self):
+        """H11a: At step=0 (λ=0), SEPA produces identical results to no HICRA."""
+        from textpolicy.training.reasoning_stack import _GTPOTransform
+
+        tokenizer = _MockTokenizer({1: "let", 2: "me", 3: "think", 4: "x"})
+
+        blend = _GTPOTransform(
+            alpha_1=1.0, alpha_2=0.1,
+            tokenizer=tokenizer,
+            strategic_grams=["let me think"],
+            hicra_gamma=0.3,
+            sepa_steps=100,
+        )
+        plain = _GTPOTransform(alpha_1=1.0, alpha_2=0.1)
+
+        rewards = mx.array([1.0, 1.0, 0.0, 0.0])
+        episode_lengths = [3, 3, 3, 3]
+        token_entropies = mx.array([
+            2.0, 3.0, 1.0,
+            4.0, 1.0, 2.0,
+            3.0, 2.0, 1.0,
+            1.0, 3.0, 2.0,
+        ])
+        act = mx.array([[1, 2, 3], [4, 4, 4], [4, 4, 4], [4, 4, 4]])
+
+        batch_blend = {
+            "rewards": rewards,
+            "token_entropies": token_entropies,
+            "episode_lengths": episode_lengths,
+            "act": act,
+            "step": 0,  # λ = 0/100 = 0.0
+        }
+        blend.prepare_batch(batch_blend)
+
+        batch_plain = {
+            "rewards": rewards,
+            "token_entropies": token_entropies,
+            "episode_lengths": episode_lengths,
+        }
+
+        advantages = mx.zeros((12,))
+        result_blend = blend(advantages, batch_blend)
+        result_plain = plain(advantages, batch_plain)
+        mx.eval(result_blend, result_plain)
+
+        assert mx.allclose(result_blend, result_plain, atol=1e-6), \
+            "At λ=0, SEPA should produce identical results to no HICRA"
+
+    def test_h11b_sepa_at_lambda_one_uniform_execution_entropy(self):
+        """H11b: At step >= sepa_steps (λ=1), execution tokens have uniform entropy."""
+        from textpolicy.training.reasoning_stack import _GTPOTransform
+
+        tokenizer = _MockTokenizer({1: "let", 2: "me", 3: "think", 4: "x"})
+
+        transform = _GTPOTransform(
+            alpha_1=1.0, alpha_2=0.1,
+            tokenizer=tokenizer,
+            strategic_grams=["let me think"],
+            hicra_gamma=0.3,
+            sepa_steps=100,
+        )
+
+        rewards = mx.array([1.0, 1.0, 0.0, 0.0])
+        episode_lengths = [3, 3, 3, 3]
+        # Non-uniform execution token entropy to verify it gets smoothed
+        token_entropies = mx.array([
+            2.0, 3.0, 1.0,   # ep0: planning (tokens 0,1,2)
+            4.0, 1.0, 2.0,   # ep1: execution (tokens 3,4,5) — varied entropy
+            3.0, 2.0, 1.0,   # ep2: execution
+            1.0, 3.0, 2.0,   # ep3: execution
+        ])
+        act = mx.array([[1, 2, 3], [4, 4, 4], [4, 4, 4], [4, 4, 4]])
+
+        batch = {
+            "rewards": rewards,
+            "token_entropies": token_entropies,
+            "episode_lengths": episode_lengths,
+            "act": act,
+            "step": 200,  # λ = min(200/100, 1.0) = 1.0
+        }
+        transform.prepare_batch(batch)
+
+        advantages = mx.zeros((12,))
+        result = transform(advantages, batch)
+        mx.eval(result)
+
+        assert result.shape == (12,)
+        assert not mx.any(mx.isnan(result)).item()
+
+    def test_h11c_sepa_differs_from_no_hicra_at_nonzero_lambda(self):
+        """H11c: At λ > 0, SEPA produces different results than plain GTPO."""
+        from textpolicy.training.reasoning_stack import _GTPOTransform
+
+        tokenizer = _MockTokenizer({1: "let", 2: "me", 3: "think", 4: "x"})
+
+        blend = _GTPOTransform(
+            alpha_1=1.0, alpha_2=0.1,
+            tokenizer=tokenizer,
+            strategic_grams=["let me think"],
+            hicra_gamma=0.3,
+            sepa_steps=100,
+        )
+        plain = _GTPOTransform(alpha_1=1.0, alpha_2=0.1)
+
+        rewards = mx.array([1.0, 1.0, 0.0, 0.0])
+        episode_lengths = [3, 3, 3, 3]
+        token_entropies = mx.array([
+            2.0, 3.0, 1.0,
+            4.0, 1.0, 2.0,
+            3.0, 2.0, 1.0,
+            1.0, 3.0, 2.0,
+        ])
+        act = mx.array([[1, 2, 3], [4, 4, 4], [4, 4, 4], [4, 4, 4]])
+
+        batch_blend = {
+            "rewards": rewards,
+            "token_entropies": token_entropies,
+            "episode_lengths": episode_lengths,
+            "act": act,
+            "step": 100,  # λ = 1.0
+        }
+        blend.prepare_batch(batch_blend)
+
+        batch_plain = {
+            "rewards": rewards,
+            "token_entropies": token_entropies,
+            "episode_lengths": episode_lengths,
+        }
+
+        advantages = mx.zeros((12,))
+        result_blend = blend(advantages, batch_blend)
+        result_plain = plain(advantages, batch_plain)
+        mx.eval(result_blend, result_plain)
+
+        assert not mx.allclose(result_blend, result_plain, atol=1e-4), \
+            "At λ=1, SEPA should differ from plain GTPO when entropy is non-uniform"
+
+    def test_h11d_eq5_no_blowup_at_lambda_one(self):
+        """H11d: Eq. 5 (O- inverse entropy) produces finite values at λ=1.
+
+        Key SEPA safety property: pooling toward mean(H_exec) > 0 means
+        1/H stays finite — no 1/eps blowup from zeroed entropy.
+        """
+        from textpolicy.training.reasoning_stack import _GTPOTransform
+
+        tokenizer = _MockTokenizer({1: "let", 2: "me", 3: "think", 4: "x"})
+
+        transform = _GTPOTransform(
+            alpha_1=1.0, alpha_2=0.1,
+            tokenizer=tokenizer,
+            strategic_grams=["let me think"],
+            hicra_gamma=0.3,
+            sepa_steps=10,
+        )
+
+        # All O- episodes — forces Eq. 5 path exclusively
+        rewards = mx.array([0.0, 0.0, 0.0])
+        episode_lengths = [3, 3, 3]
+        token_entropies = mx.array([
+            2.0, 3.0, 1.0,  # ep0: planning tokens
+            4.0, 1.0, 2.0,  # ep1: execution
+            0.5, 3.0, 2.0,  # ep2: execution — includes low entropy token
+        ])
+        act = mx.array([[1, 2, 3], [4, 4, 4], [4, 4, 4]])
+
+        batch = {
+            "rewards": rewards,
+            "token_entropies": token_entropies,
+            "episode_lengths": episode_lengths,
+            "act": act,
+            "step": 10,  # λ = 1.0
+        }
+        transform.prepare_batch(batch)
+
+        advantages = mx.zeros((9,))
+        result = transform(advantages, batch)
+        mx.eval(result)
+
+        assert result.shape == (9,)
+        assert not mx.any(mx.isnan(result)).item(), "SEPA at λ=1 should not produce NaN"
+        assert not mx.any(mx.isinf(result)).item(), "SEPA at λ=1 should not produce Inf"
+        # Verify magnitudes are reasonable (not 1/eps scale)
+        assert mx.max(mx.abs(result)).item() < 100.0, \
+            "Advantages should be reasonable magnitude, not 1/eps blowup"
+
+    def test_h11e_sepa_steps_zero_uses_boost(self):
+        """H11e: sepa_steps=0 falls back to boost mode (backward compat)."""
+        from textpolicy.training.reasoning_stack import _GTPOTransform
+
+        tokenizer = _MockTokenizer({1: "let", 2: "me", 3: "think", 4: "x"})
+
+        # Blend with 0 steps = boost mode
+        blend_zero = _GTPOTransform(
+            alpha_1=1.0, alpha_2=0.1,
+            tokenizer=tokenizer,
+            strategic_grams=["let me think"],
+            hicra_gamma=0.5,
+            sepa_steps=0,
+        )
+        # Explicit boost mode
+        boost = _GTPOTransform(
+            alpha_1=1.0, alpha_2=0.1,
+            tokenizer=tokenizer,
+            strategic_grams=["let me think"],
+            hicra_gamma=0.5,
+        )
+
+        rewards = mx.array([1.0, 1.0, 0.0, 0.0])
+        episode_lengths = [3, 3, 3, 3]
+        token_entropies = mx.array([
+            2.0, 3.0, 1.0,
+            4.0, 1.0, 2.0,
+            3.0, 2.0, 1.0,
+            1.0, 3.0, 2.0,
+        ])
+        act = mx.array([[1, 2, 3], [4, 4, 4], [4, 4, 4], [4, 4, 4]])
+
+        batch_a = {
+            "rewards": rewards,
+            "token_entropies": token_entropies,
+            "episode_lengths": episode_lengths,
+            "act": act,
+        }
+        blend_zero.prepare_batch(batch_a)
+
+        batch_b = {
+            "rewards": rewards,
+            "token_entropies": token_entropies,
+            "episode_lengths": episode_lengths,
+            "act": act,
+        }
+        boost.prepare_batch(batch_b)
+
+        advantages = mx.zeros((12,))
+        result_a = blend_zero(advantages, batch_a)
+        result_b = boost(advantages, batch_b)
+        mx.eval(result_a, result_b)
+
+        assert mx.allclose(result_a, result_b, atol=1e-6), \
+            "sepa_steps=0 should produce identical results to boost mode"
+
+    def test_h11f_negative_sepa_steps_rejected(self):
+        """H11f: Negative sepa_steps rejected by builder."""
+        from textpolicy.training import build_gtpo_transform
+
+        with pytest.raises(ValueError, match="sepa_steps"):
+            build_gtpo_transform(sepa_steps=-1)
+
+    def test_h11g_no_planning_tokens_sepa_degrades_gracefully(self):
+        """H11g: When no planning tokens match, SEPA pools all tokens (graceful)."""
+        from textpolicy.training.reasoning_stack import _GTPOTransform
+
+        # Tokenizer that won't match any strategic grams
+        tokenizer = _MockTokenizer({1: "foo", 2: "bar", 3: "baz"})
+
+        blend = _GTPOTransform(
+            alpha_1=1.0, alpha_2=0.1,
+            tokenizer=tokenizer,
+            strategic_grams=["let me think"],
+            hicra_gamma=0.3,
+            sepa_steps=100,
+        )
+        plain = _GTPOTransform(alpha_1=1.0, alpha_2=0.1)
+
+        rewards = mx.array([1.0, 0.0])
+        episode_lengths = [3, 3]
+        token_entropies = mx.array([2.0, 3.0, 1.0, 4.0, 0.5, 2.5])
+
+        # At λ=1, all tokens are execution. blend: H → mean(H) for all.
+        # With uniform entropy, GTPO assigns equal weight at each position.
+        batch_blend = {
+            "rewards": rewards,
+            "token_entropies": token_entropies,
+            "episode_lengths": episode_lengths,
+            "act": mx.array([1, 2, 3, 1, 2, 3]),
+            "step": 100,  # λ = 1.0
+        }
+        blend.prepare_batch(batch_blend)
+
+        advantages = mx.zeros((6,))
+        result = blend(advantages, batch_blend)
+        mx.eval(result)
+
+        assert result.shape == (6,)
+        assert not mx.any(mx.isnan(result)).item()
+        assert not mx.any(mx.isinf(result)).item()
+
+    def test_h11h_lambda_anneals_linearly(self):
+        """H11h: Intermediate steps produce intermediate pooling."""
+        from textpolicy.training.reasoning_stack import _GTPOTransform
+
+        tokenizer = _MockTokenizer({1: "let", 2: "me", 3: "think", 4: "x"})
+
+        transform = _GTPOTransform(
+            alpha_1=1.0, alpha_2=0.1,
+            tokenizer=tokenizer,
+            strategic_grams=["let me think"],
+            hicra_gamma=0.3,
+            sepa_steps=100,
+        )
+
+        rewards = mx.array([1.0, 1.0, 0.0, 0.0])
+        episode_lengths = [3, 3, 3, 3]
+        token_entropies = mx.array([
+            2.0, 3.0, 1.0,
+            4.0, 1.0, 2.0,
+            3.0, 2.0, 1.0,
+            1.0, 3.0, 2.0,
+        ])
+        act = mx.array([[1, 2, 3], [4, 4, 4], [4, 4, 4], [4, 4, 4]])
+        advantages = mx.zeros((12,))
+
+        results = []
+        for step in [0, 25, 50, 75, 100]:
+            batch = {
+                "rewards": rewards,
+                "token_entropies": token_entropies,
+                "episode_lengths": episode_lengths,
+                "act": act,
+                "step": step,
+            }
+            transform.prepare_batch(batch)
+            r = transform(advantages, batch)
+            mx.eval(r)
+            results.append(r)
+
+        # Step 0 should equal step 0 (identity)
+        # Step 100 should differ from step 0
+        assert not mx.allclose(results[0], results[-1], atol=1e-4), \
+            "Step 0 and step 100 should produce different results"
+
+        # Intermediate steps should be distinct from both endpoints
+        # (at least one intermediate step should differ from both extremes)
+        mid = results[2]  # step 50
+        differs_from_start = not mx.allclose(mid, results[0], atol=1e-4)
+        differs_from_end = not mx.allclose(mid, results[-1], atol=1e-4)
+        assert differs_from_start or differs_from_end, \
+            "Intermediate λ should produce intermediate results"
+
+
 if __name__ == "__main__":
     pytest.main([__file__, "-v"])

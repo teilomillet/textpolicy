@@ -238,11 +238,24 @@ class _GTPOTransform:
     completely replacing the standard GRPO advantages.  All operations are
     compile-safe (no ``mx.eval`` or ``.item()``).
 
-    Optionally fuses HICRA planning-token amplification by boosting the
-    entropy array before GTPO processes it (via ``boost_entropy_with_planning``).
-    When ``hicra_gamma > 0``, planning tokens receive artificially higher
-    entropy so GTPO's O+/O- machinery naturally assigns them more credit
-    (O+) or less blame (O-).
+    Optionally fuses HICRA planning-token amplification.  Two modes:
+
+    **Boost** (``hicra_gamma > 0``, ``sepa_steps == 0``):
+        Adds ``gamma * mean(H)`` to planning token entropy before GTPO
+        processes it (via ``boost_entropy_with_planning``).
+
+    **SEPA** — Selective Entropy Pooling with Annealing
+    (``hicra_gamma > 0``, ``sepa_steps > 0``):
+        Pools execution token entropy toward the class mean, removing
+        per-token variance without removing tokens from the credit budget.
+        Planning tokens pass through untouched.  λ ∈ [0, 1] anneals
+        linearly over ``sepa_steps`` training steps:
+
+            H_exec(t) = λ · mean(H_exec) + (1 − λ) · H_real(t)
+
+        At λ=0 (step 0): pure GTPO, no HICRA influence.
+        At λ=1 (step ≥ sepa_steps): execution tokens are uniform,
+        entropy gradient operates only among planning tokens.
 
     The PPO clipped objective (Eq. 7) is handled by the Trainer's ``loss_fn``
     (e.g. ``grpo.policy_loss``).
@@ -258,6 +271,7 @@ class _GTPOTransform:
         tokenizer: Any = None,
         strategic_grams: Optional[List[str]] = None,
         hicra_gamma: float = 0.0,
+        sepa_steps: int = 0,
     ) -> None:
         self.alpha_1 = alpha_1
         self.alpha_2 = alpha_2
@@ -270,6 +284,7 @@ class _GTPOTransform:
             else (list(_DEFAULT_STRATEGIC_GRAMS) if tokenizer is not None else None)
         )
         self.hicra_gamma = hicra_gamma
+        self.sepa_steps = sepa_steps
 
     def _flatten_actions(self, batch_data: Dict[str, Any]) -> mx.array:
         episode_lengths = batch_data.get("episode_lengths")
@@ -328,7 +343,7 @@ class _GTPOTransform:
             field_name="token_entropies",
         )
 
-        # Optional HICRA fusion: boost entropies at planning positions
+        # Optional HICRA fusion: modify entropies using planning token mask
         if self.hicra_gamma > 0.0 and self.tokenizer is not None:
             planning_mask = batch_data.get("planning_mask")
             if planning_mask is None:
@@ -354,9 +369,30 @@ class _GTPOTransform:
                     episode_lengths,
                     field_name="planning_mask",
                 )
-            flat_entropies = boost_entropy_with_planning(
-                flat_entropies, planning_mask, gamma=self.hicra_gamma,
-            )
+
+            if self.sepa_steps > 0:
+                # SEPA: Selective Entropy Pooling with Annealing.
+                # Pool execution token entropy toward class mean; planning
+                # tokens pass through.  λ anneals 0→1 over sepa_steps.
+                step = batch_data.get("step", 0)
+                lambda_t = min(step / self.sepa_steps, 1.0)
+
+                mask = mx.stop_gradient(planning_mask)
+                exec_mask = 1.0 - mask
+                exec_count = mx.maximum(mx.sum(exec_mask), mx.array(1.0))
+                mean_H_exec = mx.sum(flat_entropies * exec_mask) / exec_count
+
+                flat_entropies = mx.where(
+                    mask.astype(mx.bool_),
+                    flat_entropies,
+                    lambda_t * mean_H_exec
+                    + (1.0 - lambda_t) * flat_entropies,
+                )
+            else:
+                # Boost mode (legacy): additive entropy boost at planning positions.
+                flat_entropies = boost_entropy_with_planning(
+                    flat_entropies, planning_mask, gamma=self.hicra_gamma,
+                )
 
         # Eq. 3 + Eq. 5: entropy-shaped token-level rewards
         shaped_rewards, is_positive = compute_gtpo_shaped_rewards(
@@ -384,6 +420,7 @@ def build_gtpo_transform(
     tokenizer: Any = None,
     strategic_grams: Optional[List[str]] = None,
     hicra_gamma: float = 0.0,
+    sepa_steps: int = 0,
 ) -> Callable[[mx.array, Dict[str, Any]], mx.array]:
     """
     Build a Trainer-compatible transform for GTPO (arXiv 2508.04349).
@@ -396,15 +433,25 @@ def build_gtpo_transform(
     ``functools.partial(grpo.policy_loss, clip_ratio=0.2)`` or similar.
 
     **HICRA Fusion (optional):**  When ``hicra_gamma > 0`` and a tokenizer
-    is provided, the transform boosts entropy at planning token positions
-    *before* GTPO processes it.  GTPO's O+/O- machinery then naturally
-    assigns planning tokens more credit (O+) or less blame (O-).
+    is provided, the transform modifies per-token entropies *before* GTPO
+    processes them.  Two modes are available:
+
+    - **Boost** (default, ``sepa_steps == 0``): adds ``gamma * mean(H)``
+      to planning token entropy.
+    - **SEPA** — Selective Entropy Pooling with Annealing (``sepa_steps > 0``):
+      pools execution token entropy toward the class mean, removing per-token
+      variance without removing tokens from the credit budget.  Planning tokens
+      pass through untouched.  λ anneals linearly from 0 to 1 over
+      ``sepa_steps``.  At λ=1, execution tokens have uniform entropy (no
+      individual differentiation), while planning tokens retain their real
+      entropy for GTPO's Eq. 3/5 weighting.
 
     Expected batch_data keys (auto-populated by the Trainer):
     - ``'rewards'``: episode-level rewards [num_episodes]
     - ``'token_entropies'``: per-token entropy [total_tokens] (auto-computed)
     - ``'episode_lengths'``: token count per episode
     - ``'act'``: token IDs (required when ``hicra_gamma > 0``)
+    - ``'step'``: training step count (auto-injected by Trainer, used for SEPA)
 
     Example::
 
@@ -412,6 +459,7 @@ def build_gtpo_transform(
         from textpolicy.algorithms import grpo
         from functools import partial
 
+        # Boost mode (legacy)
         trainer = Trainer(
             model=model,
             advantage_fn=grpo.compute_advantages,
@@ -420,6 +468,19 @@ def build_gtpo_transform(
             advantage_transform_fn=build_gtpo_transform(
                 alpha_1=1.0, alpha_2=0.1,
                 tokenizer=tokenizer, hicra_gamma=0.3,
+            ),
+        )
+
+        # SEPA mode (anneals over 500 steps)
+        trainer = Trainer(
+            model=model,
+            advantage_fn=grpo.compute_advantages,
+            loss_fn=partial(grpo.policy_loss, clip_ratio=0.2),
+            optimizer=optimizer,
+            advantage_transform_fn=build_gtpo_transform(
+                alpha_1=1.0, alpha_2=0.1,
+                tokenizer=tokenizer, hicra_gamma=0.3,
+                sepa_steps=500,
             ),
         )
 
@@ -432,12 +493,16 @@ def build_gtpo_transform(
         strategic_grams: Planning phrases for HICRA (defaults to built-in list
                         when tokenizer is provided).
         hicra_gamma: Entropy boost factor for HICRA fusion (default 0.0 = disabled).
+                    In SEPA mode, any value > 0 enables pooling (magnitude unused).
+        sepa_steps: SEPA annealing horizon — number of training steps over
+                   which λ anneals from 0 to 1 (default 0 = use boost mode).
 
     Returns:
         A callable ``(advantages, batch_data) -> advantages``.
 
     Raises:
-        ValueError: If ``hicra_gamma < 0``, or ``hicra_gamma > 0`` without tokenizer.
+        ValueError: If ``hicra_gamma < 0``, ``sepa_steps < 0``,
+                   or ``hicra_gamma > 0`` without tokenizer.
     """
     if alpha_1 < 0.0:
         raise ValueError(f"alpha_1 must be >= 0, got {alpha_1}.")
@@ -445,6 +510,10 @@ def build_gtpo_transform(
         raise ValueError(f"alpha_2 must be >= 0, got {alpha_2}.")
     if hicra_gamma < 0.0:
         raise ValueError(f"hicra_gamma must be >= 0, got {hicra_gamma}.")
+    if sepa_steps < 0:
+        raise ValueError(
+            f"sepa_steps must be >= 0, got {sepa_steps}."
+        )
     if hicra_gamma > 0.0 and tokenizer is None:
         raise ValueError(
             "hicra_gamma > 0 requires a tokenizer for planning token identification."
@@ -458,6 +527,7 @@ def build_gtpo_transform(
         tokenizer=tokenizer,
         strategic_grams=strategic_grams,
         hicra_gamma=hicra_gamma,
+        sepa_steps=sepa_steps,
     )
 
 

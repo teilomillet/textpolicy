@@ -931,6 +931,10 @@ class Trainer:
             # Manual mode with preprocessed data
             batch_data = rollout_data
 
+        # Expose training step count for transforms that need scheduling
+        # (e.g. HICRA blend annealing uses batch_data["step"]).
+        batch_data["step"] = self._step_count
+
         # Let transforms eagerly precompute compile-unsafe fields
         # (e.g. planning_mask token matching for HICRA).
         self._prepare_advantage_transform_batch(batch_data)
