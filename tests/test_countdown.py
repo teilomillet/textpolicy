@@ -240,6 +240,14 @@ class TestCountdownReward:
         )
         assert score == 1.0
 
+    def test_unicode_operators_are_supported_via_normalization(self):
+        score = countdown_reward(
+            prompt="",
+            completion="(6 × 4) ÷ 1 + 0",
+            example={"target": 24, "numbers": [6, 4, 1, 0]},
+        )
+        assert score == 1.0
+
     def test_kwargs_compatibility(self):
         # Should accept arbitrary kwargs without error
         score = countdown_reward(
@@ -499,6 +507,10 @@ class TestExpressionExtraction:
     def test_extract_with_answer_keyword(self):
         expr = extract_expression_from_completion("The answer is 2+3*4")
         assert "2+3*4" in expr
+
+    def test_extract_unicode_operators(self):
+        expr = extract_expression_from_completion("(21 - 4) × (1 + 24)")
+        assert expr == "(21 - 4) * (1 + 24)"
 
 
 # =========================================================================

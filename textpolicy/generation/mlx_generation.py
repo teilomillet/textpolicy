@@ -14,6 +14,7 @@ Key functions:
 
 from __future__ import annotations
 import importlib
+import re
 import time
 from typing import Dict, List, Optional, Tuple, Any, Callable
 import mlx.core as mx
@@ -40,6 +41,7 @@ BatchedDecodeBackend = Callable[
     BatchedGenerationOutput,
 ]
 _BATCHED_DECODE_BACKENDS: Dict[str, BatchedDecodeBackend] = {}
+_CHAT_MARKER_RE = re.compile(r"<\|[^<>|]+\|>")
 
 
 def register_batched_decode_backend(
@@ -2071,7 +2073,27 @@ def decode(tokenizer: Any, tokens: mx.array) -> str:
         Decoded text string
     """
     token_list = tokens.tolist()
-    return tokenizer.decode(token_list)
+    return decode_token_ids(tokenizer, token_list)
+
+
+def decode_token_ids(tokenizer: Any, token_ids: List[int]) -> str:
+    """Decode token IDs and strip chat-control markers like ``<|im_end|>``."""
+    if not token_ids:
+        return ""
+
+    text: str
+    try:
+        text = tokenizer.decode(token_ids, skip_special_tokens=True)
+    except TypeError:
+        text = tokenizer.decode(token_ids)
+    except Exception:
+        text = tokenizer.decode(token_ids)
+
+    # Some tokenizers still emit textual control markers even when special
+    # tokens are skipped. Strip them for clean logging/reward inspection.
+    cleaned = _CHAT_MARKER_RE.sub("", str(text))
+    cleaned = cleaned.replace("\u200b", "")
+    return cleaned.strip()
 
 
 def create_policy(

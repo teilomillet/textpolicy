@@ -263,7 +263,15 @@ class TestEmergenceLogger:
         required_fields = [
             "step", "prompt", "completion", "reward", "tokens",
             "logprobs", "entropy_per_token", "planning_phrases_found",
-            "planning_token_ratio", "metadata",
+            "planning_token_ratio",
+            "contains_strategic_gram",
+            "strategic_gram_word_count",
+            "non_strategic_gram_word_count",
+            "strategic_gram_word_ratio",
+            "gram_entropy_mean",
+            "non_gram_entropy_mean",
+            "gram_entropy_delta",
+            "metadata",
         ]
         for field in required_fields:
             assert field in rec, f"Missing field: {field}"
@@ -281,10 +289,32 @@ class TestEmergenceLogger:
         required_fields = [
             "step", "mean_reward", "std_reward", "mean_completion_length",
             "planning_token_ratio", "entropy_mean", "entropy_std",
+            "strategic_gram_match_rate",
+            "strategic_gram_word_ratio",
+            "gram_entropy_on_mean",
+            "gram_entropy_off_mean",
+            "gram_entropy_delta",
+            "gram_entropy_pair_count",
             "correct_count", "total_count", "logging_overhead_ms",
         ]
         for field in required_fields:
             assert field in rec, f"Missing field: {field}"
+
+    def test_step_record_includes_extra_step_metrics(self, tmp_dir):
+        logger = EmergenceLogger(output_dir=tmp_dir)
+        tok = _make_tokenizer()
+        ep = _make_episode([1, 2], [3, 4], 1.0, logprobs=[-1.0, -0.5])
+        logger.log_step(
+            step=0,
+            episodes=[ep],
+            tokenizer=tok,
+            extra_step_metrics={"sepa_lambda": 0.25},
+        )
+        logger.finish()
+
+        line = (tmp_dir / "steps.jsonl").read_text().strip()
+        rec = json.loads(line)
+        assert rec["sepa_lambda"] == pytest.approx(0.25)
 
     def test_entropy_proxy_is_neg_logprob(self, tmp_dir):
         logger = EmergenceLogger(output_dir=tmp_dir)
@@ -310,6 +340,44 @@ class TestEmergenceLogger:
         lower_phrases = [p.lower() for p in rec["planning_phrases_found"]]
         assert "wait" in lower_phrases
         assert "let me think" in lower_phrases
+
+    def test_gram_entropy_metrics_capture_on_vs_off(self, tmp_dir):
+        tok = MagicMock()
+        tok.decode.side_effect = ["prompt", "let me try now"]
+
+        logger = EmergenceLogger(
+            output_dir=tmp_dir,
+            strategic_grams=["let me try"],
+        )
+        ep = _make_episode(
+            [10],
+            [20, 21, 22, 23],
+            0.5,
+            logprobs=[-1.0, -1.0, -1.0, -0.1],
+        )
+        step = logger.log_step(step=0, episodes=[ep], tokenizer=tok)
+        logger.finish()
+
+        rec = json.loads((tmp_dir / "generations.jsonl").read_text().strip())
+        assert rec["contains_strategic_gram"] is True
+        assert rec["gram_entropy_mean"] == pytest.approx(1.0)
+        assert rec["non_gram_entropy_mean"] == pytest.approx(0.1)
+        assert rec["gram_entropy_delta"] == pytest.approx(0.9)
+        assert step["strategic_gram_match_rate"] == pytest.approx(1.0)
+        assert step["gram_entropy_delta"] == pytest.approx(0.9)
+
+    def test_generation_record_strips_chat_markers(self, tmp_dir):
+        tok = MagicMock()
+        tok.decode.side_effect = ["prompt<|im_end|>", "(4+3)*(13-4)<|im_end|>"]
+
+        logger = EmergenceLogger(output_dir=tmp_dir)
+        ep = _make_episode([1], [2], 0.5)
+        logger.log_step(step=0, episodes=[ep], tokenizer=tok)
+        logger.finish()
+
+        rec = json.loads((tmp_dir / "generations.jsonl").read_text().strip())
+        assert rec["prompt"] == "prompt"
+        assert rec["completion"] == "(4+3)*(13-4)"
 
     def test_countdown_metadata_extraction(self, tmp_dir):
         logger = EmergenceLogger(output_dir=tmp_dir)

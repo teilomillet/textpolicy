@@ -15,7 +15,7 @@ Usage:
 import argparse
 import json
 import time
-from dataclasses import asdict, dataclass
+from dataclasses import asdict, dataclass, field
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Union
 
@@ -30,10 +30,18 @@ import mlx.core as mx
 import mlx.optimizers as optim
 
 from textpolicy.algorithms import grpo
-from textpolicy.analysis import EmergenceLogger, load_strategic_grams
+from textpolicy.analysis import (
+    EmergenceLogger,
+    build_litmus_markdown,
+    evaluate_sepa_litmus,
+    get_sepa_litmus_profile,
+    get_countdown_strategic_grams,
+    load_strategic_grams,
+    save_strategic_grams,
+)
 from textpolicy.buffer import Buffer
 from textpolicy.environment.text_generation import TextGenerationEnv
-from textpolicy.generation.mlx_generation import create_policy, load_model
+from textpolicy.generation.mlx_generation import create_policy, load_model, decode_token_ids
 from textpolicy.generation.reload import save_adapters
 from textpolicy.rollout import RolloutCoordinator
 from textpolicy.tasks.countdown import (
@@ -61,12 +69,15 @@ class ReasoningConfig:
 
     # Reasoning shaping
     strategic_grams_path: Optional[str] = None
+    use_countdown_strategic_grams: bool = True
 
     # GTPO (arXiv 2508.04349 Eq. 3, 5, 6)
     alpha_1: float = 1.0
     alpha_2: float = 0.1
     reward_threshold: float = 0.5
     hicra_gamma: float = 0.3
+    sepa_steps: int = 0
+    sepa_schedule: str = "linear"
 
     # Training
     learning_rate: float = 5e-6
@@ -93,10 +104,16 @@ class ReasoningConfig:
 
     # Output
     output_dir: str = "results/countdown_reasoning_lora"
+    litmus_profile: str = "official_v1"
+    litmus_baselines: List[str] = field(default_factory=list)
+    run_litmus: bool = True
 
     # Wandb (opt-in: set wandb_project to enable)
     wandb_project: Optional[str] = None
     wandb_run_name: Optional[str] = None
+    wandb_completion_log_interval: int = 10
+    wandb_log_final_completions: bool = True
+    wandb_completion_char_limit: int = 0
 
 
 # Memory optimization quick-reference:
@@ -115,6 +132,39 @@ def save_config(config: ReasoningConfig, output_dir: Path) -> None:
     with open(config_path, "w") as f:
         json.dump(asdict(config), f, indent=2)
     print(f"Config saved to {config_path}")
+
+
+def resolve_strategic_grams(
+    config: ReasoningConfig,
+    output_dir: Path,
+) -> Optional[List[str]]:
+    """Resolve strategic grams for this run and persist deterministic defaults."""
+    if config.strategic_grams_path:
+        configured_path = Path(config.strategic_grams_path).expanduser()
+        resolved_path = configured_path.resolve()
+        grams = load_strategic_grams(resolved_path)
+        config.strategic_grams_path = str(resolved_path)
+        print(
+            f"Loaded {len(grams)} strategic grams from "
+            f"{resolved_path}"
+        )
+        return grams
+
+    if config.use_countdown_strategic_grams:
+        grams = get_countdown_strategic_grams()
+        rel_path = Path("analysis") / "countdown_strategic_grams.json"
+        grams_path = output_dir / rel_path
+        grams_path.parent.mkdir(parents=True, exist_ok=True)
+        save_strategic_grams({"source": "countdown_default", "grams": grams}, grams_path)
+        config.strategic_grams_path = str(rel_path)
+        print(
+            f"Using {len(grams)} built-in countdown strategic grams "
+            f"(saved to {grams_path})"
+        )
+        return grams
+
+    print("Using global default strategic grams from training transform.")
+    return None
 
 
 def save_checkpoint(model, output_dir: Path, step: int) -> None:
@@ -161,7 +211,60 @@ def print_summary(output_dir: Path) -> None:
     print(f"  Final step reward: {last['mean_reward']:.3f}")
     print(f"  Best accuracy:     {best_accuracy:.1%} (step {best_step})")
     print(f"  Final planning ratio: {last['planning_token_ratio']:.4f}")
+    if "strategic_gram_match_rate" in last:
+        print(f"  Final gram match rate: {last['strategic_gram_match_rate']:.2%}")
+    if "gram_entropy_delta" in last:
+        delta = last.get("gram_entropy_delta")
+        delta_txt = "n/a" if delta is None else f"{float(delta):.4f}"
+        print(f"  Final gram entropy delta: {delta_txt}")
     print("=" * 50)
+
+
+def run_litmus_report(config: ReasoningConfig, output_dir: Path) -> None:
+    """Run post-training SEPA litmus against provided baselines and persist report."""
+    if not config.run_litmus:
+        print("SEPA litmus disabled (--no-litmus).")
+        return
+    if not config.litmus_baselines:
+        print("SEPA litmus skipped (no --litmus-baseline provided).")
+        return
+
+    try:
+        profile = get_sepa_litmus_profile(config.litmus_profile)
+    except ValueError as exc:
+        print(f"SEPA litmus skipped ({exc})")
+        return
+
+    try:
+        result = evaluate_sepa_litmus(
+            baseline_run_dirs=config.litmus_baselines,
+            candidate_run_dirs=[str(output_dir)],
+            thresholds=profile.thresholds,
+            evidence=profile.evidence,
+        )
+    except Exception as exc:
+        print(f"SEPA litmus failed to run: {exc}")
+        return
+
+    analysis_dir = output_dir / "analysis"
+    analysis_dir.mkdir(parents=True, exist_ok=True)
+    json_path = analysis_dir / "sepa_litmus.json"
+    md_path = analysis_dir / "sepa_litmus.md"
+    json_path.write_text(json.dumps(result.to_dict(), indent=2) + "\n")
+    md_path.write_text(build_litmus_markdown(result))
+
+    print(f"SEPA litmus profile={profile.name}: {result.status}")
+    for check in result.checks:
+        verdict = "PASS" if check.passed else "FAIL"
+        print(
+            f"  [{verdict}] {check.metric}: "
+            f"delta={check.delta:.6f} threshold={check.threshold:.6f}"
+        )
+    if result.evidence_failures:
+        for failure in result.evidence_failures:
+            print(f"  evidence: {failure}")
+    print(f"  Wrote litmus report: {json_path}")
+    print(f"  Wrote litmus report: {md_path}")
 
 
 def print_amdahl_summary(
@@ -230,7 +333,18 @@ def init_wandb(config: ReasoningConfig) -> bool:
             print("Warning: --wandb-project set but wandb not installed. pip install wandb")
         return False
 
-    tags = ["gtpo", "hicra", "tinylora", "countdown"]
+    sepa_enabled = (config.sepa_steps > 0 or config.sepa_schedule == "auto")
+    tags = ["gtpo", "tinylora", "countdown"]
+    if sepa_enabled:
+        tags.extend(["sepa", f"sepa-{config.sepa_schedule}"])
+    else:
+        tags.append("hicra")
+
+    mode_notes = (
+        "SEPA (Selective Entropy Pooling with Annealing)"
+        if sepa_enabled
+        else "HICRA (arXiv 2509.03646)"
+    )
 
     wandb.init(
         project=config.wandb_project,
@@ -238,13 +352,22 @@ def init_wandb(config: ReasoningConfig) -> bool:
         config=asdict(config),
         tags=tags,
         notes=(
-            "GTPO (arXiv 2508.04349) + HICRA (arXiv 2509.03646) "
+            f"GTPO (arXiv 2508.04349) + {mode_notes} "
             "with TinyLoRA adapters (arXiv 2602.04118) on Countdown task."
         ),
     )
 
     # Group metrics by prefix for dashboard panels.
-    for prefix in ["entropy", "reward", "hicra", "train", "policy", "accuracy", "completions"]:
+    for prefix in [
+        "entropy",
+        "reward",
+        "hicra",
+        "sepa",
+        "train",
+        "policy",
+        "accuracy",
+        "completions",
+    ]:
         wandb.define_metric(f"{prefix}/*", step_metric="step")
 
     return True
@@ -259,7 +382,6 @@ def compute_episode_stats(episodes: List[Any]) -> Dict[str, Any]:
     """
     rewards: List[float] = []
     lengths: List[int] = []
-    planning_ratios: List[float] = []
 
     for ep in episodes:
         if isinstance(ep, dict):
@@ -298,6 +420,7 @@ def log_wandb_step(
     episode_stats: Dict[str, Any],
     config: ReasoningConfig,
     use_wandb: bool,
+    sepa_lambda: Optional[float] = None,
 ) -> None:
     """Log structured metrics to wandb for a single training step."""
     if not use_wandb:
@@ -314,6 +437,17 @@ def log_wandb_step(
     ent_mean = step_stats["entropy_mean"]
     if ent_mean > 0:
         log["entropy/collapse_indicator"] = step_stats["entropy_std"] / ent_mean
+    log["entropy/gram_match_rate"] = step_stats.get("strategic_gram_match_rate", 0.0)
+    log["entropy/gram_word_ratio"] = step_stats.get("strategic_gram_word_ratio", 0.0)
+    gram_on = step_stats.get("gram_entropy_on_mean")
+    gram_off = step_stats.get("gram_entropy_off_mean")
+    gram_delta = step_stats.get("gram_entropy_delta")
+    if gram_on is not None:
+        log["entropy/gram_on_mean"] = float(gram_on)
+    if gram_off is not None:
+        log["entropy/gram_off_mean"] = float(gram_off)
+    if gram_delta is not None:
+        log["entropy/gram_delta"] = float(gram_delta)
 
     # ── Reward signal ─────────────────────────────────────────────────
     log["reward/mean"] = step_stats["mean_reward"]
@@ -327,6 +461,8 @@ def log_wandb_step(
     # ── HICRA planning token coverage ─────────────────────────────────
     # arXiv 2509.03646 tracks planning ratio distribution, not just mean.
     log["hicra/planning_token_ratio"] = step_stats["planning_token_ratio"]
+    if sepa_lambda is not None:
+        log["sepa/lambda"] = sepa_lambda
 
     # ── Training loss + gradient norm ─────────────────────────────────
     log["train/loss"] = train_metrics["loss"]
@@ -367,9 +503,18 @@ def log_wandb_completions(
     episodes: List[Any],
     tokenizer: Any,
     use_wandb: bool,
+    completion_log_interval: int = 10,
+    is_final_step: bool = False,
+    log_final_step: bool = True,
+    completion_char_limit: int = 0,
 ) -> None:
     """Log a wandb.Table of decoded completions for qualitative inspection."""
-    if not use_wandb or step % 10 != 0:
+    if not use_wandb:
+        return
+
+    interval = max(int(completion_log_interval), 1)
+    should_log = (step % interval == 0) or (is_final_step and log_final_step)
+    if not should_log:
         return
 
     def _as_list(value: Any) -> List[Any]:
@@ -399,6 +544,11 @@ def log_wandb_completions(
                 flat.append(int(item))
         return flat
 
+    def _clip(text: str) -> str:
+        if completion_char_limit > 0:
+            return text[:completion_char_limit]
+        return text
+
     rows = []
     for ep in episodes:
         if isinstance(ep, dict):
@@ -424,13 +574,13 @@ def log_wandb_completions(
             reward_raw = reward_raw.item()
         reward_val = float(reward_raw)
 
-        prompt_text = tokenizer.decode(prompt_tokens) if len(prompt_tokens) > 0 else ""
-        completion_text = tokenizer.decode(completion_tokens) if len(completion_tokens) > 0 else ""
+        prompt_text = decode_token_ids(tokenizer, prompt_tokens)
+        completion_text = decode_token_ids(tokenizer, completion_tokens)
 
         rows.append([
             step,
-            prompt_text[:200],
-            completion_text[:500],
+            _clip(prompt_text),
+            _clip(completion_text),
             reward_val,
             reward_val >= 1.0,
             len(completion_tokens),
@@ -452,25 +602,26 @@ def run_experiment(config: ReasoningConfig) -> None:
 
     output_dir = Path(config.output_dir)
     output_dir.mkdir(parents=True, exist_ok=True)
+    strategic_grams = resolve_strategic_grams(config, output_dir)
     save_config(config, output_dir)
 
     print(f"Loading model: {config.model_id}")
     base_model, tokenizer = load_model(config.model_id)
 
-    strategic_grams = None
-    if config.strategic_grams_path:
-        strategic_grams = load_strategic_grams(config.strategic_grams_path)
-        print(
-            f"Loaded {len(strategic_grams)} strategic grams from "
-            f"{config.strategic_grams_path}"
-        )
-
     optimizer = optim.Adam(learning_rate=config.learning_rate)
 
-    print(
-        f"GTPO (Eq. 3,5,6): α₁={config.alpha_1}, α₂={config.alpha_2}, "
-        f"threshold={config.reward_threshold}, γ_hicra={config.hicra_gamma}"
-    )
+    sepa_enabled = (config.sepa_steps > 0 or config.sepa_schedule == "auto")
+    if sepa_enabled:
+        print(
+            f"GTPO + SEPA: α₁={config.alpha_1}, α₂={config.alpha_2}, "
+            f"threshold={config.reward_threshold}, "
+            f"schedule={config.sepa_schedule}, sepa_steps={config.sepa_steps}"
+        )
+    else:
+        print(
+            f"GTPO + HICRA: α₁={config.alpha_1}, α₂={config.alpha_2}, "
+            f"threshold={config.reward_threshold}, γ_hicra={config.hicra_gamma}"
+        )
 
     # Enable per-step policy metrics only when wandb will actually be active.
     # Otherwise this triggers an extra model forward pass every step with no
@@ -500,6 +651,8 @@ def run_experiment(config: ReasoningConfig) -> None:
         tokenizer=tokenizer,
         strategic_grams=strategic_grams,
         hicra_gamma=config.hicra_gamma,
+        sepa_steps=config.sepa_steps,
+        sepa_schedule=config.sepa_schedule,
     )
 
     # 3. Trainer
@@ -572,7 +725,10 @@ def run_experiment(config: ReasoningConfig) -> None:
 
     buffer = Buffer(max_episodes=config.episodes_per_step)
     trainer.link_buffer(buffer, data_selector_fn=grpo.select_recent_data)
-    emergence = EmergenceLogger(output_dir=output_dir / "emergence")
+    emergence = EmergenceLogger(
+        output_dir=output_dir / "emergence",
+        strategic_grams=strategic_grams,
+    )
     use_wandb = init_wandb(config)
 
     print(f"\nStarting reasoning training for {config.max_steps} steps...")
@@ -587,6 +743,11 @@ def run_experiment(config: ReasoningConfig) -> None:
     rollout_phase_totals: Dict[str, float] = {}
     for step in range(config.max_steps):
         step_start = time.perf_counter()
+        sepa_lambda: Optional[float] = None
+        if sepa_enabled:
+            sepa_controller = getattr(transform, "_sepa", None)
+            if sepa_controller is not None and hasattr(sepa_controller, "resolve_lambda"):
+                sepa_lambda = float(sepa_controller.resolve_lambda(step=float(step)))
 
         buffer.clear()
         rollout_start = time.perf_counter()
@@ -599,16 +760,22 @@ def run_experiment(config: ReasoningConfig) -> None:
         for phase, secs in rollout.get_rollout_timing().items():
             rollout_phase_totals[phase] = rollout_phase_totals.get(phase, 0.0) + secs
 
-        new_episode = rollout_buffer.episodes[-1]
-        example = problems[global_episode_count % len(problems)]
-        global_episode_count += 1
+        step_episodes = list(rollout_buffer.episodes)
+        step_examples = [
+            problems[(global_episode_count + idx) % len(problems)]
+            for idx in range(len(step_episodes))
+        ]
+        global_episode_count += len(step_episodes)
 
         emergence_start = time.perf_counter()
         step_stats = emergence.log_step(
             step=step,
-            episodes=[new_episode],
+            episodes=step_episodes,
             tokenizer=tokenizer,
-            examples=[example],
+            examples=step_examples,
+            extra_step_metrics=(
+                {"sepa_lambda": sepa_lambda} if sepa_lambda is not None else None
+            ),
         )
         phase_totals["emergence_log_s"] += time.perf_counter() - emergence_start
 
@@ -621,18 +788,39 @@ def run_experiment(config: ReasoningConfig) -> None:
                 trainer_phase_totals[phase] = trainer_phase_totals.get(phase, 0.0) + float(value)
 
         ep_stats = compute_episode_stats(rollout_buffer.episodes) if use_wandb else {}
-        log_wandb_step(step, step_stats, metrics, ep_stats, config, use_wandb)
-        log_wandb_completions(step, rollout_buffer.episodes, tokenizer, use_wandb)
+        log_wandb_step(
+            step,
+            step_stats,
+            metrics,
+            ep_stats,
+            config,
+            use_wandb,
+            sepa_lambda=sepa_lambda,
+        )
+        log_wandb_completions(
+            step=step,
+            episodes=rollout_buffer.episodes,
+            tokenizer=tokenizer,
+            use_wandb=use_wandb,
+            completion_log_interval=config.wandb_completion_log_interval,
+            is_final_step=(step == (config.max_steps - 1)),
+            log_final_step=config.wandb_log_final_completions,
+            completion_char_limit=config.wandb_completion_char_limit,
+        )
 
         if step % 10 == 0:
             cumulative_total = sum(phase_totals.values()) or 1e-9
             rollout_pct = phase_totals["rollout_collect_s"] / cumulative_total * 100
             train_pct = phase_totals["train_s"] / cumulative_total * 100
+            gram_delta = step_stats.get("gram_entropy_delta")
+            gram_delta_txt = "n/a" if gram_delta is None else f"{gram_delta:.3f}"
             print(
                 f"Step {step}: loss={metrics['loss']:.4f} "
                 f"reward={step_stats['mean_reward']:.3f} "
                 f"correct={step_stats['correct_count']}/{step_stats['total_count']} "
                 f"planning_ratio={step_stats['planning_token_ratio']:.4f} "
+                f"gram_match={step_stats.get('strategic_gram_match_rate', 0.0):.2f} "
+                f"gram_delta={gram_delta_txt} "
                 f"step_time={time.perf_counter() - step_start:.2f}s "
                 f"[rollout {rollout_pct:.0f}% | train {train_pct:.0f}%]"
             )
@@ -648,6 +836,7 @@ def run_experiment(config: ReasoningConfig) -> None:
     save_checkpoint(model, output_dir, config.max_steps)
     phase_totals["checkpoint_s"] += time.perf_counter() - checkpoint_start
     print_summary(output_dir)
+    run_litmus_report(config, output_dir)
     print_amdahl_summary(phase_totals, trainer_phase_totals, rollout_phase_totals)
     if use_wandb:
         wandb.finish()
@@ -655,7 +844,7 @@ def run_experiment(config: ReasoningConfig) -> None:
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(
-        description="Run TinyLoRA + GTPO + HICRA on the Countdown task"
+        description="Run TinyLoRA + GTPO + HICRA/SEPA on the Countdown task"
     )
     parser.add_argument("--model", default="arcee-ai/Trinity-Nano-Preview", help="Model ID")
     parser.add_argument("--steps", type=int, default=500, help="Training steps")
@@ -674,13 +863,32 @@ if __name__ == "__main__":
         "--compile-training",
         choices=["false", "true", "auto"],
         default="false",
-        help="Training compilation mode (HICRA defaults to false for compatibility)",
+        help="Training compilation mode (reasoning transforms default to false for compatibility)",
     )
     parser.add_argument(
         "--strategic-grams",
         default=None,
         help="Optional path to strategic grams JSON (defaults to built-ins)",
     )
+    parser.add_argument(
+        "--countdown-grams",
+        dest="countdown_grams",
+        action="store_true",
+        help=(
+            "Use built-in countdown-specific strategic grams when "
+            "--strategic-grams is not provided (default)."
+        ),
+    )
+    parser.add_argument(
+        "--no-countdown-grams",
+        dest="countdown_grams",
+        action="store_false",
+        help=(
+            "Disable countdown-specific grams and fall back to global default "
+            "grams when --strategic-grams is not provided."
+        ),
+    )
+    parser.set_defaults(countdown_grams=True)
     parser.add_argument(
         "--gradient-checkpointing",
         action="store_true",
@@ -710,9 +918,68 @@ if __name__ == "__main__":
     parser.add_argument("--alpha-1", type=float, default=1.0, help="GTPO: base reward weight (Eq. 3)")
     parser.add_argument("--alpha-2", type=float, default=0.1, help="GTPO: entropy-shaped weight (Eq. 3)")
     parser.add_argument("--reward-threshold", type=float, default=0.5, help="GTPO: O+/O- partition threshold")
-    parser.add_argument("--hicra-gamma", type=float, default=0.3, help="HICRA entropy boost factor for GTPO fusion")
+    parser.add_argument(
+        "--hicra-gamma",
+        type=float,
+        default=0.3,
+        help="HICRA entropy boost factor for GTPO fusion (ignored when SEPA is active)",
+    )
+    parser.add_argument(
+        "--sepa-steps",
+        type=int,
+        default=0,
+        help=(
+            "SEPA linear anneal horizon. "
+            "Set >0 to enable SEPA with sepa_schedule=linear."
+        ),
+    )
+    parser.add_argument(
+        "--sepa-schedule",
+        choices=["linear", "auto"],
+        default="linear",
+        help=(
+            "SEPA schedule mode. "
+            "'auto' enables variance-driven SEPA even when sepa_steps=0."
+        ),
+    )
     parser.add_argument("--wandb-project", default=None, help="Wandb project name (enables wandb logging)")
     parser.add_argument("--wandb-run-name", default=None, help="Wandb run name (optional)")
+    parser.add_argument(
+        "--litmus-profile",
+        default="official_v1",
+        help="SEPA litmus profile name for post-run verdict generation.",
+    )
+    parser.add_argument(
+        "--litmus-baseline",
+        action="append",
+        default=[],
+        help=(
+            "Baseline run directory for post-run litmus comparison. "
+            "Repeat flag for multiple baselines."
+        ),
+    )
+    parser.add_argument(
+        "--no-litmus",
+        action="store_true",
+        help="Disable post-run SEPA litmus report generation.",
+    )
+    parser.add_argument(
+        "--wandb-completion-log-interval",
+        type=int,
+        default=10,
+        help="Log completion table every N steps (minimum 1)",
+    )
+    parser.add_argument(
+        "--no-wandb-final-completions",
+        action="store_true",
+        help="Disable completion table logging on the final training step",
+    )
+    parser.add_argument(
+        "--wandb-completion-char-limit",
+        type=int,
+        default=0,
+        help="Max chars kept for prompt/completion in wandb table (0 = no truncation)",
+    )
     args = parser.parse_args()
 
     compile_mode: Union[bool, str]
@@ -727,6 +994,9 @@ if __name__ == "__main__":
         model_id=args.model,
         max_steps=args.steps,
         output_dir=args.output,
+        litmus_profile=args.litmus_profile,
+        litmus_baselines=args.litmus_baseline,
+        run_litmus=(not args.no_litmus),
         learning_rate=args.lr,
         num_problems=args.num_problems,
         episodes_per_step=args.episodes_per_step,
@@ -738,6 +1008,7 @@ if __name__ == "__main__":
         lora_layers=args.lora_layers,
         lora_scale=args.lora_scale,
         strategic_grams_path=args.strategic_grams,
+        use_countdown_strategic_grams=args.countdown_grams,
         compile_training=compile_mode,
         gradient_checkpointing=args.gradient_checkpointing,
         micro_batch_size=args.micro_batch_size,
@@ -746,7 +1017,12 @@ if __name__ == "__main__":
         alpha_2=args.alpha_2,
         reward_threshold=args.reward_threshold,
         hicra_gamma=args.hicra_gamma,
+        sepa_steps=args.sepa_steps,
+        sepa_schedule=args.sepa_schedule,
         wandb_project=args.wandb_project,
         wandb_run_name=args.wandb_run_name,
+        wandb_completion_log_interval=args.wandb_completion_log_interval,
+        wandb_log_final_completions=(not args.no_wandb_final_completions),
+        wandb_completion_char_limit=args.wandb_completion_char_limit,
     )
     run_experiment(cfg)

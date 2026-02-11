@@ -3,6 +3,7 @@ Smoke tests for experiments/countdown_reasoning_lora.py.
 """
 
 import tempfile
+import json
 from dataclasses import asdict
 from pathlib import Path
 from unittest.mock import MagicMock, patch
@@ -34,9 +35,15 @@ class TestReasoningConfig:
         assert cfg.alpha_1 == 1.0
         assert cfg.alpha_2 == 0.1
         assert cfg.hicra_gamma == 0.3
+        assert cfg.sepa_steps == 0
+        assert cfg.sepa_schedule == "linear"
         assert cfg.episodes_per_step == 8
         assert cfg.batch_size == 8
         assert cfg.output_dir == "results/countdown_reasoning_lora"
+        assert cfg.use_countdown_strategic_grams is True
+        assert cfg.wandb_completion_log_interval == 10
+        assert cfg.wandb_log_final_completions is True
+        assert cfg.wandb_completion_char_limit == 0
 
     def test_roundtrip_dict(self):
         from experiments.countdown_reasoning_lora import ReasoningConfig
@@ -103,7 +110,12 @@ class TestReasoningConfig:
 
                 # No training loop work should run when max_steps=0.
                 mock_trainer.train.assert_not_called()
-                assert (Path(tmpdir) / "config.json").exists()
+                config_path = Path(tmpdir) / "config.json"
+                assert config_path.exists()
+                saved = json.loads(config_path.read_text())
+                assert saved["strategic_grams_path"]
+                emergence_kwargs = mock_emergence_cls.call_args.kwargs
+                assert emergence_kwargs["strategic_grams"] is not None
 
     def test_rejects_batch_size_exceeding_episodes_per_step(self):
         from experiments.countdown_reasoning_lora import ReasoningConfig, run_experiment
@@ -170,6 +182,34 @@ class TestRunExperiment:
         assert kwargs["step"] == 10
         assert "completions/samples" in args[0]
 
+    def test_log_wandb_step_logs_sepa_lambda_when_provided(self):
+        import experiments.countdown_reasoning_lora as exp
+
+        mock_wandb = MagicMock()
+        with patch.object(exp, "wandb", mock_wandb, create=True):
+            cfg = exp.ReasoningConfig(sepa_steps=10)
+            exp.log_wandb_step(
+                step=7,
+                step_stats={
+                    "entropy_mean": 0.2,
+                    "entropy_std": 0.05,
+                    "mean_reward": 0.4,
+                    "std_reward": 0.1,
+                    "planning_token_ratio": 0.3,
+                    "total_count": 2,
+                    "correct_count": 1,
+                    "mean_completion_length": 12.0,
+                },
+                train_metrics={"loss": 0.25},
+                episode_stats={},
+                config=cfg,
+                use_wandb=True,
+                sepa_lambda=0.4,
+            )
+
+        args, _kwargs = mock_wandb.log.call_args
+        assert args[0]["sepa/lambda"] == 0.4
+
     def test_log_wandb_completions_skips_non_interval_steps(self):
         import experiments.countdown_reasoning_lora as exp
 
@@ -185,6 +225,70 @@ class TestRunExperiment:
             )
 
         mock_wandb.log.assert_not_called()
+
+    def test_log_wandb_completions_logs_final_step_when_requested(self):
+        import experiments.countdown_reasoning_lora as exp
+
+        mock_wandb = MagicMock()
+        tokenizer = MagicMock()
+        tokenizer.decode.side_effect = lambda tokens: " ".join(str(t) for t in tokens)
+        episodes = [{"obs": [[101]], "act": [[201, 202]], "rew": [0.0]}]
+
+        with patch.object(exp, "wandb", mock_wandb, create=True):
+            exp.log_wandb_completions(
+                step=9,
+                episodes=episodes,
+                tokenizer=tokenizer,
+                use_wandb=True,
+                completion_log_interval=10,
+                is_final_step=True,
+                log_final_step=True,
+            )
+
+        mock_wandb.log.assert_called_once()
+        _args, kwargs = mock_wandb.log.call_args
+        assert kwargs["step"] == 9
+
+    def test_log_wandb_completions_keeps_full_completion_when_unbounded(self):
+        import experiments.countdown_reasoning_lora as exp
+
+        mock_wandb = MagicMock()
+        tokenizer = MagicMock()
+        long_text = "x" * 1200
+        tokenizer.decode.side_effect = [long_text, long_text]
+        episodes = [{"obs": [[1]], "act": [[2]], "rew": [1.0]}]
+
+        with patch.object(exp, "wandb", mock_wandb, create=True):
+            exp.log_wandb_completions(
+                step=10,
+                episodes=episodes,
+                tokenizer=tokenizer,
+                use_wandb=True,
+                completion_char_limit=0,
+            )
+
+        table_kwargs = mock_wandb.Table.call_args.kwargs
+        assert table_kwargs["data"][0][2] == long_text
+
+    def test_log_wandb_completions_strips_chat_markers(self):
+        import experiments.countdown_reasoning_lora as exp
+
+        mock_wandb = MagicMock()
+        tokenizer = MagicMock()
+        tokenizer.decode.side_effect = ["prompt<|im_end|>", "(4+3)*(13-4)<|im_end|>"]
+        episodes = [{"obs": [[101]], "act": [[201]], "rew": [1.0]}]
+
+        with patch.object(exp, "wandb", mock_wandb, create=True):
+            exp.log_wandb_completions(
+                step=10,
+                episodes=episodes,
+                tokenizer=tokenizer,
+                use_wandb=True,
+            )
+
+        table_kwargs = mock_wandb.Table.call_args.kwargs
+        assert table_kwargs["data"][0][1] == "prompt"
+        assert table_kwargs["data"][0][2] == "(4+3)*(13-4)"
 
     def test_wandb_project_without_wandb_does_not_force_metrics_interval_1(self):
         import experiments.countdown_reasoning_lora as exp
@@ -323,3 +427,48 @@ class TestRunExperiment:
                     rollout_kwargs["generation_params"]["repetition_penalty"]
                     == cfg.repetition_penalty
                 )
+
+    def test_run_experiment_forwards_sepa_config_to_gtpo_transform(self):
+        import experiments.countdown_reasoning_lora as exp
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            with (
+                patch.object(exp, "load_model") as mock_load_model,
+                patch.object(exp, "create_lora_setup") as mock_lora_setup,
+                patch.object(exp, "Trainer") as mock_trainer_cls,
+                patch.object(exp, "build_gtpo_transform") as mock_build_transform,
+                patch.object(exp, "create_policy"),
+                patch.object(exp, "generate_countdown_problems") as mock_generate_problems,
+                patch.object(exp, "RolloutCoordinator") as mock_rollout_cls,
+                patch.object(exp, "EmergenceLogger") as mock_emergence_cls,
+                patch.object(exp, "save_checkpoint"),
+            ):
+                mock_model = MagicMock()
+                mock_tokenizer = MagicMock()
+                mock_load_model.return_value = (mock_model, mock_tokenizer)
+                mock_lora_setup.return_value = (
+                    mock_model,
+                    {"memory_savings_percent": 95.0},
+                )
+                mock_build_transform.return_value = MagicMock()
+                mock_trainer = MagicMock()
+                mock_trainer.model = mock_model
+                mock_trainer_cls.return_value = mock_trainer
+                mock_generate_problems.return_value = [{"target": 15, "numbers": [10, 5, 3]}]
+                mock_rollout_cls.return_value = MagicMock()
+                mock_emergence_cls.return_value = MagicMock()
+
+                cfg = exp.ReasoningConfig(
+                    max_steps=0,
+                    output_dir=tmpdir,
+                    num_problems=1,
+                    episodes_per_step=4,
+                    batch_size=4,
+                    sepa_steps=25,
+                    sepa_schedule="auto",
+                )
+                exp.run_experiment(cfg)
+
+                kwargs = mock_build_transform.call_args.kwargs
+                assert kwargs["sepa_steps"] == 25
+                assert kwargs["sepa_schedule"] == "auto"

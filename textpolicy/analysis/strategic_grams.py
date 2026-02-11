@@ -57,9 +57,43 @@ DEFAULT_STRATEGIC_GRAMS: List[str] = [
 ]
 
 
+COUNTDOWN_STRATEGIC_GRAMS: List[str] = [
+    # Countdown-specific planning / narration patterns.
+    "let me try",
+    "let me check",
+    "i need to",
+    "we need to",
+    "using the numbers",
+    "use each number",
+    "each number once",
+    "closest to",
+    "too high",
+    "too low",
+    "difference is",
+    "sum is",
+    "product is",
+    "divide by",
+    "multiply by",
+    "try another",
+    "another way",
+    "that gives",
+    "which gives",
+    "so we get",
+    "line 1",
+    "line 2",
+    "final expression",
+    "answer is",
+]
+
+
 def get_default_strategic_grams() -> List[str]:
     """Return a copy of the curated default strategic grams."""
     return list(DEFAULT_STRATEGIC_GRAMS)
+
+
+def get_countdown_strategic_grams() -> List[str]:
+    """Return a copy of the countdown-specific strategic grams."""
+    return list(COUNTDOWN_STRATEGIC_GRAMS)
 
 
 # ---------------------------------------------------------------------------
