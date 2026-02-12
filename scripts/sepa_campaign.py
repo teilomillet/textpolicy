@@ -113,6 +113,21 @@ def _build_parser() -> argparse.ArgumentParser:
         default="linear",
         help="SEPA schedule for candidate arm.",
     )
+    parser.add_argument(
+        "--candidate-sepa-delay-steps",
+        type=int,
+        default=0,
+        help="SEPA delay steps for candidate arm.",
+    )
+    parser.add_argument(
+        "--candidate-sepa-correct-rate-gate",
+        type=float,
+        default=0.0,
+        help=(
+            "Candidate sticky correctness gate in [0, 1]. "
+            "When >0, λ stays 0 until the run reaches this correct rate."
+        ),
+    )
 
     parser.add_argument(
         "--wandb-project",
@@ -229,6 +244,10 @@ def _build_run_specs(args: argparse.Namespace, seeds: Sequence[int], campaign_ro
                         str(args.candidate_sepa_steps),
                         "--sepa-schedule",
                         str(args.candidate_sepa_schedule),
+                        "--sepa-delay-steps",
+                        str(args.candidate_sepa_delay_steps),
+                        "--sepa-correct-rate-gate",
+                        str(args.candidate_sepa_correct_rate_gate),
                     ]
                 )
 
@@ -316,6 +335,34 @@ def _paired_success_dirs(results: Sequence[RunResult]) -> tuple[List[str], List[
             baseline_dirs.append(base.output_dir)
             candidate_dirs.append(cand.output_dir)
     return baseline_dirs, candidate_dirs
+
+
+def _run_dynamics_map(campaign_root: Path, analysis_dir: Path) -> Dict[str, str]:
+    dynamics_script = _repo_root() / "scripts" / "sepa_dynamics_map.py"
+    if not dynamics_script.exists():
+        raise FileNotFoundError(f"Dynamics script not found: {dynamics_script}")
+
+    dynamics_json = analysis_dir / "dynamics.json"
+    dynamics_md = analysis_dir / "dynamics.md"
+    cmd = [
+        sys.executable,
+        str(dynamics_script),
+        "--campaign-root",
+        str(campaign_root),
+        "--output",
+        str(dynamics_json),
+        "--markdown",
+        str(dynamics_md),
+    ]
+    proc = subprocess.run(cmd, cwd=str(_repo_root()), check=False)
+    if proc.returncode != 0:
+        raise RuntimeError(
+            f"sepa_dynamics_map.py failed with return code {proc.returncode}"
+        )
+    return {
+        "dynamics_json": str(dynamics_json),
+        "dynamics_md": str(dynamics_md),
+    }
 
 
 def main() -> int:
@@ -416,6 +463,13 @@ def main() -> int:
             "significance_json": str(sig_json_path),
             "significance_md": str(sig_md_path),
         }
+        try:
+            dynamics_paths = _run_dynamics_map(campaign_root, analysis_dir)
+            manifest["analysis"].update(dynamics_paths)
+            print(f"Wrote dynamics map: {dynamics_paths['dynamics_json']}")
+        except Exception as exc:
+            manifest["analysis"]["dynamics_error"] = str(exc)
+            print(f"Dynamics map skipped ({exc})")
         print(f"Litmus status: {litmus.status}")
         print(f"Significance recommendation: {significance.recommendation}")
         print(f"Wrote analysis: {analysis_dir}")

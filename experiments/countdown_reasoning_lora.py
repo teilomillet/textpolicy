@@ -78,6 +78,8 @@ class ReasoningConfig:
     hicra_gamma: float = 0.3
     sepa_steps: int = 0
     sepa_schedule: str = "linear"
+    sepa_delay_steps: int = 0
+    sepa_correct_rate_gate: float = 0.0
 
     # Training
     learning_rate: float = 5e-6
@@ -615,7 +617,9 @@ def run_experiment(config: ReasoningConfig) -> None:
         print(
             f"GTPO + SEPA: α₁={config.alpha_1}, α₂={config.alpha_2}, "
             f"threshold={config.reward_threshold}, "
-            f"schedule={config.sepa_schedule}, sepa_steps={config.sepa_steps}"
+            f"schedule={config.sepa_schedule}, sepa_steps={config.sepa_steps}, "
+            f"sepa_delay_steps={config.sepa_delay_steps}, "
+            f"sepa_correct_rate_gate={config.sepa_correct_rate_gate}"
         )
     else:
         print(
@@ -653,6 +657,8 @@ def run_experiment(config: ReasoningConfig) -> None:
         hicra_gamma=config.hicra_gamma,
         sepa_steps=config.sepa_steps,
         sepa_schedule=config.sepa_schedule,
+        sepa_delay_steps=config.sepa_delay_steps,
+        sepa_correct_rate_gate=config.sepa_correct_rate_gate,
     )
 
     # 3. Trainer
@@ -733,6 +739,7 @@ def run_experiment(config: ReasoningConfig) -> None:
 
     print(f"\nStarting reasoning training for {config.max_steps} steps...")
     global_episode_count = 0
+    sepa_controller = getattr(transform, "_sepa", None) if sepa_enabled else None
     phase_totals: Dict[str, float] = {
         "rollout_collect_s": 0.0,
         "emergence_log_s": 0.0,
@@ -744,10 +751,12 @@ def run_experiment(config: ReasoningConfig) -> None:
     for step in range(config.max_steps):
         step_start = time.perf_counter()
         sepa_lambda: Optional[float] = None
+        sepa_gate_open: Optional[bool] = None
         if sepa_enabled:
-            sepa_controller = getattr(transform, "_sepa", None)
             if sepa_controller is not None and hasattr(sepa_controller, "resolve_lambda"):
                 sepa_lambda = float(sepa_controller.resolve_lambda(step=float(step)))
+            if sepa_controller is not None and hasattr(sepa_controller, "gate_open"):
+                sepa_gate_open = bool(getattr(sepa_controller, "gate_open"))
 
         buffer.clear()
         rollout_start = time.perf_counter()
@@ -768,15 +777,22 @@ def run_experiment(config: ReasoningConfig) -> None:
         global_episode_count += len(step_episodes)
 
         emergence_start = time.perf_counter()
+        extra_metrics: Dict[str, float] = {}
+        if sepa_lambda is not None:
+            extra_metrics["sepa_lambda"] = float(sepa_lambda)
+        if sepa_gate_open is not None:
+            extra_metrics["sepa_gate_open"] = 1.0 if sepa_gate_open else 0.0
         step_stats = emergence.log_step(
             step=step,
             episodes=step_episodes,
             tokenizer=tokenizer,
             examples=step_examples,
-            extra_step_metrics=(
-                {"sepa_lambda": sepa_lambda} if sepa_lambda is not None else None
-            ),
+            extra_step_metrics=extra_metrics if extra_metrics else None,
         )
+        if sepa_controller is not None and hasattr(sepa_controller, "observe_correct_rate"):
+            total = max(float(step_stats.get("total_count", 0.0)), 1.0)
+            correct_rate = float(step_stats.get("correct_count", 0.0)) / total
+            sepa_controller.observe_correct_rate(correct_rate)
         phase_totals["emergence_log_s"] += time.perf_counter() - emergence_start
 
         train_start = time.perf_counter()
@@ -942,6 +958,24 @@ if __name__ == "__main__":
             "'auto' enables variance-driven SEPA even when sepa_steps=0."
         ),
     )
+    parser.add_argument(
+        "--sepa-delay-steps",
+        type=int,
+        default=0,
+        help=(
+            "Delay before SEPA linear ramp starts. "
+            "During this delay λ stays at 0."
+        ),
+    )
+    parser.add_argument(
+        "--sepa-correct-rate-gate",
+        type=float,
+        default=0.0,
+        help=(
+            "Sticky correctness gate for SEPA λ in [0, 1]. "
+            "When >0, λ stays 0 until step-level correct rate reaches this value."
+        ),
+    )
     parser.add_argument("--wandb-project", default=None, help="Wandb project name (enables wandb logging)")
     parser.add_argument("--wandb-run-name", default=None, help="Wandb run name (optional)")
     parser.add_argument(
@@ -1019,6 +1053,8 @@ if __name__ == "__main__":
         hicra_gamma=args.hicra_gamma,
         sepa_steps=args.sepa_steps,
         sepa_schedule=args.sepa_schedule,
+        sepa_delay_steps=args.sepa_delay_steps,
+        sepa_correct_rate_gate=args.sepa_correct_rate_gate,
         wandb_project=args.wandb_project,
         wandb_run_name=args.wandb_run_name,
         wandb_completion_log_interval=args.wandb_completion_log_interval,

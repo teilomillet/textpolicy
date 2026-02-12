@@ -37,6 +37,8 @@ class TestReasoningConfig:
         assert cfg.hicra_gamma == 0.3
         assert cfg.sepa_steps == 0
         assert cfg.sepa_schedule == "linear"
+        assert cfg.sepa_delay_steps == 0
+        assert cfg.sepa_correct_rate_gate == 0.0
         assert cfg.episodes_per_step == 8
         assert cfg.batch_size == 8
         assert cfg.output_dir == "results/countdown_reasoning_lora"
@@ -466,9 +468,13 @@ class TestRunExperiment:
                     batch_size=4,
                     sepa_steps=25,
                     sepa_schedule="auto",
+                    sepa_delay_steps=3,
+                    sepa_correct_rate_gate=0.05,
                 )
                 exp.run_experiment(cfg)
 
                 kwargs = mock_build_transform.call_args.kwargs
                 assert kwargs["sepa_steps"] == 25
                 assert kwargs["sepa_schedule"] == "auto"
+                assert kwargs["sepa_delay_steps"] == 3
+                assert kwargs["sepa_correct_rate_gate"] == pytest.approx(0.05)

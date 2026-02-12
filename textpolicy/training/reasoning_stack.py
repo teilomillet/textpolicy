@@ -285,6 +285,8 @@ class _GTPOTransform:
         hicra_gamma: float = 0.0,
         sepa_steps: int = 0,
         sepa_schedule: str = "linear",
+        sepa_delay_steps: int = 0,
+        sepa_correct_rate_gate: float = 0.0,
         sepa_ema_decay: float = 0.99,
         sepa_var_threshold: float = 0.2,
         sepa_warmup: int = 50,
@@ -311,6 +313,8 @@ class _GTPOTransform:
         self._sepa = SEPAController(
             sepa_steps=sepa_steps,
             sepa_schedule=sepa_schedule,
+            sepa_delay_steps=sepa_delay_steps,
+            sepa_correct_rate_gate=sepa_correct_rate_gate,
             sepa_ema_decay=sepa_ema_decay,
             sepa_var_threshold=sepa_var_threshold,
             sepa_warmup=sepa_warmup,
@@ -592,6 +596,8 @@ def build_gtpo_transform(
     hicra_gamma: float = 0.0,
     sepa_steps: int = 0,
     sepa_schedule: str = "linear",
+    sepa_delay_steps: int = 0,
+    sepa_correct_rate_gate: float = 0.0,
     semantic_entropy: bool = False,
     semantic_entropy_embedding_mode: str = "hash",
 ) -> Callable[[mx.array, Dict[str, Any]], mx.array]:
@@ -696,6 +702,11 @@ def build_gtpo_transform(
                       ``'linear'`` uses ``sepa_steps`` only.
                       ``'auto'`` uses variance-driven λ, optionally capped by
                       linear ``sepa_steps``.
+        sepa_delay_steps: Hold λ at 0 for this many initial steps before the
+                         linear component begins (default 0).
+        sepa_correct_rate_gate: Sticky correctness gate in [0, 1]. When >0,
+                               λ remains 0 until observed correct-rate reaches
+                               this threshold (default 0 = disabled).
         semantic_entropy: Enable planning-level semantic-entropy tracking in
                          ``postprocess_batch``. This does not affect gradients
                          or the GTPO loss path.
@@ -718,6 +729,15 @@ def build_gtpo_transform(
     if sepa_steps < 0:
         raise ValueError(
             f"sepa_steps must be >= 0, got {sepa_steps}."
+        )
+    if sepa_delay_steps < 0:
+        raise ValueError(
+            f"sepa_delay_steps must be >= 0, got {sepa_delay_steps}."
+        )
+    if not (0.0 <= sepa_correct_rate_gate <= 1.0):
+        raise ValueError(
+            "sepa_correct_rate_gate must be in [0, 1], "
+            f"got {sepa_correct_rate_gate}."
         )
     sepa_schedule = normalize_sepa_schedule(sepa_schedule)
 
@@ -759,7 +779,8 @@ def build_gtpo_transform(
         hicra_gamma=hicra_gamma,
         sepa_steps=sepa_steps,
         sepa_schedule=sepa_schedule,
+        sepa_delay_steps=sepa_delay_steps,
+        sepa_correct_rate_gate=sepa_correct_rate_gate,
         semantic_entropy=semantic_entropy,
         semantic_entropy_embedding_mode=semantic_entropy_embedding_mode,
     )
-
