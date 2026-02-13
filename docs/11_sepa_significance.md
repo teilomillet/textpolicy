@@ -106,4 +106,4 @@ The power analysis below uses a standard two-sample proportion design (`alpha = 
 1. This is `N=1` seed; continuous metrics are correlated, so directional consistency is suggestive but not statistically meaningful (order-of-magnitude chance baseline is about `1/8` if reduced to ~3 independent metric families).
 2. The effect-size assumptions in the power table are planning assumptions, not calibrated priors.
 3. The smoke test used MaxRL prompt-level normalization; the funded campaign must use the same normalization (`--advantage-mode maxrl`) to test the same hypothesis.
-4. The Trinity tokenizer regex warning remains unresolved in current runs, so these results are provisional until tokenization is pinned/fixed.
+4. The Trinity tokenizer regex issue is now handled in `/Users/teilomillet/Code/textpolicy/textpolicy/generation/mlx_generation.py` by applying the Mistral regex fix post-load; campaign reports should still note tokenizer/toolchain versions for reproducibility.
