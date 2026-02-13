@@ -43,6 +43,7 @@ class Episode:
         self.logprob: Optional[list[Any]] = None
         self.value: Optional[list[Any]] = None
         self.entropy: Optional[list[Any]] = None
+        self.is_correct: Optional[list[Any]] = None
 
     def append(
         self, 
@@ -54,7 +55,8 @@ class Episode:
         timeout=False, 
         logprob=None, 
         value=None, 
-        entropy=None
+        entropy=None,
+        is_correct=None,
     ):
         """
         Append a single environment transition to the episode.
@@ -69,6 +71,8 @@ class Episode:
             logprob: Log probability of action (optional, but must be all-or-nothing)
             value: Estimated state value (optional, but must be all-or-nothing)
             entropy: Action entropy (optional, but must be all-or-nothing)
+            is_correct: Verifier correctness signal (optional, but must be
+                all-or-nothing)
 
         Raises:
             ValueError: If optional fields are inconsistent (some provided, some missing)
@@ -120,6 +124,18 @@ class Episode:
                     "Either provide entropy for all steps or none."
                 )
 
+        # Handle is_correct: must be all-or-nothing
+        if is_correct is not None:
+            if self.is_correct is None:
+                self.is_correct = []
+            self.is_correct.append(is_correct)
+        else:
+            if self.is_correct is not None:
+                raise ValueError(
+                    "This episode includes is_correct, but one step is missing it. "
+                    "Either provide is_correct for all steps or none."
+                )
+
     def __len__(self) -> int:
         """Return the number of steps in this episode."""
         return len(self.obs)
@@ -140,6 +156,7 @@ class Episode:
             - 'logprob': (T,) - log probabilities (if provided)
             - 'value': (T,) - value estimates (if provided)
             - 'entropy': (T,) - action entropy (if provided)
+            - 'is_correct': (T,) - verifier correctness flags (if provided)
 
         Notes:
             This runs once at sample time and uses batched array conversion.
@@ -260,6 +277,9 @@ class Episode:
                 else:
                     raise
 
+        if self.is_correct is not None:
+            result['is_correct'] = mx.array(self.is_correct)
+
         return result
 
     def to_dict(self) -> Dict[str, Any]:
@@ -298,6 +318,8 @@ class Episode:
             result['value'] = self.value
         if self.entropy is not None:
             result['entropy'] = self.entropy
+        if self.is_correct is not None:
+            result['is_correct'] = self.is_correct
 
         return result
 
@@ -341,6 +363,8 @@ class Episode:
                 step_data['value'] = data['value'][i]
             if 'entropy' in data and i < len(data['entropy']):
                 step_data['entropy'] = data['entropy'][i]
+            if 'is_correct' in data and i < len(data['is_correct']):
+                step_data['is_correct'] = data['is_correct'][i]
                 
             episode.append(**step_data)
             
@@ -381,3 +405,8 @@ class Episode:
             
         if self.entropy is not None and len(self.entropy) != episode_length:
             raise ValueError(f"entropy length {len(self.entropy)} != episode length {episode_length}") 
+
+        if self.is_correct is not None and len(self.is_correct) != episode_length:
+            raise ValueError(
+                f"is_correct length {len(self.is_correct)} != episode length {episode_length}"
+            )

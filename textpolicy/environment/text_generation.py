@@ -627,7 +627,7 @@ class TextGenerationEnv(Environment):
     def __init__(
         self,
         prompts: List[str],
-        reward_fn: Callable[[str, str, dict], float],
+        reward_fn: Callable[[str, str, dict], Any],
         max_tokens: int = 25,
         seed: int = 42,
         tokenizer: Any = None,
@@ -639,7 +639,11 @@ class TextGenerationEnv(Environment):
 
         Args:
             prompts: List of prompts to cycle through
-            reward_fn: Function that computes reward from (prompt, completion, example)
+            reward_fn: Function that computes reward from (prompt, completion, example).
+                May return:
+                - scalar reward
+                - dict {"reward": float, "is_correct": bool}
+                - tuple/list (reward, is_correct)
             max_tokens: Maximum tokens to generate per response
             seed: Random seed for reproducible behavior
             tokenizer: Tokenizer for converting prompts to tokens (required for MLX compatibility)
@@ -753,16 +757,21 @@ class TextGenerationEnv(Environment):
         # Episode terminates after each generation (single-turn tasks)
         terminated = True
         
-        # Compute reward using provided reward function
-        # Pass tokenizer for EOS token detection and truncation detection
+        # Compute reward using provided reward function.
+        # Supports either:
+        # - scalar reward
+        # - dict with {"reward": float, "is_correct": bool}
+        # - tuple/list of (reward, is_correct)
+        # Pass tokenizer for EOS token detection and truncation detection.
         prompt_index = (self.current_episode // self.group_size) % len(self.prompts)
-        reward = self.reward_fn(
+        reward_output = self.reward_fn(
             prompt=self.current_prompt,
             completion=response_text,
             example=self.examples[prompt_index],
             tokenizer=self.tokenizer,  # Pass tokenizer for EOS detection
             truncated=truncated        # Pass truncation flag from environment
         )
+        reward, is_correct = self._parse_reward_output(reward_output)
         
         # Prepare next observation (empty MLX array since episode ended)
         next_observation = mx.array([])
@@ -773,6 +782,8 @@ class TextGenerationEnv(Environment):
             'prompt': self.current_prompt,
             'episode': self.current_episode
         }
+        if is_correct is not None:
+            info['is_correct'] = bool(is_correct)
         
         # Move to next episode
         self.current_episode += 1
@@ -788,6 +799,36 @@ class TextGenerationEnv(Environment):
             'truncated': truncated,
             'info': info,
         }
+
+    @staticmethod
+    def _parse_reward_output(reward_output: Any) -> Tuple[float, Optional[bool]]:
+        """Normalize reward function outputs into (reward, is_correct)."""
+        reward: float
+        is_correct: Optional[bool] = None
+
+        if isinstance(reward_output, dict):
+            if 'reward' not in reward_output:
+                raise ValueError(
+                    "reward_fn dict output must include a 'reward' key."
+                )
+            reward = float(reward_output['reward'])
+            if 'is_correct' in reward_output:
+                raw = reward_output['is_correct']
+                if hasattr(raw, "item"):
+                    raw = raw.item()
+                is_correct = bool(raw)
+            return reward, is_correct
+
+        if isinstance(reward_output, (tuple, list)) and len(reward_output) == 2:
+            reward = float(reward_output[0])
+            raw = reward_output[1]
+            if raw is not None:
+                if hasattr(raw, "item"):
+                    raw = raw.item()
+                is_correct = bool(raw)
+            return reward, is_correct
+
+        return float(reward_output), None
     
     @property
     def observation_space(self) -> Any:

@@ -126,6 +126,58 @@ class TestReasoningConfig:
         with pytest.raises(ValueError, match="batch_size"):
             run_experiment(cfg)
 
+    def test_maxrl_routes_binary_rewards_to_trainer(self):
+        from experiments.countdown_reasoning_lora import ReasoningConfig, run_experiment
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            with (
+                patch("experiments.countdown_reasoning_lora.load_model") as mock_load_model,
+                patch(
+                    "experiments.countdown_reasoning_lora.create_lora_setup"
+                ) as mock_lora_setup,
+                patch(
+                    "experiments.countdown_reasoning_lora.Trainer"
+                ) as mock_trainer_cls,
+                patch("experiments.countdown_reasoning_lora.build_gtpo_transform"),
+                patch("experiments.countdown_reasoning_lora.create_policy"),
+                patch(
+                    "experiments.countdown_reasoning_lora.generate_countdown_problems"
+                ) as mock_generate_problems,
+                patch(
+                    "experiments.countdown_reasoning_lora.RolloutCoordinator"
+                ) as mock_rollout_cls,
+                patch(
+                    "experiments.countdown_reasoning_lora.EmergenceLogger"
+                ) as mock_emergence_cls,
+                patch("experiments.countdown_reasoning_lora.save_checkpoint"),
+            ):
+                mock_model = MagicMock()
+                mock_tokenizer = MagicMock()
+                mock_load_model.return_value = (mock_model, mock_tokenizer)
+                mock_lora_setup.return_value = (
+                    mock_model,
+                    {"memory_savings_percent": 95.0},
+                )
+                mock_trainer = MagicMock()
+                mock_trainer.model = mock_model
+                mock_trainer_cls.return_value = mock_trainer
+                mock_generate_problems.return_value = [{"target": 15, "numbers": [10, 5, 3]}]
+                mock_rollout_cls.return_value = MagicMock()
+                mock_emergence_cls.return_value = MagicMock()
+
+                cfg = ReasoningConfig(
+                    max_steps=0,
+                    output_dir=tmpdir,
+                    num_problems=1,
+                    episodes_per_step=4,
+                    batch_size=4,
+                    use_maxrl=True,
+                )
+                run_experiment(cfg)
+
+                trainer_kwargs = mock_trainer_cls.call_args.kwargs
+                assert trainer_kwargs["advantage_reward_key"] == "binary_rewards"
+
 
 class TestRunExperiment:
     def test_log_wandb_step_uses_explicit_step_kwarg(self):

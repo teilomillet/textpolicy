@@ -175,6 +175,9 @@ class RolloutRunner:
             # Store transition using strategy-specific logic
             if timer is not None:
                 timer.start("buffer_store")
+            transition_extra = dict(extra)
+            if isinstance(info, dict) and "is_correct" in info:
+                transition_extra.setdefault("is_correct", info["is_correct"])
             self.strategy.store_transition(
                 buffer=self.buffer,
                 obs=obs_single,
@@ -183,7 +186,7 @@ class RolloutRunner:
                 next_obs=next_obs,
                 done=done,
                 timeout=trunc,
-                **extra  # Algorithm-specific data (logprob, value, etc.)
+                **transition_extra,  # Algorithm-specific data + explicit correctness
             )
             if timer is not None:
                 timer.stop("buffer_store")
@@ -262,6 +265,8 @@ class RolloutRunner:
                 'done': done or trunc,  # Combine terminated/truncated for backward compatibility
                 **extra  # Include logprob, value, entropy from strategy
             }
+            if isinstance(info, dict) and "is_correct" in info:
+                transition["is_correct"] = info["is_correct"]
             trajectory.append(transition)
             
             # Track step count for tests
@@ -435,6 +440,9 @@ class RolloutRunner:
                 timer.start("buffer_store")
             for i in range(this_batch):
                 next_obs, reward, done, trunc, info = step_outputs[i]
+                transition_extra = dict(extras[i])
+                if isinstance(info, dict) and "is_correct" in info:
+                    transition_extra.setdefault("is_correct", info["is_correct"])
                 self.strategy.store_transition(
                     buffer=self.buffer,
                     obs=obs_batch[i],
@@ -443,7 +451,7 @@ class RolloutRunner:
                     next_obs=next_obs,
                     done=done,
                     timeout=trunc,
-                    **extras[i],
+                    **transition_extra,
                 )
             if timer is not None:
                 timer.stop("buffer_store")

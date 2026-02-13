@@ -41,7 +41,7 @@ class BufferStorage:
         next_obs: Any,
         done: bool,
         timeout: bool = False,
-        **kwargs  # Additional fields like logprob, value, entropy
+        **kwargs  # Additional fields like logprob, value, entropy, is_correct
     ):
         """
         Add a transition to the current episode.
@@ -55,7 +55,7 @@ class BufferStorage:
             next_obs: Next observation
             done: Boolean indicating episode termination
             timeout: Boolean indicating truncation (e.g. time limit)
-            **kwargs: Optional fields (logprob, value, entropy)
+            **kwargs: Optional fields (logprob, value, entropy, is_correct)
         """
         # Add transition to current episode
         self.current_episode.append(
@@ -159,7 +159,7 @@ class BufferStorage:
         Args:
             data: Dictionary containing episode data from episode.to_dict()
                   Must include: obs, act, rew, next_obs, done, timeout
-                  Optional: logprob, value, entropy
+                  Optional: logprob, value, entropy, is_correct
         
         Raises:
             ValueError: If episode data is invalid or inconsistent
@@ -179,6 +179,7 @@ class BufferStorage:
         episode.logprob = data.get('logprob', None)
         episode.value = data.get('value', None) 
         episode.entropy = data.get('entropy', None)
+        episode.is_correct = data.get('is_correct', None)
         
         # Validate consistency before adding
         episode.validate_consistency()

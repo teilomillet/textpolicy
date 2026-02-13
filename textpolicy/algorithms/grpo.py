@@ -111,6 +111,8 @@ def compute_advantages(rewards: Union[List[float], mx.array]) -> mx.array:
 def compute_advantages_maxrl(
     rewards: Union[List[float], mx.array],
     eps: float = 1e-6,
+    prompt_ids: Optional[mx.array] = None,
+    num_prompt_groups: Optional[int] = None,
 ) -> mx.array:
     """
     Compute MaxRL advantages: inverse success-rate reweighting.
@@ -119,8 +121,13 @@ def compute_advantages_maxrl(
     std-normalization with mean-normalization, recovering the 1/p(x)
     reweighting from maximum likelihood in the infinite-compute limit.
 
-    Formula:
+    Formula (global):
         A_i = (r_i - mean(r)) / (mean(r) + eps)
+
+    Formula (per-prompt, matching Algorithm 1 of the paper):
+        For each prompt x:
+            r_hat(x) = mean(rewards for completions of x)
+            A_i = (r_i - r_hat(x)) / (r_hat(x) + eps)
 
     For binary rewards with K successes out of N rollouts (mean = K/N):
         - Correct rollout:   A = (N-K)/K   (large when K is small -> hard problem)
@@ -139,17 +146,23 @@ def compute_advantages_maxrl(
                  interpretation is exact only for binary.
                  Negative rewards are not supported.
         eps: Small constant for numerical stability (default 1e-6).
+        prompt_ids: Optional [num_episodes] int array mapping each episode
+                   to its prompt group. When provided with num_prompt_groups,
+                   computes per-prompt means (Algorithm 1, line 8).
+                   When None, uses global mean (simpler, same as GRPO).
+        num_prompt_groups: Number of unique prompt groups. Required when
+                          prompt_ids is provided. Must be a Python int
+                          (used at mx.compile trace time for array allocation).
 
     Returns:
         Episode-level advantages [num_episodes] as MLX array.
         The Trainer automatically expands to token-level via _expand_advantages.
 
     References:
-        Maximum Likelihood Reinforcement Learning (MaxRL).
-        Formalizes correctness-based RL as latent-generation MLE.
-        Standard RL optimizes only the first-order approximation of the
-        MLE objective; MaxRL recovers the full objective via inverse
-        success-rate reweighting.
+        Maximum Likelihood Reinforcement Learning (Tajwar et al., 2026).
+        Algorithm 1, line 8: r_hat(x) = mean over completions of prompt x.
+        Equation (10): variance-reduced form of the MLE gradient.
+        Table 2: weight function w(p) = 1/p for maximum likelihood.
     """
     if isinstance(rewards, list):
         if not rewards:
@@ -160,6 +173,45 @@ def compute_advantages_maxrl(
     else:
         raise TypeError(f"Expected list or mx.array, got {type(rewards)}")
 
+    # MaxRL assumes non-negative rewards (success-rate interpretation).
+    if bool(mx.any(rewards_tensor < 0).item()):
+        raise ValueError(
+            "MaxRL expects non-negative rewards. "
+            "Shift/clip rewards to >= 0 before calling compute_advantages_maxrl."
+        )
+
+    if prompt_ids is not None and num_prompt_groups is not None:
+        # Per-prompt MaxRL: Algorithm 1 of the paper.
+        # Compute r_hat(x) = mean(rewards for completions of prompt x)
+        # for each prompt x, then A_i = (r_i - r_hat(x_i)) / (r_hat(x_i) + eps).
+        #
+        # Vectorized via one-hot matrix multiplication for mx.compile safety.
+        # No Python branching on mx.array values; num_prompt_groups is a Python
+        # int resolved at trace time (re-traces if group count changes, which is
+        # rare — typically fixed per prompt set).
+        group_range = mx.arange(num_prompt_groups)  # [G]
+        # One-hot membership: [G, N] where membership[g, i] = 1 if episode i belongs to group g
+        membership = (prompt_ids[None, :] == group_range[:, None]).astype(mx.float32)
+
+        # Per-group sum and count
+        group_sums = membership @ rewards_tensor[:, None]  # [G, 1]
+        group_counts = mx.sum(membership, axis=1, keepdims=True)  # [G, 1]
+        safe_counts = mx.maximum(group_counts, mx.array(1.0))
+        group_means = group_sums / safe_counts  # [G, 1]
+
+        # Map back to per-episode means: [N]
+        per_episode_mean = (membership.T @ group_means).reshape(-1)
+
+        # MaxRL advantage per prompt
+        advantages = (rewards_tensor - per_episode_mean) / (per_episode_mean + eps)
+
+        # Zero-out episodes in groups with no signal (mean ~ 0)
+        has_signal = per_episode_mean > eps
+        advantages = mx.where(has_signal, advantages, mx.zeros_like(advantages))
+
+        return advantages
+
+    # Global fallback: single mean across all episodes (existing behavior).
     mean_r = mx.mean(rewards_tensor)
 
     # MaxRL advantage: (r_i - mean) / (mean + eps)
@@ -171,6 +223,10 @@ def compute_advantages_maxrl(
     advantages = mx.where(has_signal, advantages, mx.zeros_like(advantages))
 
     return advantages
+
+
+# Mark as accepting prompt group arguments so the Trainer can forward them.
+compute_advantages_maxrl.accepts_prompt_groups = True  # type: ignore[attr-defined]
 
 
 def compute_advantages_dr_grpo(rewards: Union[List[float], mx.array]) -> mx.array:
@@ -1507,6 +1563,31 @@ def _flatten_tokens(items: List[Any]) -> List:
     return flattened
 
 
+def _to_binary_success_reward(reward: Any) -> float:
+    """
+    Convert a reward container to episode-level Bernoulli correctness.
+
+    Convention: return 1.0 when any element is >= 1.0, else 0.0.
+    """
+    if isinstance(reward, (int, float)):
+        return 1.0 if float(reward) >= 1.0 else 0.0
+
+    if hasattr(reward, "tolist"):
+        reward = reward.tolist()
+
+    values = _flatten_tokens(reward if isinstance(reward, list) else [reward])
+    numeric: List[float] = []
+    for value in values:
+        if hasattr(value, "item"):
+            value = value.item()
+        try:
+            numeric.append(float(value))
+        except (TypeError, ValueError):
+            continue
+
+    return 1.0 if any(v >= 1.0 for v in numeric) else 0.0
+
+
 def _pack_episodes(episodes: List[Any], sort_by_length: bool = True) -> Dict[str, Any]:
     """
     Pack episodes into batch data for GRPO training.
@@ -1519,6 +1600,9 @@ def _pack_episodes(episodes: List[Any], sort_by_length: bool = True) -> Dict[str
         - 'act': 2D ``[N, max_act_len]`` right-padded response tokens
         - 'logprob': Flat 1D unpadded concatenated log probabilities
         - 'rewards': Episode rewards as MLX array
+        - 'binary_rewards': Episode-level Bernoulli correctness (0/1),
+          sourced from explicit ``is_correct`` when available, otherwise
+          derived from reward values.
         - 'episode_lengths': List of per-episode response token counts
         - 'prompt_lengths': List of per-episode prompt token counts
 
@@ -1548,8 +1632,11 @@ def _pack_episodes(episodes: List[Any], sort_by_length: bool = True) -> Dict[str
             'act': mx.array([], dtype=mx.int64),
             'logprob': mx.array([], dtype=mx.float32),
             'rewards': mx.array([]),
+            'binary_rewards': mx.array([], dtype=mx.float32),
             'episode_lengths': [],
             'prompt_lengths': [],
+            'prompt_ids': mx.array([], dtype=mx.int32),
+            'num_prompt_groups': 0,
         }
 
     episode_lengths = []
@@ -1559,11 +1646,25 @@ def _pack_episodes(episodes: List[Any], sort_by_length: bool = True) -> Dict[str
     all_logprobs = []
     pending_reward_sums: List[Tuple[int, mx.array]] = []
     scalar_rewards: Dict[int, float] = {}
+    episode_binary_rewards = [0.0] * len(episodes)
+
+    # Build prompt group mapping: prompt_key → group_id
+    prompt_key_to_id: Dict[tuple, int] = {}
+    prompt_ids_list: List[int] = []
 
     for i, episode in enumerate(episodes):
+        # Assign prompt group ID
+        key = _get_prompt_key(episode)
+        if key not in prompt_key_to_id:
+            prompt_key_to_id[key] = len(prompt_key_to_id)
+        prompt_ids_list.append(prompt_key_to_id[key])
         if hasattr(episode, 'rew'):
             # Episode object with attributes
             pending_reward_sums.append((i, mx.sum(mx.array(episode.rew))))
+            if getattr(episode, "is_correct", None) is not None:
+                episode_binary_rewards[i] = _to_binary_success_reward(episode.is_correct)
+            else:
+                episode_binary_rewards[i] = _to_binary_success_reward(episode.rew)
 
             # Flatten observation and action tokens
             flattened_obs = _flatten_tokens(episode.obs)
@@ -1587,6 +1688,10 @@ def _pack_episodes(episodes: List[Any], sort_by_length: bool = True) -> Dict[str
                 scalar_rewards[i] = float(rew)
             else:
                 pending_reward_sums.append((i, mx.sum(mx.array(rew))))
+            if episode.get("is_correct") is not None:
+                episode_binary_rewards[i] = _to_binary_success_reward(episode["is_correct"])
+            else:
+                episode_binary_rewards[i] = _to_binary_success_reward(rew)
 
             # Flatten observation and action tokens
             flattened_obs = _flatten_tokens(episode['obs'])
@@ -1625,6 +1730,8 @@ def _pack_episodes(episodes: List[Any], sort_by_length: bool = True) -> Dict[str
         episode_lengths = [episode_lengths[i] for i in sort_idx]
         prompt_lengths = [prompt_lengths[i] for i in sort_idx]
         episode_rewards = [episode_rewards[i] for i in sort_idx]
+        episode_binary_rewards = [episode_binary_rewards[i] for i in sort_idx]
+        prompt_ids_list = [prompt_ids_list[i] for i in sort_idx]
 
     # Find maximum sequence lengths for padding
     max_obs_len = max(len(obs) for obs in all_obs) if all_obs else 0
@@ -1671,8 +1778,11 @@ def _pack_episodes(episodes: List[Any], sort_by_length: bool = True) -> Dict[str
         'act': stacked_acts,
         'logprob': flat_logprobs,
         'rewards': mx.array(episode_rewards),
+        'binary_rewards': mx.array(episode_binary_rewards, dtype=mx.float32),
         'episode_lengths': episode_lengths,
         'prompt_lengths': prompt_lengths,
+        'prompt_ids': mx.array(prompt_ids_list, dtype=mx.int32),
+        'num_prompt_groups': len(prompt_key_to_id),
     }
 
 

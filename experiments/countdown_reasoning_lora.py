@@ -45,11 +45,15 @@ from textpolicy.generation.mlx_generation import create_policy, load_model, deco
 from textpolicy.generation.reload import save_adapters
 from textpolicy.rollout import RolloutCoordinator
 from textpolicy.tasks.countdown import (
-    countdown_reward,
+    countdown_reward_with_info,
     format_countdown_prompt,
     generate_countdown_problems,
 )
-from textpolicy.algorithms.grpo import compute_advantages, policy_loss
+from textpolicy.algorithms.grpo import (
+    compute_advantages,
+    compute_advantages_maxrl,
+    policy_loss,
+)
 from textpolicy.generation.lora import create_lora_setup
 from textpolicy.training import Trainer, build_gtpo_transform
 
@@ -80,6 +84,7 @@ class ReasoningConfig:
     sepa_schedule: str = "linear"
     sepa_delay_steps: int = 0
     sepa_correct_rate_gate: float = 0.0
+    use_maxrl: bool = False
 
     # Training
     learning_rate: float = 5e-6
@@ -613,18 +618,22 @@ def run_experiment(config: ReasoningConfig) -> None:
     optimizer = optim.Adam(learning_rate=config.learning_rate)
 
     sepa_enabled = (config.sepa_steps > 0 or config.sepa_schedule == "auto")
+    advantage_fn = compute_advantages_maxrl if config.use_maxrl else compute_advantages
+    advantage_name = "MaxRL" if config.use_maxrl else "GRPO"
     if sepa_enabled:
         print(
             f"GTPO + SEPA: α₁={config.alpha_1}, α₂={config.alpha_2}, "
             f"threshold={config.reward_threshold}, "
             f"schedule={config.sepa_schedule}, sepa_steps={config.sepa_steps}, "
             f"sepa_delay_steps={config.sepa_delay_steps}, "
-            f"sepa_correct_rate_gate={config.sepa_correct_rate_gate}"
+            f"sepa_correct_rate_gate={config.sepa_correct_rate_gate}, "
+            f"advantage={advantage_name}"
         )
     else:
         print(
             f"GTPO + HICRA: α₁={config.alpha_1}, α₂={config.alpha_2}, "
-            f"threshold={config.reward_threshold}, γ_hicra={config.hicra_gamma}"
+            f"threshold={config.reward_threshold}, γ_hicra={config.hicra_gamma}, "
+            f"advantage={advantage_name}"
         )
 
     # Enable per-step policy metrics only when wandb will actually be active.
@@ -659,15 +668,17 @@ def run_experiment(config: ReasoningConfig) -> None:
         sepa_schedule=config.sepa_schedule,
         sepa_delay_steps=config.sepa_delay_steps,
         sepa_correct_rate_gate=config.sepa_correct_rate_gate,
+        use_maxrl_base=config.use_maxrl,
     )
 
     # 3. Trainer
     trainer = Trainer(
         model=lora_model,
-        advantage_fn=compute_advantages,
+        advantage_fn=advantage_fn,
         loss_fn=policy_loss,
         optimizer=optimizer,
         advantage_transform_fn=transform,
+        advantage_reward_key=("binary_rewards" if config.use_maxrl else "rewards"),
         max_grad_norm=config.max_grad_norm,
         compile_training=config.compile_training,
         gradient_checkpointing=config.gradient_checkpointing,
@@ -692,7 +703,7 @@ def run_experiment(config: ReasoningConfig) -> None:
     def create_env():
         return TextGenerationEnv(
             prompts=prompts,
-            reward_fn=countdown_reward,
+            reward_fn=countdown_reward_with_info,
             max_tokens=config.max_completion_tokens,
             tokenizer=tokenizer,
             examples=problems,
@@ -976,6 +987,15 @@ if __name__ == "__main__":
             "When >0, λ stays 0 until step-level correct rate reaches this value."
         ),
     )
+    parser.add_argument(
+        "--maxrl",
+        action="store_true",
+        help=(
+            "Use MaxRL advantages ((r-mean)/(mean+eps) with mean-gate). "
+            "Uses binary correctness rewards for MaxRL while GTPO/SEPA keeps "
+            "the original shaped reward stream."
+        ),
+    )
     parser.add_argument("--wandb-project", default=None, help="Wandb project name (enables wandb logging)")
     parser.add_argument("--wandb-run-name", default=None, help="Wandb run name (optional)")
     parser.add_argument(
@@ -1055,6 +1075,7 @@ if __name__ == "__main__":
         sepa_schedule=args.sepa_schedule,
         sepa_delay_steps=args.sepa_delay_steps,
         sepa_correct_rate_gate=args.sepa_correct_rate_gate,
+        use_maxrl=args.maxrl,
         wandb_project=args.wandb_project,
         wandb_run_name=args.wandb_run_name,
         wandb_completion_log_interval=args.wandb_completion_log_interval,

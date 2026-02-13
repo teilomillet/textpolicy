@@ -15,7 +15,10 @@ from textpolicy.tasks.countdown.prompt import (
     format_countdown_prompt,
     extract_expression_from_completion,
 )
-from textpolicy.tasks.countdown.reward import countdown_reward
+from textpolicy.tasks.countdown.reward import (
+    countdown_reward,
+    countdown_reward_with_info,
+)
 from textpolicy.tasks.countdown.dataset import (
     generate_countdown_problems,
     load_countdown_dataset,
@@ -257,6 +260,24 @@ class TestCountdownReward:
             extra_param="ignored",
         )
         assert score == 1.0
+
+    def test_reward_with_info_correct(self):
+        info = countdown_reward_with_info(
+            prompt="",
+            completion="(1+2+3)*4",
+            example={"target": 24, "numbers": [1, 2, 3, 4]},
+        )
+        assert info["reward"] == 1.0
+        assert info["is_correct"] is True
+
+    def test_reward_with_info_incorrect(self):
+        info = countdown_reward_with_info(
+            prompt="",
+            completion="1+2+3+4",
+            example={"target": 24, "numbers": [1, 2, 3, 4]},
+        )
+        assert info["reward"] == 0.0
+        assert info["is_correct"] is False
 
 
 # =========================================================================

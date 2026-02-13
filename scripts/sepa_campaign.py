@@ -94,6 +94,16 @@ def _build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--max-tokens", type=int, default=128, help="Max completion tokens.")
     parser.add_argument("--temperature", type=float, default=0.4, help="Sampling temperature.")
     parser.add_argument("--lr", type=float, default=5e-6, help="Learning rate.")
+    parser.add_argument(
+        "--advantage-mode",
+        choices=["grpo", "maxrl"],
+        default="grpo",
+        help=(
+            "Prompt-level advantage normalization used in both arms. "
+            "'grpo' keeps the existing baseline behavior; 'maxrl' adds --maxrl "
+            "to each run so campaigns test the same hypothesis as MaxRL smoke tests."
+        ),
+    )
 
     parser.add_argument(
         "--baseline-hicra-gamma",
@@ -225,6 +235,8 @@ def _build_run_specs(args: argparse.Namespace, seeds: Sequence[int], campaign_ro
                 "--wandb-completion-char-limit",
                 "0",
             ]
+            if args.advantage_mode == "maxrl":
+                cmd.append("--maxrl")
 
             if group == "baseline":
                 cmd.extend(
@@ -384,6 +396,7 @@ def main() -> int:
         "campaign_root": str(campaign_root),
         "created_at": datetime.now().isoformat(),
         "execute": bool(args.execute),
+        "advantage_mode": str(args.advantage_mode),
         "seeds": seeds,
         "planned_runs": [
             {

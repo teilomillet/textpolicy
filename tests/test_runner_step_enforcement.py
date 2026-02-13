@@ -101,6 +101,20 @@ class _CounterRewardDoneEnv:
         }
 
 
+class _CorrectnessInfoEnv:
+    def reset(self):
+        return 0, {}
+
+    def step(self, action):
+        return {
+            "observation": 0,
+            "reward": -0.5,
+            "terminated": True,
+            "truncated": False,
+            "info": {"is_correct": True},
+        }
+
+
 def _counter_reward_env_fn():
     return _CounterRewardDoneEnv()
 
@@ -173,6 +187,20 @@ def test_runner_collect_accepts_dict_step():
     buf = runner.collect()
     # Buffer should contain at least one episode
     assert len(buf.episodes) >= 0  # episodes may be reset; ensure call succeeds
+
+
+def test_runner_collect_preserves_is_correct_from_info():
+    from textpolicy.rollout.runner import RolloutRunner
+    from textpolicy.rollout.strategy import create_strategy
+
+    env = _CorrectnessInfoEnv()
+    strategy = create_strategy("grpo")
+    runner = RolloutRunner(env, policy=_policy, strategy=strategy, max_steps=1)
+
+    buf = runner.collect()
+    assert len(buf.episodes) == 1
+    episode = buf.episodes[0]
+    assert episode.is_correct == [True]
 
 
 def test_runner_collect_rejects_missing_required_step_keys():

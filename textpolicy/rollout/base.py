@@ -51,7 +51,7 @@ DEFAULT_WORKER_TIMEOUT = 1.0
 
 # Supported transition data keys for validation
 REQUIRED_TRANSITION_KEYS = {'obs', 'act', 'rew', 'next_obs', 'done'}
-OPTIONAL_TRANSITION_KEYS = {'timeout', 'logprob', 'value', 'entropy'}
+OPTIONAL_TRANSITION_KEYS = {'timeout', 'logprob', 'value', 'entropy', 'is_correct'}
 ALL_TRANSITION_KEYS = REQUIRED_TRANSITION_KEYS | OPTIONAL_TRANSITION_KEYS
 
 

@@ -60,7 +60,8 @@ class Buffer:
         timeout: bool = False,
         logprob: Optional[Any] = None,
         value: Optional[Any] = None,
-        entropy: Optional[Any] = None
+        entropy: Optional[Any] = None,
+        is_correct: Optional[Any] = None,
     ):
         """
         Add a transition to the current episode.
@@ -77,6 +78,8 @@ class Buffer:
             logprob: Log probability of action (optional, all-or-nothing)
             value: Estimated state value (optional, all-or-nothing)
             entropy: Action entropy (optional, all-or-nothing)
+            is_correct: Explicit verifier correctness signal (optional,
+                all-or-nothing). Should be boolean-like (0/1 or False/True).
 
         Example:
             buffer.add(
@@ -93,7 +96,8 @@ class Buffer:
         self.storage.add_transition(
             obs=obs, act=act, rew=rew, next_obs=next_obs,
             done=done, timeout=timeout,
-            logprob=logprob, value=value, entropy=entropy
+            logprob=logprob, value=value, entropy=entropy,
+            is_correct=is_correct,
         )
     
     def sample(self) -> Dict[str, Any]:
@@ -174,7 +178,7 @@ class Buffer:
         Args:
             data: Dictionary containing episode data (e.g. from `episode.to_dict()`)
                   Must include: obs, act, rew, next_obs, done, timeout
-                  Optional: logprob, value, entropy
+                  Optional: logprob, value, entropy, is_correct
         """
         self.storage.add_episode_from_dict(data)
     

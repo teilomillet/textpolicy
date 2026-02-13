@@ -60,12 +60,14 @@ class BufferSampler:
         all_logprob = []
         all_value = []
         all_entropy = []
+        all_is_correct = []
         
         # Only include optional fields that exist in ALL episodes for consistent sampling
         # This matches the buffer's "all-or-nothing" design philosophy per episode
         has_logprob = all(episode.logprob is not None for episode in self.episodes)
         has_value = all(episode.value is not None for episode in self.episodes)
         has_entropy = all(episode.entropy is not None for episode in self.episodes)
+        has_is_correct = all(episode.is_correct is not None for episode in self.episodes)
         
         # Collect transitions from all episodes
         for episode in self.episodes:
@@ -84,6 +86,8 @@ class BufferSampler:
                     all_value.append(episode.value[i])
                 if has_entropy:
                     all_entropy.append(episode.entropy[i])
+                if has_is_correct:
+                    all_is_correct.append(episode.is_correct[i])
         
         # Create Episode directly with collected data (bypassing validation during construction)
         all_transitions = Episode()
@@ -101,6 +105,8 @@ class BufferSampler:
             all_transitions.value = all_value
         if has_entropy:
             all_transitions.entropy = all_entropy
+        if has_is_correct:
+            all_transitions.is_correct = all_is_correct
         
         return all_transitions.to_tensor_dict()
     
@@ -145,6 +151,8 @@ class BufferSampler:
                     step_dict["value"] = episode.value[i]
                 if episode.entropy is not None:
                     step_dict["entropy"] = episode.entropy[i]
+                if episode.is_correct is not None:
+                    step_dict["is_correct"] = episode.is_correct[i]
                 
                 steps.append(step_dict)
                 
@@ -217,7 +225,8 @@ class BufferSampler:
                     timeout=episode.timeout[i],
                     logprob=episode.logprob[i] if episode.logprob is not None else None,
                     value=episode.value[i] if episode.value is not None else None,
-                    entropy=episode.entropy[i] if episode.entropy is not None else None
+                    entropy=episode.entropy[i] if episode.entropy is not None else None,
+                    is_correct=episode.is_correct[i] if episode.is_correct is not None else None,
                 )
         
         return all_transitions.to_tensor_dict()
@@ -290,6 +299,8 @@ class BufferSampler:
                 seq['value'] = ep.value[start:end]
             if ep.entropy is not None:
                 seq['entropy'] = ep.entropy[start:end]
+            if ep.is_correct is not None:
+                seq['is_correct'] = ep.is_correct[start:end]
 
             sequences.append(seq)
             episodes_used.append(ep)

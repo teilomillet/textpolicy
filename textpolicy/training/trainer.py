@@ -70,6 +70,7 @@ class Trainer:
         auto_save_lora: Optional[str] = None,
         metrics_interval: int = 10,
         advantage_transform_fn: Optional[Callable] = None,
+        advantage_reward_key: str = "rewards",
         profile: bool = False,
         on_policy: bool = True
     ):
@@ -113,6 +114,9 @@ class Trainer:
                 advantages after expansion. Signature:
                 ``(advantages: mx.array, batch_data: Dict) -> mx.array``.
                 Used by HICRA to amplify planning tokens. None means no-op.
+            advantage_reward_key: Batch key passed to ``advantage_fn``.
+                Defaults to ``"rewards"``. Set to ``"binary_rewards"`` for
+                MaxRL-style Bernoulli correctness advantages.
             profile: When True, insert ``mx.eval()`` barriers between training
                 phases and record per-phase wall-clock times in the metrics dict
                 returned by ``train()``.  Zero cost when False (single boolean
@@ -125,6 +129,9 @@ class Trainer:
         """
         self.model = model
         self.advantage_fn = advantage_fn
+        self._advantage_fn_accepts_groups = getattr(
+            advantage_fn, 'accepts_prompt_groups', False
+        )
         self.loss_fn = loss_fn
         self.optimizer = optimizer
         self.get_logprobs_fn = get_logprobs_fn or self._default_get_logprobs
@@ -133,6 +140,12 @@ class Trainer:
         self.metrics_interval = max(1, metrics_interval)
 
         self.advantage_transform_fn = advantage_transform_fn
+        if not isinstance(advantage_reward_key, str) or not advantage_reward_key:
+            raise ValueError(
+                "advantage_reward_key must be a non-empty string, "
+                f"got {advantage_reward_key!r}."
+            )
+        self.advantage_reward_key = advantage_reward_key
 
         # Profiling: Timer is only allocated when profile=True.
         # When _timer is None every phase-timing check is a single ``if``.
@@ -513,7 +526,52 @@ class Trainer:
             Selected batch data for training
         """
         return self._prepare_batch_from_buffer(buffer)
-    
+
+    def _get_advantage_rewards(self, batch_data: Dict[str, Any]) -> mx.array:
+        """Return the reward tensor used by ``advantage_fn``."""
+        reward_key = self.advantage_reward_key
+        if reward_key not in batch_data:
+            available_keys = ", ".join(sorted(str(k) for k in batch_data.keys()))
+            raise KeyError(
+                f"batch_data is missing advantage_reward_key={reward_key!r}. "
+                f"Available keys: {available_keys}"
+            )
+        return batch_data[reward_key]
+
+    @staticmethod
+    def _to_binary_success_reward(rewards: Any) -> float:
+        """
+        Convert per-step rewards to an episode-level Bernoulli correctness flag.
+
+        Convention: ``1.0`` when any step has reward >= 1.0, else ``0.0``.
+        """
+        if isinstance(rewards, (int, float)):
+            return 1.0 if float(rewards) >= 1.0 else 0.0
+
+        values: List[float] = []
+        if hasattr(rewards, "tolist"):
+            rewards = rewards.tolist()
+        if isinstance(rewards, list):
+            for value in rewards:
+                if hasattr(value, "item"):
+                    value = value.item()
+                try:
+                    values.append(float(value))
+                except (TypeError, ValueError):
+                    continue
+        elif hasattr(rewards, "item"):
+            try:
+                values.append(float(rewards.item()))
+            except (TypeError, ValueError):
+                pass
+        else:
+            try:
+                values.append(float(rewards))
+            except (TypeError, ValueError):
+                pass
+
+        return 1.0 if any(v >= 1.0 for v in values) else 0.0
+
     def _loss_fn(self, batch_data: Dict[str, mx.array]) -> mx.array:
         """
         Internal loss function for nn.value_and_grad.
@@ -533,7 +591,7 @@ class Trainer:
         observations = batch_data['obs']
         actions = batch_data['act']  # Actions taken during rollout
         old_logprobs = batch_data['logprob']
-        rewards = batch_data['rewards']
+        advantage_rewards = self._get_advantage_rewards(batch_data)
         
         # For proper logprob extraction, we need the full context (prompt + response)
         # The model needs to see the full sequence to generate logits for all response positions
@@ -619,8 +677,17 @@ class Trainer:
         if new_logprobs.shape[0] == 0:
             return mx.array(0.0)
 
-        # Compute advantages using algorithm-specific function
-        advantages = self.advantage_fn(rewards)
+        # Compute advantages using algorithm-specific function.
+        # Forward per-prompt group info when the advantage function supports it
+        # (e.g. MaxRL per-prompt grouping, Algorithm 1 of Tajwar et al. 2026).
+        if self._advantage_fn_accepts_groups and 'prompt_ids' in batch_data:
+            advantages = self.advantage_fn(
+                advantage_rewards,
+                prompt_ids=batch_data['prompt_ids'],
+                num_prompt_groups=batch_data['num_prompt_groups'],
+            )
+        else:
+            advantages = self.advantage_fn(advantage_rewards)
         
         # Handle advantage expansion for sequence-level algorithms
         # Check if advantages (episode-level) need expansion to match logprobs (token-level)
@@ -1115,10 +1182,19 @@ class Trainer:
                 model_output = self.model(model_input)
                 new_logprobs = self.get_logprobs_fn(model_output, actions)
 
+            advantage_rewards = self._get_advantage_rewards(batch_data)
+            if self._advantage_fn_accepts_groups and 'prompt_ids' in batch_data:
+                adv_for_metrics = self.advantage_fn(
+                    advantage_rewards,
+                    prompt_ids=batch_data['prompt_ids'],
+                    num_prompt_groups=batch_data['num_prompt_groups'],
+                )
+            else:
+                adv_for_metrics = self.advantage_fn(advantage_rewards)
             algorithm_metrics = self.metrics_fn(
                 batch_data['logprob'],
                 new_logprobs,
-                self.advantage_fn(batch_data['rewards'])
+                adv_for_metrics
             )
             metrics.update(algorithm_metrics)
 
@@ -1201,6 +1277,7 @@ class Trainer:
         # Build reward sums lazily, then evaluate in a single sync barrier
         episode_lengths = []
         pending_sums = []
+        episode_binary_rewards: List[float] = []
 
         # Collect all transitions
         all_obs = []
@@ -1227,6 +1304,14 @@ class Trainer:
                 )
 
             pending_sums.append(mx.sum(mx.array(rew)))
+            if hasattr(episode, "is_correct"):
+                explicit_correct = episode.is_correct
+            elif isinstance(episode, dict):
+                explicit_correct = episode.get("is_correct")
+            else:
+                explicit_correct = None
+            binary_source = explicit_correct if explicit_correct is not None else rew
+            episode_binary_rewards.append(self._to_binary_success_reward(binary_source))
             episode_lengths.append(len(obs))
 
             # Collect transitions
@@ -1245,6 +1330,7 @@ class Trainer:
             'act': mx.concatenate(all_acts),
             'logprob': mx.concatenate(all_logprobs),
             'rewards': mx.array(episode_rewards),
+            'binary_rewards': mx.array(episode_binary_rewards, dtype=mx.float32),
             'episode_lengths': episode_lengths
         }
         
