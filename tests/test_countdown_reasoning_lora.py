@@ -265,6 +265,38 @@ class TestRunExperiment:
         args, _kwargs = mock_wandb.log.call_args
         assert args[0]["sepa/lambda"] == 0.4
 
+    def test_log_wandb_step_logs_max_token_hit_metrics(self):
+        import experiments.countdown_reasoning_lora as exp
+
+        mock_wandb = MagicMock()
+        with patch.object(exp, "wandb", mock_wandb, create=True):
+            cfg = exp.ReasoningConfig()
+            exp.log_wandb_step(
+                step=3,
+                step_stats={
+                    "entropy_mean": 0.2,
+                    "entropy_std": 0.05,
+                    "mean_reward": 0.4,
+                    "std_reward": 0.1,
+                    "planning_token_ratio": 0.3,
+                    "total_count": 2,
+                    "correct_count": 1,
+                    "mean_completion_length": 12.0,
+                    "max_tokens_limit": 128,
+                    "max_tokens_hit_count": 1,
+                    "max_tokens_hit_rate": 0.5,
+                },
+                train_metrics={"loss": 0.25},
+                episode_stats={},
+                config=cfg,
+                use_wandb=True,
+            )
+
+        args, _kwargs = mock_wandb.log.call_args
+        assert args[0]["completions/max_tokens_limit"] == 128
+        assert args[0]["completions/max_tokens_hit_count"] == 1
+        assert args[0]["completions/max_tokens_hit_rate"] == pytest.approx(0.5)
+
     def test_log_wandb_completions_skips_non_interval_steps(self):
         import experiments.countdown_reasoning_lora as exp
 

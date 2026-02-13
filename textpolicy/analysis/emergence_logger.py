@@ -204,6 +204,7 @@ class EmergenceLogger:
         planning_config: Optional[PlanningPatternConfig] = None,
         strategic_grams: Optional[List[str]] = None,
         metadata_extractor: Optional[Callable] = None,
+        max_completion_tokens: Optional[int] = None,
     ) -> None:
         self._output_dir = Path(output_dir)
         self._output_dir.mkdir(parents=True, exist_ok=True)
@@ -218,6 +219,11 @@ class EmergenceLogger:
             if isinstance(gram, str) and gram.strip()
         ]
         self._extract_metadata = metadata_extractor or _default_metadata_extractor
+        self._max_completion_tokens = (
+            int(max_completion_tokens)
+            if isinstance(max_completion_tokens, (int, float)) and float(max_completion_tokens) > 0
+            else None
+        )
 
     # ------------------------------------------------------------------
     # Public API
@@ -303,6 +309,7 @@ class EmergenceLogger:
             correct_count=correct_count,
             total_count=total,
             elapsed_ms=elapsed_ms,
+            max_tokens_limit=self._max_completion_tokens,
         )
 
         if isinstance(extra_step_metrics, dict):
@@ -405,6 +412,7 @@ class EmergenceLogger:
         correct_count: int,
         total_count: int,
         elapsed_ms: float,
+        max_tokens_limit: Optional[int],
     ) -> dict:
         """Compute aggregate statistics for a training step."""
         import math
@@ -418,11 +426,24 @@ class EmergenceLogger:
             m = _mean(xs)
             return math.sqrt(sum((x - m) ** 2 for x in xs) / len(xs))
 
+        max_tokens_hit_count = 0
+        max_tokens_hit_rate = 0.0
+        if isinstance(max_tokens_limit, int) and max_tokens_limit > 0:
+            max_tokens_hit_count = sum(
+                1 for length in completion_lengths if int(length) >= max_tokens_limit
+            )
+            max_tokens_hit_rate = (
+                (max_tokens_hit_count / total_count) if total_count > 0 else 0.0
+            )
+
         return {
             "step": step,
             "mean_reward": _mean(rewards),
             "std_reward": _std(rewards),
             "mean_completion_length": _mean([float(l) for l in completion_lengths]),
+            "max_tokens_limit": max_tokens_limit,
+            "max_tokens_hit_count": max_tokens_hit_count,
+            "max_tokens_hit_rate": max_tokens_hit_rate,
             "planning_token_ratio": _mean(planning_ratios),
             "entropy_mean": _mean(entropy_values),
             "entropy_std": _std(entropy_values),

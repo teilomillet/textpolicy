@@ -288,6 +288,7 @@ class TestEmergenceLogger:
 
         required_fields = [
             "step", "mean_reward", "std_reward", "mean_completion_length",
+            "max_tokens_limit", "max_tokens_hit_count", "max_tokens_hit_rate",
             "planning_token_ratio", "entropy_mean", "entropy_std",
             "strategic_gram_match_rate",
             "strategic_gram_word_ratio",
@@ -299,6 +300,18 @@ class TestEmergenceLogger:
         ]
         for field in required_fields:
             assert field in rec, f"Missing field: {field}"
+
+    def test_step_record_tracks_max_token_limit_hits(self, tmp_dir):
+        logger = EmergenceLogger(output_dir=tmp_dir, max_completion_tokens=4)
+        tok = _make_tokenizer()
+        ep1 = _make_episode([1], [2, 3, 4, 5], 0.5)  # hits limit
+        ep2 = _make_episode([1], [2, 3, 4], 0.5)  # below limit
+        step = logger.log_step(step=0, episodes=[ep1, ep2], tokenizer=tok)
+        logger.finish()
+
+        assert step["max_tokens_limit"] == 4
+        assert step["max_tokens_hit_count"] == 1
+        assert step["max_tokens_hit_rate"] == pytest.approx(0.5)
 
     def test_step_record_includes_extra_step_metrics(self, tmp_dir):
         logger = EmergenceLogger(output_dir=tmp_dir)

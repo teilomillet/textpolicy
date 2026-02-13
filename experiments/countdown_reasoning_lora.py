@@ -488,6 +488,12 @@ def log_wandb_step(
     # ── Completion lengths ────────────────────────────────────────────
     # TRL GRPOTrainer logs mean/min/max (arXiv 2508.04349 Appendix E.2).
     log["completions/mean_length"] = step_stats["mean_completion_length"]
+    if "max_tokens_hit_rate" in step_stats:
+        log["completions/max_tokens_hit_rate"] = step_stats["max_tokens_hit_rate"]
+    if "max_tokens_hit_count" in step_stats:
+        log["completions/max_tokens_hit_count"] = step_stats["max_tokens_hit_count"]
+    if step_stats.get("max_tokens_limit") is not None:
+        log["completions/max_tokens_limit"] = step_stats["max_tokens_limit"]
     if "min_length" in episode_stats:
         log["completions/min_length"] = episode_stats["min_length"]
         log["completions/max_length"] = episode_stats["max_length"]
@@ -795,6 +801,7 @@ def run_experiment(config: ReasoningConfig) -> None:
     emergence = EmergenceLogger(
         output_dir=output_dir / "emergence",
         strategic_grams=strategic_grams,
+        max_completion_tokens=config.max_completion_tokens,
     )
     use_wandb = init_wandb(config)
 
@@ -900,6 +907,8 @@ def run_experiment(config: ReasoningConfig) -> None:
                 f"planning_ratio={step_stats['planning_token_ratio']:.4f} "
                 f"gram_match={step_stats.get('strategic_gram_match_rate', 0.0):.2f} "
                 f"gram_delta={gram_delta_txt} "
+                f"max_tok_hit={int(step_stats.get('max_tokens_hit_count', 0))}/"
+                f"{step_stats.get('total_count', 0)} "
                 f"step_time={time.perf_counter() - step_start:.2f}s "
                 f"[rollout {rollout_pct:.0f}% | train {train_pct:.0f}%]"
             )
