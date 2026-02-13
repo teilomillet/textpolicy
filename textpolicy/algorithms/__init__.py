@@ -11,6 +11,7 @@ from .grpo import (
     # Core GRPO functions
     compute_advantages,
     compute_advantages_dr_grpo,
+    compute_advantages_maxrl,
     policy_loss,
     grpo_loss,
     compute_metrics,
@@ -27,6 +28,7 @@ from .grpo import (
     gtpo_loss,
     # Compiled versions
     compute_advantages_compiled,
+    compute_advantages_maxrl_compiled,
     policy_loss_compiled,
     policy_loss_compiled_constant_norm,
     # Length shaping (DAPO-style soft overlong penalties)
@@ -63,6 +65,7 @@ __all__ = [
     # GRPO core functions
     "compute_advantages",
     "compute_advantages_dr_grpo",
+    "compute_advantages_maxrl",
     "policy_loss",
     "grpo_loss",
     "compute_metrics",
@@ -79,6 +82,7 @@ __all__ = [
     "gtpo_loss",
     # GRPO compiled versions
     "compute_advantages_compiled",
+    "compute_advantages_maxrl_compiled",
     "policy_loss_compiled",
     "policy_loss_compiled_constant_norm",
     # GRPO length shaping (DAPO-style)

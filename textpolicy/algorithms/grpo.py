@@ -108,6 +108,71 @@ def compute_advantages(rewards: Union[List[float], mx.array]) -> mx.array:
     return advantages
 
 
+def compute_advantages_maxrl(
+    rewards: Union[List[float], mx.array],
+    eps: float = 1e-6,
+) -> mx.array:
+    """
+    Compute MaxRL advantages: inverse success-rate reweighting.
+
+    MaxRL (Maximum Likelihood Reinforcement Learning) replaces GRPO's
+    std-normalization with mean-normalization, recovering the 1/p(x)
+    reweighting from maximum likelihood in the infinite-compute limit.
+
+    Formula:
+        A_i = (r_i - mean(r)) / (mean(r) + eps)
+
+    For binary rewards with K successes out of N rollouts (mean = K/N):
+        - Correct rollout:   A = (N-K)/K   (large when K is small -> hard problem)
+        - Incorrect rollout: A = -1         (constant, regardless of difficulty)
+
+    This places exponentially more gradient weight on hard, low-success-rate
+    prompts — the same 1/p reweighting that makes maximum likelihood the
+    principled objective in supervised learning with binary correctness.
+
+    When mean(r) ~ 0 (no correct rollout in the group), all advantages are
+    set to zero: there is no positive signal to learn from.
+
+    Args:
+        rewards: Episode rewards [num_episodes], ideally binary {0, 1}.
+                 Works with non-negative continuous rewards, but the 1/p
+                 interpretation is exact only for binary.
+                 Negative rewards are not supported.
+        eps: Small constant for numerical stability (default 1e-6).
+
+    Returns:
+        Episode-level advantages [num_episodes] as MLX array.
+        The Trainer automatically expands to token-level via _expand_advantages.
+
+    References:
+        Maximum Likelihood Reinforcement Learning (MaxRL).
+        Formalizes correctness-based RL as latent-generation MLE.
+        Standard RL optimizes only the first-order approximation of the
+        MLE objective; MaxRL recovers the full objective via inverse
+        success-rate reweighting.
+    """
+    if isinstance(rewards, list):
+        if not rewards:
+            return mx.array([])
+        rewards_tensor = mx.array(rewards, dtype=mx.float32)
+    elif isinstance(rewards, mx.array):
+        rewards_tensor = rewards.astype(mx.float32)
+    else:
+        raise TypeError(f"Expected list or mx.array, got {type(rewards)}")
+
+    mean_r = mx.mean(rewards_tensor)
+
+    # MaxRL advantage: (r_i - mean) / (mean + eps)
+    advantages = (rewards_tensor - mean_r) / (mean_r + eps)
+
+    # Zero out when mean ~ 0 (no correct rollout): no positive signal to learn from.
+    # Uses mx.where for compile-safety (no Python branching on mx.array).
+    has_signal = mean_r > eps
+    advantages = mx.where(has_signal, advantages, mx.zeros_like(advantages))
+
+    return advantages
+
+
 def compute_advantages_dr_grpo(rewards: Union[List[float], mx.array]) -> mx.array:
     """
     Compute advantages using Dr. GRPO (GRPO Done Right) - bias-corrected version.
@@ -245,6 +310,39 @@ def compute_advantages_compiled(rewards: mx.array) -> mx.array:
     """Compiled version of compute_advantages for maximum performance."""
     group_mean = mx.mean(rewards)
     return rewards - group_mean
+
+
+@mx.compile
+def _compute_advantages_maxrl_compiled_kernel(rewards: mx.array) -> mx.array:
+    """Internal compiled kernel for MaxRL advantages."""
+    eps = 1e-6
+    mean_r = mx.mean(rewards)
+    advantages = (rewards - mean_r) / (mean_r + eps)
+    has_signal = mean_r > eps
+    return mx.where(has_signal, advantages, mx.zeros_like(advantages))
+
+
+def compute_advantages_maxrl_compiled(rewards: mx.array) -> mx.array:
+    """
+    Compiled MaxRL advantages with eager input validation.
+
+    Expects non-negative rewards; use this for performance after data has been
+    validated. For list inputs, use compute_advantages_maxrl.
+    """
+    if not isinstance(rewards, mx.array):
+        raise TypeError(f"Expected mx.array, got {type(rewards)}")
+
+    rewards_tensor = rewards.astype(mx.float32)
+    if rewards_tensor.size == 0:
+        return rewards_tensor
+
+    if bool(mx.any(rewards_tensor < 0).item()):
+        raise ValueError(
+            "MaxRL expects non-negative rewards. "
+            "Shift/clip rewards to >= 0 before calling compute_advantages_maxrl_compiled."
+        )
+
+    return _compute_advantages_maxrl_compiled_kernel(rewards_tensor)
 
 
 # --- Compiled Policy Loss Variants ---

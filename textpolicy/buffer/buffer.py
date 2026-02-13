@@ -148,10 +148,9 @@ class Buffer:
         seq_len: int,
         recent_first: bool = True,
         drop_incomplete: bool = True,
-        dreamerv3_mode: bool = False,
     ) -> Dict[str, Any]:
         """
-        Sample contiguous sequences of length `seq_len` for DreamerV3 RSSM training.
+        Sample contiguous sequences of length `seq_len`.
 
         Returns tensors shaped [batch, time, ...] and avoids crossing episode boundaries.
 
@@ -164,7 +163,6 @@ class Buffer:
             seq_len=seq_len,
             recent_first=recent_first,
             drop_incomplete=drop_incomplete,
-            dreamerv3_mode=dreamerv3_mode,
         )
     
     def add_episode_from_dict(self, data: Dict[str, Any]):
