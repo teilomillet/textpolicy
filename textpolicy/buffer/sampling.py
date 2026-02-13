@@ -60,12 +60,14 @@ class BufferSampler:
         all_logprob = []
         all_value = []
         all_entropy = []
+        all_is_correct = []
         
         # Only include optional fields that exist in ALL episodes for consistent sampling
         # This matches the buffer's "all-or-nothing" design philosophy per episode
         has_logprob = all(episode.logprob is not None for episode in self.episodes)
         has_value = all(episode.value is not None for episode in self.episodes)
         has_entropy = all(episode.entropy is not None for episode in self.episodes)
+        has_is_correct = all(episode.is_correct is not None for episode in self.episodes)
         
         # Collect transitions from all episodes
         for episode in self.episodes:
@@ -84,6 +86,8 @@ class BufferSampler:
                     all_value.append(episode.value[i])
                 if has_entropy:
                     all_entropy.append(episode.entropy[i])
+                if has_is_correct:
+                    all_is_correct.append(episode.is_correct[i])
         
         # Create Episode directly with collected data (bypassing validation during construction)
         all_transitions = Episode()
@@ -101,6 +105,8 @@ class BufferSampler:
             all_transitions.value = all_value
         if has_entropy:
             all_transitions.entropy = all_entropy
+        if has_is_correct:
+            all_transitions.is_correct = all_is_correct
         
         return all_transitions.to_tensor_dict()
     
@@ -145,6 +151,8 @@ class BufferSampler:
                     step_dict["value"] = episode.value[i]
                 if episode.entropy is not None:
                     step_dict["entropy"] = episode.entropy[i]
+                if episode.is_correct is not None:
+                    step_dict["is_correct"] = episode.is_correct[i]
                 
                 steps.append(step_dict)
                 
@@ -217,7 +225,8 @@ class BufferSampler:
                     timeout=episode.timeout[i],
                     logprob=episode.logprob[i] if episode.logprob is not None else None,
                     value=episode.value[i] if episode.value is not None else None,
-                    entropy=episode.entropy[i] if episode.entropy is not None else None
+                    entropy=episode.entropy[i] if episode.entropy is not None else None,
+                    is_correct=episode.is_correct[i] if episode.is_correct is not None else None,
                 )
         
         return all_transitions.to_tensor_dict()
@@ -228,20 +237,17 @@ class BufferSampler:
         seq_len: int,
         recent_first: bool = True,
         drop_incomplete: bool = True,
-        dreamerv3_mode: bool = False,
     ) -> Dict[str, mx.array]:
         """
         Sample contiguous sequences of length `seq_len`.
 
-        Standard mode: Sample without crossing episode boundaries (for most algorithms).
-        DreamerV3 mode: Sample across episode boundaries to include terminals (for continue head supervision).
+        Samples without crossing episode boundaries.
 
         Args:
             batch_size: Number of sequences to sample.
             seq_len: Length of each sequence (T). Must be > 0.
             recent_first: Prefer sampling from most recent episodes first.
-            drop_incomplete: If True, skip episodes shorter than seq_len (standard mode only).
-            dreamerv3_mode: If True, sample across episode boundaries to include terminals.
+            drop_incomplete: If True, skip episodes shorter than seq_len.
 
         Returns:
             Dict of MLX arrays with keys: obs, act, rew, next_obs, done, timeout
@@ -254,9 +260,6 @@ class BufferSampler:
             raise ValueError("Buffer is empty. No episodes to sample.")
         if batch_size <= 0 or seq_len <= 0:
             raise ValueError("batch_size and seq_len must be positive.")
-
-        if dreamerv3_mode:
-            return self._sample_dreamerv3_sequences(batch_size, seq_len, recent_first)
 
         # Choose episode order per recency preference.
         episodes_iter: List[Episode]
@@ -274,10 +277,9 @@ class BufferSampler:
                 # Padding/masking path intentionally not implemented for simplicity/perf.
                 continue
 
-            # DreamerV3 expects sequences sampled from throughout episodes, not only tails.
-            # Avoid tail-bias that would overrepresent terminal steps. Sample a random
-            # start index within the episode. This preserves recency at the episode
-            # level via episodes_iter and reduces bias within each episode.
+            # Sample a random start index within the episode to avoid tail-bias
+            # that would overrepresent terminal steps. This preserves recency at the
+            # episode level via episodes_iter and reduces bias within each episode.
             max_start = n - seq_len
             start = random.randint(0, max_start) if max_start > 0 else 0
             end = start + seq_len  # ensure fixed-length window [start, start+seq_len)
@@ -297,6 +299,8 @@ class BufferSampler:
                 seq['value'] = ep.value[start:end]
             if ep.entropy is not None:
                 seq['entropy'] = ep.entropy[start:end]
+            if ep.is_correct is not None:
+                seq['is_correct'] = ep.is_correct[start:end]
 
             sequences.append(seq)
             episodes_used.append(ep)
@@ -325,87 +329,6 @@ class BufferSampler:
 
         return batch
 
-    def _sample_dreamerv3_sequences(
-        self, 
-        batch_size: int, 
-        seq_len: int, 
-        recent_first: bool
-    ) -> Dict[str, mx.array]:
-        """
-        Sample sequences for DreamerV3 by concatenating episodes to form continuous trajectories.
-        
-        Unlike standard sampling, this allows sequences to span episode boundaries,
-        ensuring episode terminals appear within training sequences for continue head supervision.
-        
-        This mirrors DreamerV3's original replay buffer behavior where episodes are stored
-        continuously and sampling naturally includes episode boundaries.
-        """
-        import random
-        
-        # Create continuous trajectory by concatenating recent episodes
-        episodes_iter = list(reversed(self.episodes)) if recent_first else list(self.episodes)
-        
-        # Concatenate episodes into a continuous stream
-        continuous_data = {
-            'obs': [], 'act': [], 'rew': [], 'next_obs': [], 'done': [], 'timeout': [],
-            'logprob': [], 'value': [], 'entropy': []
-        }
-        
-        for ep in episodes_iter:
-            continuous_data['obs'].extend(ep.obs)
-            continuous_data['act'].extend(ep.act) 
-            continuous_data['rew'].extend(ep.rew)
-            continuous_data['next_obs'].extend(ep.next_obs)
-            continuous_data['done'].extend(ep.done)
-            continuous_data['timeout'].extend(ep.timeout)
-            
-            # Optional fields - extend with zeros if episode doesn't have them
-            if ep.logprob is not None:
-                continuous_data['logprob'].extend(ep.logprob)
-            else:
-                continuous_data['logprob'].extend([0.0] * len(ep.obs))
-                
-            if ep.value is not None:
-                continuous_data['value'].extend(ep.value)
-            else:
-                continuous_data['value'].extend([0.0] * len(ep.obs))
-                
-            if ep.entropy is not None:
-                continuous_data['entropy'].extend(ep.entropy)
-            else:
-                continuous_data['entropy'].extend([0.0] * len(ep.obs))
-        
-        total_steps = len(continuous_data['obs'])
-        if total_steps < seq_len:
-            raise ValueError(f"Not enough continuous data: {total_steps} steps < {seq_len} required")
-        
-        # Sample random sequences from the continuous trajectory
-        sequences = []
-        for _ in range(batch_size):
-            # Random start position that allows full sequence
-            max_start = total_steps - seq_len
-            start = random.randint(0, max_start) if max_start > 0 else 0
-            end = start + seq_len
-            
-            # Extract sequence
-            seq = {}
-            for key in ['obs', 'act', 'rew', 'next_obs', 'done', 'timeout', 'logprob', 'value', 'entropy']:
-                seq[key] = continuous_data[key][start:end]
-            
-            sequences.append(seq)
-        
-        # Convert to batch format [batch_size, seq_len, ...] using the same efficient conversion as standard mode
-        batch = {}
-        for key in sequences[0].keys():
-            per_seq = []
-            for s in sequences:
-                # Convert sequence to mx.array and stack along time dimension
-                per_seq.append(mx.stack([mx.array(v) for v in s[key]], axis=0))  # [T, ...]
-            # Stack sequences along batch dimension  
-            batch[key] = mx.stack(per_seq, axis=0)  # [B, T, ...]
-
-        return batch
-    
     def get_episode_statistics(self) -> Dict[str, float]:
         """
         Get statistical information about stored episodes.

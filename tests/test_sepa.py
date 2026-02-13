@@ -22,6 +22,40 @@ class TestSEPAController:
         assert sepa.resolve_lambda(step=5.0) == 0.5
         assert sepa.resolve_lambda(step=20.0) == 1.0
 
+    def test_linear_schedule_honors_delay_steps(self):
+        sepa = SEPAController(
+            sepa_steps=10,
+            sepa_schedule="linear",
+            sepa_delay_steps=3,
+        )
+
+        assert sepa.resolve_lambda(step=0.0) == 0.0
+        assert sepa.resolve_lambda(step=3.0) == 0.0
+        assert sepa.resolve_lambda(step=8.0) == pytest.approx(0.5)
+        assert sepa.resolve_lambda(step=20.0) == 1.0
+
+    def test_correct_rate_gate_blocks_until_threshold_then_sticks_open(self):
+        sepa = SEPAController(
+            sepa_steps=10,
+            sepa_schedule="linear",
+            sepa_correct_rate_gate=0.1,
+        )
+
+        assert sepa.gate_open is False
+        assert sepa.resolve_lambda(step=5.0) == 0.0
+
+        sepa.observe_correct_rate(0.05)
+        assert sepa.gate_open is False
+        assert sepa.resolve_lambda(step=5.0) == 0.0
+
+        sepa.observe_correct_rate(0.10)
+        assert sepa.gate_open is True
+        assert sepa.resolve_lambda(step=5.0) == pytest.approx(0.5)
+
+        sepa.observe_correct_rate(0.0)
+        assert sepa.gate_open is True
+        assert sepa.resolve_lambda(step=5.0) == pytest.approx(0.5)
+
     def test_auto_schedule_lambda_increases_after_variance_drop(self):
         sepa = SEPAController(
             sepa_schedule="auto",
@@ -126,3 +160,22 @@ class TestSEPAController:
         restored = SEPAController(sepa_schedule="auto")
         restored.load_state_dict(sepa.state_dict())
         assert restored.resolve_lambda(step=0.0) == pytest.approx(expected_lambda)
+
+    def test_state_dict_roundtrip_preserves_gate_state(self):
+        sepa = SEPAController(
+            sepa_steps=10,
+            sepa_schedule="linear",
+            sepa_correct_rate_gate=0.2,
+        )
+        assert sepa.gate_open is False
+        sepa.observe_correct_rate(0.25)
+        assert sepa.gate_open is True
+
+        restored = SEPAController(
+            sepa_steps=10,
+            sepa_schedule="linear",
+            sepa_correct_rate_gate=0.2,
+        )
+        restored.load_state_dict(sepa.state_dict())
+        assert restored.gate_open is True
+        assert restored.resolve_lambda(step=5.0) == pytest.approx(0.5)

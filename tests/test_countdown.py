@@ -15,7 +15,10 @@ from textpolicy.tasks.countdown.prompt import (
     format_countdown_prompt,
     extract_expression_from_completion,
 )
-from textpolicy.tasks.countdown.reward import countdown_reward
+from textpolicy.tasks.countdown.reward import (
+    countdown_reward,
+    countdown_reward_with_info,
+)
 from textpolicy.tasks.countdown.dataset import (
     generate_countdown_problems,
     load_countdown_dataset,
@@ -240,6 +243,14 @@ class TestCountdownReward:
         )
         assert score == 1.0
 
+    def test_unicode_operators_are_supported_via_normalization(self):
+        score = countdown_reward(
+            prompt="",
+            completion="(6 × 4) ÷ 1 + 0",
+            example={"target": 24, "numbers": [6, 4, 1, 0]},
+        )
+        assert score == 1.0
+
     def test_kwargs_compatibility(self):
         # Should accept arbitrary kwargs without error
         score = countdown_reward(
@@ -249,6 +260,24 @@ class TestCountdownReward:
             extra_param="ignored",
         )
         assert score == 1.0
+
+    def test_reward_with_info_correct(self):
+        info = countdown_reward_with_info(
+            prompt="",
+            completion="(1+2+3)*4",
+            example={"target": 24, "numbers": [1, 2, 3, 4]},
+        )
+        assert info["reward"] == 1.0
+        assert info["is_correct"] is True
+
+    def test_reward_with_info_incorrect(self):
+        info = countdown_reward_with_info(
+            prompt="",
+            completion="1+2+3+4",
+            example={"target": 24, "numbers": [1, 2, 3, 4]},
+        )
+        assert info["reward"] == 0.0
+        assert info["is_correct"] is False
 
 
 # =========================================================================
@@ -499,6 +528,10 @@ class TestExpressionExtraction:
     def test_extract_with_answer_keyword(self):
         expr = extract_expression_from_completion("The answer is 2+3*4")
         assert "2+3*4" in expr
+
+    def test_extract_unicode_operators(self):
+        expr = extract_expression_from_completion("(21 - 4) × (1 + 24)")
+        assert expr == "(21 - 4) * (1 + 24)"
 
 
 # =========================================================================

@@ -21,7 +21,9 @@ def format_countdown_prompt(target: int, numbers: List[int]) -> str:
         f"Using the numbers {numbers}, create an arithmetic expression "
         f"that equals {target}. You may use each number at most once. "
         f"Use only +, -, *, / and parentheses. "
-        f"Provide your expression on its own line."
+        "Use at most two lines. "
+        "First line: very brief reasoning (max 18 words, no label). "
+        "Final line: arithmetic expression only (no words or labels)."
     )
 
 
@@ -36,6 +38,15 @@ _DELIMITER_PATTERN = re.compile(
 
 # Find longest arithmetic-like substring
 _ARITH_SUBSTRING = re.compile(r'[\d\s+\-*/()]+')
+
+_UNICODE_OPERATOR_MAP = str.maketrans({
+    "×": "*",
+    "÷": "/",
+    "−": "-",
+    "–": "-",
+    "—": "-",
+    "﹣": "-",
+})
 
 
 def extract_expression_from_completion(completion: str) -> str:
@@ -56,7 +67,7 @@ def extract_expression_from_completion(completion: str) -> str:
     if not completion or not completion.strip():
         return ""
 
-    text = completion.strip()
+    text = completion.strip().translate(_UNICODE_OPERATOR_MAP)
 
     # Strategy 1: Find lines that are pure arithmetic expressions
     for line in text.splitlines():

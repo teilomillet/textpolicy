@@ -13,9 +13,12 @@ Key functions:
 """
 
 from __future__ import annotations
+from contextlib import contextmanager
 import importlib
+import logging
+import re
 import time
-from typing import Dict, List, Optional, Tuple, Any, Callable
+from typing import Dict, List, Optional, Tuple, Any, Callable, Iterator
 import mlx.core as mx
 import mlx.nn as nn
 try:
@@ -40,6 +43,72 @@ BatchedDecodeBackend = Callable[
     BatchedGenerationOutput,
 ]
 _BATCHED_DECODE_BACKENDS: Dict[str, BatchedDecodeBackend] = {}
+_CHAT_MARKER_RE = re.compile(r"<\|[^<>|]+\|>")
+
+
+@contextmanager
+def _suppress_mistral_regex_warning() -> Iterator[None]:
+    """
+    Silence only the known Mistral regex advisory emitted during tokenizer init.
+
+    We apply the regex fix explicitly after load, so this warning would otherwise
+    be noisy and misleading in logs.
+    """
+    logger = logging.getLogger("transformers.tokenization_utils_tokenizers")
+
+    class _MistralRegexFilter(logging.Filter):
+        def filter(self, record: logging.LogRecord) -> bool:  # noqa: D401
+            msg = record.getMessage()
+            return "incorrect regex pattern" not in msg
+
+    filt = _MistralRegexFilter()
+    logger.addFilter(filt)
+    try:
+        yield
+    finally:
+        logger.removeFilter(filt)
+
+
+def _apply_mistral_regex_fix(tokenizer: Any, model_path: str) -> bool:
+    """
+    Apply the Mistral regex fix post-load without passing the broken init kwarg.
+
+    On transformers 5.1.0, `fix_mistral_regex=True` in `from_pretrained(...)`
+    can fail due duplicated kwarg handling. This uses the same internal patching
+    routine safely on the tokenizer object after construction.
+    """
+    hf_tokenizer = getattr(tokenizer, "_tokenizer", tokenizer)
+    patch_fn = getattr(type(hf_tokenizer), "_patch_mistral_regex", None)
+    if patch_fn is None:
+        return False
+
+    init_kwargs = getattr(hf_tokenizer, "init_kwargs", {})
+    if not isinstance(init_kwargs, dict):
+        init_kwargs = {}
+    pretrained_ref = init_kwargs.get("name_or_path", model_path)
+
+    try:
+        patched_tokenizer = patch_fn(
+            hf_tokenizer,
+            pretrained_model_name_or_path=pretrained_ref,
+            init_kwargs=init_kwargs,
+            is_local=True,
+            fix_mistral_regex=True,
+        )
+    except Exception:
+        return False
+
+    if patched_tokenizer is not None and patched_tokenizer is not hf_tokenizer:
+        # mlx_lm's TokenizerWrapper stores the HF tokenizer as `_tokenizer`.
+        if hasattr(tokenizer, "_tokenizer"):
+            tokenizer._tokenizer = patched_tokenizer
+        hf_tokenizer = patched_tokenizer
+
+    try:
+        setattr(hf_tokenizer, "fix_mistral_regex", True)
+    except Exception:
+        pass
+    return True
 
 
 def register_batched_decode_backend(
@@ -267,13 +336,16 @@ def load_model(
     
     # Configure model & tokenizer for EOS handling based on model type
     tokenizer_config, model_config = _get_eos_configs_for_model(model_path, tokenizer_config)
-    model, tokenizer = load(
-        path_or_hf_repo=model_path,
-        adapter_path=adapter_path,
-        tokenizer_config=tokenizer_config,
-        model_config=model_config,
-        lazy=False,
-    )
+    with _suppress_mistral_regex_warning():
+        model, tokenizer = load(
+            path_or_hf_repo=model_path,
+            adapter_path=adapter_path,
+            tokenizer_config=tokenizer_config,
+            model_config=model_config,
+            lazy=False,
+        )
+    if _apply_mistral_regex_fix(tokenizer, model_path):
+        print("Applied Mistral tokenizer regex fix.")
     _prepare_tokenizer(tokenizer, verbose)
     print("✓ Model loaded successfully")
     return model, tokenizer
@@ -2071,7 +2143,27 @@ def decode(tokenizer: Any, tokens: mx.array) -> str:
         Decoded text string
     """
     token_list = tokens.tolist()
-    return tokenizer.decode(token_list)
+    return decode_token_ids(tokenizer, token_list)
+
+
+def decode_token_ids(tokenizer: Any, token_ids: List[int]) -> str:
+    """Decode token IDs and strip chat-control markers like ``<|im_end|>``."""
+    if not token_ids:
+        return ""
+
+    text: str
+    try:
+        text = tokenizer.decode(token_ids, skip_special_tokens=True)
+    except TypeError:
+        text = tokenizer.decode(token_ids)
+    except Exception:
+        text = tokenizer.decode(token_ids)
+
+    # Some tokenizers still emit textual control markers even when special
+    # tokens are skipped. Strip them for clean logging/reward inspection.
+    cleaned = _CHAT_MARKER_RE.sub("", str(text))
+    cleaned = cleaned.replace("\u200b", "")
+    return cleaned.strip()
 
 
 def create_policy(

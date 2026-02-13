@@ -11,8 +11,9 @@ Welcome! TextPolicy is a lightweight RL toolkit for text generation on MLX, desi
 - Performance and Memory Optimization: 06_performance.md
 - Testing and Integration: 07_testing.md
 - Efficient MLX Policies: 08_efficient_policies.md
- - Command-Line Interface: 09_cli.md
- - LoRA and QLoRA: 10_lora_qlora.md
- - Quickstart with uv: QUICKSTART_UV.md
+- Command-Line Interface: 09_cli.md
+- LoRA and QLoRA: 10_lora_qlora.md
+- SEPA Campaign and Significance: 11_sepa_significance.md
+- Quickstart with uv: QUICKSTART_UV.md
 
 Hands-on examples are in the examples/ folder. Follow the learning path in examples/README.md to progress from simple rewards to full training.

@@ -147,6 +147,25 @@ class TestIssue2ExamplesParameter:
         env.step("another response")
         assert received_examples[1] == {"db_id": "database_2", "gold_sql": "SELECT 2"}
 
+    def test_reward_dict_can_emit_explicit_is_correct(self, dummy_tokenizer):
+        """TextGenerationEnv should pass verifier correctness in info when provided."""
+        from textpolicy.environment.text_generation import TextGenerationEnv
+
+        def reward_fn(prompt, completion, example, **kwargs):
+            return {"reward": -0.5, "is_correct": True}
+
+        env = TextGenerationEnv(
+            prompts=["P1"],
+            reward_fn=reward_fn,
+            tokenizer=dummy_tokenizer,
+            examples=[{}],
+        )
+        env.reset()
+        result = env.step("response")
+
+        assert result["reward"] == -0.5
+        assert result["info"]["is_correct"] is True
+
     def test_examples_cycle_with_prompts(self, dummy_tokenizer):
         """Examples should cycle correctly when prompts cycle."""
         from textpolicy.environment.text_generation import TextGenerationEnv

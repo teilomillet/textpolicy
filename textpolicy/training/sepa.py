@@ -37,6 +37,8 @@ class SEPAController:
         *,
         sepa_steps: int = 0,
         sepa_schedule: str = "linear",
+        sepa_delay_steps: int = 0,
+        sepa_correct_rate_gate: float = 0.0,
         sepa_ema_decay: float = 0.99,
         sepa_var_threshold: float = 0.2,
         sepa_warmup: int = 50,
@@ -44,6 +46,15 @@ class SEPAController:
     ) -> None:
         if sepa_steps < 0:
             raise ValueError(f"sepa_steps must be >= 0, got {sepa_steps}.")
+        if sepa_delay_steps < 0:
+            raise ValueError(
+                f"sepa_delay_steps must be >= 0, got {sepa_delay_steps}."
+            )
+        if not (0.0 <= sepa_correct_rate_gate <= 1.0):
+            raise ValueError(
+                "sepa_correct_rate_gate must be in [0, 1], "
+                f"got {sepa_correct_rate_gate}."
+            )
         if not (0.0 <= sepa_ema_decay <= 1.0):
             raise ValueError(
                 f"sepa_ema_decay must be in [0, 1], got {sepa_ema_decay}."
@@ -59,6 +70,8 @@ class SEPAController:
 
         self.sepa_steps = sepa_steps
         self.sepa_schedule = normalize_sepa_schedule(sepa_schedule)
+        self.sepa_delay_steps = sepa_delay_steps
+        self.sepa_correct_rate_gate = sepa_correct_rate_gate
         self.sepa_ema_decay = sepa_ema_decay
         self.sepa_var_threshold = sepa_var_threshold
         self.sepa_warmup = sepa_warmup
@@ -68,6 +81,7 @@ class SEPAController:
         self._var_ema: Optional[float] = None
         self._var_0: Optional[float] = None
         self._warmup_seen = 0
+        self._gate_open = sepa_correct_rate_gate <= 0.0
 
     @property
     def enabled(self) -> bool:
@@ -79,10 +93,34 @@ class SEPAController:
         """Whether this schedule needs post-batch state updates."""
         return self.sepa_schedule == "auto"
 
+    @property
+    def gate_open(self) -> bool:
+        """Whether correctness gate currently allows non-zero λ."""
+        return self._gate_open
+
+    def observe_correct_rate(self, correct_rate: Optional[float]) -> None:
+        """Update correctness gate state from observed step-level correct rate.
+
+        Gate is sticky-open: once threshold is met, SEPA remains enabled for
+        the rest of training.
+        """
+        if self._gate_open or self.sepa_correct_rate_gate <= 0.0:
+            return
+        if correct_rate is None:
+            return
+        rate = float(correct_rate)
+        if not math.isfinite(rate):
+            return
+        if rate >= self.sepa_correct_rate_gate:
+            self._gate_open = True
+
     def _linear_lambda(self, *, step: float) -> float:
-        if self.sepa_steps <= 0 or step <= 0.0:
+        if self.sepa_steps <= 0:
             return 0.0
-        return min(step / float(self.sepa_steps), 1.0)
+        shifted_step = step - float(self.sepa_delay_steps)
+        if shifted_step <= 0.0:
+            return 0.0
+        return min(shifted_step / float(self.sepa_steps), 1.0)
 
     def _auto_lambda(self) -> float:
         if self.sepa_schedule != "auto":
@@ -98,6 +136,8 @@ class SEPAController:
     def resolve_lambda(self, *, step: float) -> float:
         """Resolve λ using schedule mode and optional linear fallback cap."""
         linear_lambda = self._linear_lambda(step=step)
+        if not self._gate_open:
+            return 0.0
         if self.sepa_schedule == "auto":
             # One-sided cap: guarantees convergence even if auto signal stalls.
             return max(self._auto_lambda(), linear_lambda)
@@ -191,6 +231,8 @@ class SEPAController:
         return {
             "sepa_steps": self.sepa_steps,
             "sepa_schedule": self.sepa_schedule,
+            "sepa_delay_steps": self.sepa_delay_steps,
+            "sepa_correct_rate_gate": self.sepa_correct_rate_gate,
             "sepa_ema_decay": self.sepa_ema_decay,
             "sepa_var_threshold": self.sepa_var_threshold,
             "sepa_warmup": self.sepa_warmup,
@@ -198,6 +240,7 @@ class SEPAController:
             "var_ema": self._var_ema,
             "var_0": self._var_0,
             "warmup_seen": self._warmup_seen,
+            "gate_open": self._gate_open,
         }
 
     def load_state_dict(self, state: Dict[str, Any]) -> None:
@@ -233,3 +276,8 @@ class SEPAController:
         self._var_ema = var_ema
         self._var_0 = var_0
         self._warmup_seen = warmup_seen
+
+        gate_open = state.get("gate_open", self._gate_open)
+        if not isinstance(gate_open, bool):
+            raise ValueError("state['gate_open'] must be a boolean.")
+        self._gate_open = gate_open

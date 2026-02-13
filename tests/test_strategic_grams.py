@@ -45,9 +45,11 @@ import json
 import pytest
 
 from textpolicy.analysis.strategic_grams import (
+    COUNTDOWN_STRATEGIC_GRAMS,
     DEFAULT_STRATEGIC_GRAMS,
     compute_document_frequency,
     extract_ngrams,
+    get_countdown_strategic_grams,
     get_default_strategic_grams,
     load_generations,
     load_strategic_grams,
@@ -362,6 +364,19 @@ class TestDefaultStrategicGrams:
         assert a is not b
         a.append("mutated")
         assert "mutated" not in get_default_strategic_grams()
+
+    def test_countdown_non_empty(self):
+        """Countdown-specific list is not empty."""
+        assert len(COUNTDOWN_STRATEGIC_GRAMS) > 0
+
+    def test_get_countdown_returns_copy(self):
+        """get_countdown_strategic_grams returns an independent copy."""
+        a = get_countdown_strategic_grams()
+        b = get_countdown_strategic_grams()
+        assert a == b
+        assert a is not b
+        a.append("mutated")
+        assert "mutated" not in get_countdown_strategic_grams()
 
 
 # ---------------------------------------------------------------------------

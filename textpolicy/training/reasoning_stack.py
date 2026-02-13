@@ -285,6 +285,9 @@ class _GTPOTransform:
         hicra_gamma: float = 0.0,
         sepa_steps: int = 0,
         sepa_schedule: str = "linear",
+        sepa_delay_steps: int = 0,
+        sepa_correct_rate_gate: float = 0.0,
+        use_maxrl_base: bool = False,
         sepa_ema_decay: float = 0.99,
         sepa_var_threshold: float = 0.2,
         sepa_warmup: int = 50,
@@ -311,6 +314,8 @@ class _GTPOTransform:
         self._sepa = SEPAController(
             sepa_steps=sepa_steps,
             sepa_schedule=sepa_schedule,
+            sepa_delay_steps=sepa_delay_steps,
+            sepa_correct_rate_gate=sepa_correct_rate_gate,
             sepa_ema_decay=sepa_ema_decay,
             sepa_var_threshold=sepa_var_threshold,
             sepa_warmup=sepa_warmup,
@@ -344,6 +349,7 @@ class _GTPOTransform:
         self._needs_planning_mask = (
             self._hicra_enabled or self._semantic_tracker is not None
         )
+        self._use_maxrl_base = use_maxrl_base
 
     @property
     def needs_hidden_states(self) -> bool:
@@ -564,7 +570,8 @@ class _GTPOTransform:
                     flat_entropies, planning_mask, gamma=self.hicra_gamma,
                 )
 
-        # Eq. 3 + Eq. 5: entropy-shaped token-level rewards
+        # Eq. 3 + Eq. 5: entropy-shaped token-level rewards.
+        #
         shaped_rewards, is_positive = compute_gtpo_shaped_rewards(
             rewards,
             flat_entropies,
@@ -576,9 +583,23 @@ class _GTPOTransform:
         )
 
         # Eq. 6: separate O+/O- normalization
-        return normalize_gtpo_advantages(
+        gtpo_advantages = normalize_gtpo_advantages(
             shaped_rewards, is_positive, eps=self.eps,
         )
+
+        # Optional MaxRL composition:
+        # - MaxRL controls prompt-level weighting (which episodes matter)
+        # - GTPO/SEPA controls token-level shaping (which tokens matter)
+        if self._use_maxrl_base:
+            if gtpo_advantages.shape != advantages.shape:
+                raise ValueError(
+                    "MaxRL composition requires token-aligned shapes: "
+                    f"gtpo_advantages={gtpo_advantages.shape}, "
+                    f"base_advantages={advantages.shape}."
+                )
+            return gtpo_advantages * advantages.astype(mx.float32)
+
+        return gtpo_advantages
 
 
 def build_gtpo_transform(
@@ -592,6 +613,9 @@ def build_gtpo_transform(
     hicra_gamma: float = 0.0,
     sepa_steps: int = 0,
     sepa_schedule: str = "linear",
+    sepa_delay_steps: int = 0,
+    sepa_correct_rate_gate: float = 0.0,
+    use_maxrl_base: bool = False,
     semantic_entropy: bool = False,
     semantic_entropy_embedding_mode: str = "hash",
 ) -> Callable[[mx.array, Dict[str, Any]], mx.array]:
@@ -696,6 +720,15 @@ def build_gtpo_transform(
                       ``'linear'`` uses ``sepa_steps`` only.
                       ``'auto'`` uses variance-driven λ, optionally capped by
                       linear ``sepa_steps``.
+        sepa_delay_steps: Hold λ at 0 for this many initial steps before the
+                         linear component begins (default 0).
+        sepa_correct_rate_gate: Sticky correctness gate in [0, 1]. When >0,
+                               λ remains 0 until observed correct-rate reaches
+                               this threshold (default 0 = disabled).
+        use_maxrl_base: Compose incoming base advantages (e.g. MaxRL)
+                        multiplicatively with GTPO/SEPA token-level
+                        advantages. This keeps prompt-level and token-level
+                        credit assignment as separate signals.
         semantic_entropy: Enable planning-level semantic-entropy tracking in
                          ``postprocess_batch``. This does not affect gradients
                          or the GTPO loss path.
@@ -718,6 +751,15 @@ def build_gtpo_transform(
     if sepa_steps < 0:
         raise ValueError(
             f"sepa_steps must be >= 0, got {sepa_steps}."
+        )
+    if sepa_delay_steps < 0:
+        raise ValueError(
+            f"sepa_delay_steps must be >= 0, got {sepa_delay_steps}."
+        )
+    if not (0.0 <= sepa_correct_rate_gate <= 1.0):
+        raise ValueError(
+            "sepa_correct_rate_gate must be in [0, 1], "
+            f"got {sepa_correct_rate_gate}."
         )
     sepa_schedule = normalize_sepa_schedule(sepa_schedule)
 
@@ -759,7 +801,9 @@ def build_gtpo_transform(
         hicra_gamma=hicra_gamma,
         sepa_steps=sepa_steps,
         sepa_schedule=sepa_schedule,
+        sepa_delay_steps=sepa_delay_steps,
+        sepa_correct_rate_gate=sepa_correct_rate_gate,
+        use_maxrl_base=use_maxrl_base,
         semantic_entropy=semantic_entropy,
         semantic_entropy_embedding_mode=semantic_entropy_embedding_mode,
     )
-
