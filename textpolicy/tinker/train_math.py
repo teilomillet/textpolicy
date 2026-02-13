@@ -352,6 +352,8 @@ def train(args: argparse.Namespace) -> None:
         datums = []
         batch_rewards = []
         batch_correct = 0
+        batch_max_token_hits = 0
+        batch_total_completions = 0
 
         for future, (prompt_text, prompt_ids), answer in zip(
             sample_futures, batch_prompts, batch_answers
@@ -377,6 +379,12 @@ def train(args: argparse.Namespace) -> None:
 
             batch_rewards.extend(rewards_G)
             batch_correct += sum(1 for r in rewards_G if r > 0.5)
+
+            # Track max-token truncations (Lee et al. 2026: wasted compute signal)
+            for seq in sample_result.sequences:
+                batch_total_completions += 1
+                if len(seq.tokens) >= args.max_tokens:
+                    batch_max_token_hits += 1
 
             group_correct = sum(1 for r in rewards_G if r > 0.5)
             logger.info(
@@ -505,27 +513,19 @@ def train(args: argparse.Namespace) -> None:
         mean_reward = sum(batch_rewards) / max(len(batch_rewards), 1)
         running_correct_rate = total_correct / max(total_completions, 1)
 
-        # Extract loss from forward_backward result
+        # Extract loss from forward_backward result.
+        # ForwardBackwardOutput.metrics contains {"loss:sum": float, ...}
+        # ForwardBackwardOutput.loss_fn_outputs contains per-datum logprobs.
         loss_value = 0.0
-        if hasattr(fwd_bwd_result, "loss_fn_outputs"):
-            outputs = fwd_bwd_result.loss_fn_outputs
-            if isinstance(outputs, dict):
-                loss_value = float(outputs.get("loss", 0.0))
-            elif isinstance(outputs, list) and outputs:
-                # List of per-datum outputs; average the losses
-                losses = []
-                for out in outputs:
-                    if isinstance(out, dict) and "loss" in out:
-                        losses.append(float(out["loss"]))
-                    elif isinstance(out, (int, float)):
-                        losses.append(float(out))
-                if losses:
-                    loss_value = sum(losses) / len(losses)
-            elif isinstance(outputs, (int, float)):
-                loss_value = float(outputs)
-            else:
-                logger.info("  loss_fn_outputs type: %s, value: %s",
-                            type(outputs).__name__, str(outputs)[:200])
+        if hasattr(fwd_bwd_result, "metrics") and fwd_bwd_result.metrics:
+            # Tinker uses "loss:sum" key, not "loss"
+            loss_sum = fwd_bwd_result.metrics.get("loss:sum", 0.0)
+            # Normalize by number of datums for per-datum average loss
+            loss_value = float(loss_sum) / max(len(datums), 1)
+
+        max_token_hit_rate = (
+            batch_max_token_hits / max(batch_total_completions, 1)
+        )
 
         step_metrics = {
             "step": batch_idx,
@@ -537,6 +537,7 @@ def train(args: argparse.Namespace) -> None:
             "sepa_lambda": sepa_lambda if args.algorithm == "full" else 0.0,
             "sepa_gate_open": sepa_controller.gate_open if args.algorithm == "full" else False,
             "num_datums": len(datums),
+            "max_token_hit_rate": max_token_hit_rate,
             "step_time_s": step_time,
         }
 

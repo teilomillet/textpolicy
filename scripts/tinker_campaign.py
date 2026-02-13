@@ -61,8 +61,10 @@ def _build_arm_command(
     algorithm: str,
     log_dir: str,
     args: argparse.Namespace,
+    lr_override: Optional[float] = None,
 ) -> List[str]:
     """Build the train_math.py command for one arm."""
+    lr = lr_override if lr_override is not None else args.lr
     cmd = [
         sys.executable,
         "-m", "textpolicy.tinker.train_math",
@@ -73,7 +75,7 @@ def _build_arm_command(
         "--group-size", str(args.group_size),
         "--max-tokens", str(args.max_tokens),
         "--temperature", str(args.temperature),
-        "--lr", str(args.lr),
+        "--lr", str(lr),
         "--lora-rank", str(args.lora_rank),
         "--save-every", str(args.save_every),
         "--log-dir", log_dir,
@@ -263,7 +265,9 @@ def _write_comparison_markdown(
         "## Configuration",
         "",
         "### Shared (both arms)",
-        f"- Learning rate: {args.lr}",
+        f"- Learning rate: {args.lr}"
+        + (f" (baseline: {args.baseline_lr}, candidate: {args.candidate_lr})"
+           if args.baseline_lr or args.candidate_lr else ""),
         f"- LoRA rank: {args.lora_rank}",
         f"- Temperature: {args.temperature}",
         f"- Max tokens: {args.max_tokens}",
@@ -306,7 +310,7 @@ def _build_parser() -> argparse.ArgumentParser:
     # Model & Tinker
     parser.add_argument("--model", default="Qwen/Qwen3-4B-Instruct-2507")
     parser.add_argument("--base-url", default=None, help="Tinker service URL")
-    parser.add_argument("--lora-rank", type=int, default=32)
+    parser.add_argument("--lora-rank", type=int, default=64)
 
     # Training (shared across both arms)
     parser.add_argument("--max-steps", type=int, default=100,
@@ -317,16 +321,21 @@ def _build_parser() -> argparse.ArgumentParser:
                         help="Completions per prompt")
     parser.add_argument("--max-tokens", type=int, default=2048)
     parser.add_argument("--temperature", type=float, default=0.7)
-    parser.add_argument("--lr", type=float, default=4e-5)
+    parser.add_argument("--lr", type=float, default=4e-5,
+                        help="Learning rate (used for both arms unless overridden)")
+    parser.add_argument("--baseline-lr", type=float, default=None,
+                        help="Override lr for baseline arm (from sweep)")
+    parser.add_argument("--candidate-lr", type=float, default=None,
+                        help="Override lr for candidate arm (from sweep)")
     parser.add_argument("--max-examples", type=int, default=None)
     parser.add_argument("--save-every", type=int, default=20)
 
     # Full pipeline hyperparameters (candidate arm)
     parser.add_argument("--gtpo-beta", type=float, default=0.1)
     parser.add_argument("--hicra-alpha", type=float, default=0.2)
-    parser.add_argument("--sepa-steps", type=int, default=500)
+    parser.add_argument("--sepa-steps", type=int, default=100)
     parser.add_argument("--sepa-schedule", default="linear", choices=["linear", "auto"])
-    parser.add_argument("--sepa-delay-steps", type=int, default=50)
+    parser.add_argument("--sepa-delay-steps", type=int, default=10)
     parser.add_argument("--sepa-correct-rate-gate", type=float, default=0.1)
 
     # Analysis
@@ -352,9 +361,11 @@ def main() -> int:
     candidate_dir = campaign_root / "candidate"
     analysis_dir = campaign_root / "analysis"
 
-    # Build commands for both arms
-    baseline_cmd = _build_arm_command("grpo", str(baseline_dir), args)
-    candidate_cmd = _build_arm_command("full", str(candidate_dir), args)
+    # Build commands for both arms (with optional per-arm lr from sweep)
+    baseline_cmd = _build_arm_command("grpo", str(baseline_dir), args,
+                                      lr_override=args.baseline_lr)
+    candidate_cmd = _build_arm_command("full", str(candidate_dir), args,
+                                       lr_override=args.candidate_lr)
 
     # Write manifest
     manifest: Dict[str, Any] = {
