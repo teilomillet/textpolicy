@@ -39,6 +39,7 @@ class TestReasoningConfig:
         assert cfg.sepa_schedule == "linear"
         assert cfg.sepa_delay_steps == 0
         assert cfg.sepa_correct_rate_gate == 0.0
+        assert cfg.transform_mode == "gtpo_hicra"
         assert cfg.episodes_per_step == 8
         assert cfg.batch_size == 8
         assert cfg.output_dir == "results/countdown_reasoning_lora"
@@ -178,6 +179,126 @@ class TestReasoningConfig:
 
                 trainer_kwargs = mock_trainer_cls.call_args.kwargs
                 assert trainer_kwargs["advantage_reward_key"] == "binary_rewards"
+
+    def test_transform_mode_none_disables_token_transform(self):
+        from experiments.countdown_reasoning_lora import ReasoningConfig, run_experiment
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            with (
+                patch("experiments.countdown_reasoning_lora.load_model") as mock_load_model,
+                patch(
+                    "experiments.countdown_reasoning_lora.create_lora_setup"
+                ) as mock_lora_setup,
+                patch(
+                    "experiments.countdown_reasoning_lora.Trainer"
+                ) as mock_trainer_cls,
+                patch("experiments.countdown_reasoning_lora.build_gtpo_transform") as mock_build_gtpo,
+                patch(
+                    "experiments.countdown_reasoning_lora.build_gtpo_hicra_transform"
+                ) as mock_build_hicra,
+                patch("experiments.countdown_reasoning_lora.create_policy"),
+                patch(
+                    "experiments.countdown_reasoning_lora.generate_countdown_problems"
+                ) as mock_generate_problems,
+                patch(
+                    "experiments.countdown_reasoning_lora.RolloutCoordinator"
+                ) as mock_rollout_cls,
+                patch(
+                    "experiments.countdown_reasoning_lora.EmergenceLogger"
+                ) as mock_emergence_cls,
+                patch("experiments.countdown_reasoning_lora.save_checkpoint"),
+            ):
+                mock_model = MagicMock()
+                mock_tokenizer = MagicMock()
+                mock_load_model.return_value = (mock_model, mock_tokenizer)
+                mock_lora_setup.return_value = (
+                    mock_model,
+                    {"memory_savings_percent": 95.0},
+                )
+                mock_trainer = MagicMock()
+                mock_trainer.model = mock_model
+                mock_trainer_cls.return_value = mock_trainer
+                mock_generate_problems.return_value = [{"target": 15, "numbers": [10, 5, 3]}]
+                mock_rollout_cls.return_value = MagicMock()
+                mock_emergence_cls.return_value = MagicMock()
+
+                cfg = ReasoningConfig(
+                    max_steps=0,
+                    output_dir=tmpdir,
+                    num_problems=1,
+                    episodes_per_step=4,
+                    batch_size=4,
+                    transform_mode="none",
+                )
+                run_experiment(cfg)
+
+                trainer_kwargs = mock_trainer_cls.call_args.kwargs
+                assert trainer_kwargs["advantage_transform_fn"] is None
+                mock_build_gtpo.assert_not_called()
+                mock_build_hicra.assert_not_called()
+
+    def test_transform_mode_hicra_uses_hicra_builder(self):
+        from experiments.countdown_reasoning_lora import ReasoningConfig, run_experiment
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            with (
+                patch("experiments.countdown_reasoning_lora.load_model") as mock_load_model,
+                patch(
+                    "experiments.countdown_reasoning_lora.create_lora_setup"
+                ) as mock_lora_setup,
+                patch(
+                    "experiments.countdown_reasoning_lora.Trainer"
+                ) as mock_trainer_cls,
+                patch("experiments.countdown_reasoning_lora.build_gtpo_transform") as mock_build_gtpo,
+                patch(
+                    "experiments.countdown_reasoning_lora.build_gtpo_hicra_transform"
+                ) as mock_build_hicra,
+                patch("experiments.countdown_reasoning_lora.create_policy"),
+                patch(
+                    "experiments.countdown_reasoning_lora.generate_countdown_problems"
+                ) as mock_generate_problems,
+                patch(
+                    "experiments.countdown_reasoning_lora.RolloutCoordinator"
+                ) as mock_rollout_cls,
+                patch(
+                    "experiments.countdown_reasoning_lora.EmergenceLogger"
+                ) as mock_emergence_cls,
+                patch("experiments.countdown_reasoning_lora.save_checkpoint"),
+            ):
+                mock_model = MagicMock()
+                mock_tokenizer = MagicMock()
+                mock_load_model.return_value = (mock_model, mock_tokenizer)
+                mock_lora_setup.return_value = (
+                    mock_model,
+                    {"memory_savings_percent": 95.0},
+                )
+                mock_trainer = MagicMock()
+                mock_trainer.model = mock_model
+                mock_trainer_cls.return_value = mock_trainer
+                mock_transform = MagicMock()
+                mock_build_hicra.return_value = mock_transform
+                mock_generate_problems.return_value = [{"target": 15, "numbers": [10, 5, 3]}]
+                mock_rollout_cls.return_value = MagicMock()
+                mock_emergence_cls.return_value = MagicMock()
+
+                cfg = ReasoningConfig(
+                    max_steps=0,
+                    output_dir=tmpdir,
+                    num_problems=1,
+                    episodes_per_step=4,
+                    batch_size=4,
+                    transform_mode="hicra",
+                    hicra_gamma=0.4,
+                )
+                run_experiment(cfg)
+
+                trainer_kwargs = mock_trainer_cls.call_args.kwargs
+                assert trainer_kwargs["advantage_transform_fn"] is mock_transform
+                mock_build_hicra.assert_called_once()
+                hicra_kwargs = mock_build_hicra.call_args.kwargs
+                assert hicra_kwargs["hicra_alpha"] == pytest.approx(0.4)
+                assert hicra_kwargs["entropy_weight"] == 0.0
+                mock_build_gtpo.assert_not_called()
 
 
 class TestRunExperiment:
