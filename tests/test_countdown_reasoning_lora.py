@@ -46,6 +46,7 @@ class TestReasoningConfig:
         assert cfg.wandb_completion_log_interval == 10
         assert cfg.wandb_log_final_completions is True
         assert cfg.wandb_completion_char_limit == 0
+        assert cfg.wandb_log_full_completions_artifact is True
 
     def test_roundtrip_dict(self):
         from experiments.countdown_reasoning_lora import ReasoningConfig
@@ -343,6 +344,55 @@ class TestRunExperiment:
         table_kwargs = mock_wandb.Table.call_args.kwargs
         assert table_kwargs["data"][0][1] == "prompt"
         assert table_kwargs["data"][0][2] == "(4+3)*(13-4)"
+
+    def test_log_wandb_completions_persists_full_records_jsonl(self):
+        import experiments.countdown_reasoning_lora as exp
+
+        mock_wandb = MagicMock()
+        tokenizer = MagicMock()
+        tokenizer.decode.side_effect = ["prompt text", "very long completion"]
+        episodes = [{"obs": [[101]], "act": [[201, 202]], "rew": [1.0]}]
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            out_dir = Path(tmpdir)
+            with patch.object(exp, "wandb", mock_wandb, create=True):
+                exp.log_wandb_completions(
+                    step=10,
+                    episodes=episodes,
+                    tokenizer=tokenizer,
+                    use_wandb=True,
+                    completion_char_limit=4,
+                    output_dir=out_dir,
+                    persist_full_records=True,
+                )
+
+            full_path = out_dir / "wandb" / "full_completions.jsonl"
+            assert full_path.exists()
+            rows = [json.loads(line) for line in full_path.read_text().splitlines() if line.strip()]
+            assert len(rows) == 1
+            # Table is clipped but artifact file keeps full text.
+            assert rows[0]["completion"] == "very long completion"
+            assert rows[0]["completion_tokens"] == [201, 202]
+
+    def test_log_wandb_full_completions_artifact_uploads_jsonl(self):
+        import experiments.countdown_reasoning_lora as exp
+
+        mock_wandb = MagicMock()
+        with tempfile.TemporaryDirectory() as tmpdir:
+            out_dir = Path(tmpdir)
+            full_path = out_dir / "wandb" / "full_completions.jsonl"
+            full_path.parent.mkdir(parents=True, exist_ok=True)
+            full_path.write_text('{\"step\": 0}\\n')
+
+            with patch.object(exp, "wandb", mock_wandb, create=True):
+                exp.log_wandb_full_completions_artifact(
+                    output_dir=out_dir,
+                    use_wandb=True,
+                    enabled=True,
+                )
+
+            mock_wandb.Artifact.assert_called_once()
+            mock_wandb.log_artifact.assert_called_once()
 
     def test_wandb_project_without_wandb_does_not_force_metrics_interval_1(self):
         import experiments.countdown_reasoning_lora as exp

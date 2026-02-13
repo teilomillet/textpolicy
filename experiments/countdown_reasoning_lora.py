@@ -121,6 +121,7 @@ class ReasoningConfig:
     wandb_completion_log_interval: int = 10
     wandb_log_final_completions: bool = True
     wandb_completion_char_limit: int = 0
+    wandb_log_full_completions_artifact: bool = True
 
 
 # Memory optimization quick-reference:
@@ -514,6 +515,8 @@ def log_wandb_completions(
     is_final_step: bool = False,
     log_final_step: bool = True,
     completion_char_limit: int = 0,
+    output_dir: Optional[Path] = None,
+    persist_full_records: bool = True,
 ) -> None:
     """Log a wandb.Table of decoded completions for qualitative inspection."""
     if not use_wandb:
@@ -557,6 +560,7 @@ def log_wandb_completions(
         return text
 
     rows = []
+    full_records: List[Dict[str, Any]] = []
     for ep in episodes:
         if isinstance(ep, dict):
             obs = ep.get("obs", [])
@@ -592,12 +596,58 @@ def log_wandb_completions(
             reward_val >= 1.0,
             len(completion_tokens),
         ])
+        full_records.append(
+            {
+                "step": int(step),
+                "prompt": prompt_text,
+                "completion": completion_text,
+                "reward": reward_val,
+                "correct": reward_val >= 1.0,
+                "length": len(completion_tokens),
+                "prompt_tokens": prompt_tokens,
+                "completion_tokens": completion_tokens,
+            }
+        )
 
     table = wandb.Table(
         columns=["step", "prompt", "completion", "reward", "correct", "length"],
         data=rows,
     )
     wandb.log({"completions/samples": table}, step=step)
+
+    if persist_full_records and output_dir is not None:
+        full_path = output_dir / "wandb" / "full_completions.jsonl"
+        full_path.parent.mkdir(parents=True, exist_ok=True)
+        with full_path.open("a", encoding="utf-8") as f:
+            for record in full_records:
+                f.write(json.dumps(record, ensure_ascii=False) + "\n")
+
+
+def log_wandb_full_completions_artifact(
+    output_dir: Path,
+    use_wandb: bool,
+    enabled: bool = True,
+) -> None:
+    """Upload untruncated completion records as a wandb dataset artifact."""
+    if not use_wandb or not enabled:
+        return
+
+    full_path = output_dir / "wandb" / "full_completions.jsonl"
+    if not full_path.exists():
+        return
+
+    artifact_name = f"{output_dir.name}-full-completions"
+    artifact = wandb.Artifact(
+        name=artifact_name,
+        type="dataset",
+        description=(
+            "Untruncated prompt/completion records with token IDs. "
+            "Use this artifact when wandb table rendering clips long cells."
+        ),
+    )
+    artifact.add_file(str(full_path), name="full_completions.jsonl")
+    wandb.log_artifact(artifact)
+    print(f"W&B full completions artifact logged: {artifact_name}")
 
 
 def run_experiment(config: ReasoningConfig) -> None:
@@ -833,6 +883,8 @@ def run_experiment(config: ReasoningConfig) -> None:
             is_final_step=(step == (config.max_steps - 1)),
             log_final_step=config.wandb_log_final_completions,
             completion_char_limit=config.wandb_completion_char_limit,
+            output_dir=output_dir,
+            persist_full_records=config.wandb_log_full_completions_artifact,
         )
 
         if step % 10 == 0:
@@ -866,6 +918,11 @@ def run_experiment(config: ReasoningConfig) -> None:
     run_litmus_report(config, output_dir)
     print_amdahl_summary(phase_totals, trainer_phase_totals, rollout_phase_totals)
     if use_wandb:
+        log_wandb_full_completions_artifact(
+            output_dir=output_dir,
+            use_wandb=use_wandb,
+            enabled=config.wandb_log_full_completions_artifact,
+        )
         wandb.finish()
 
 
@@ -1034,6 +1091,14 @@ if __name__ == "__main__":
         default=0,
         help="Max chars kept for prompt/completion in wandb table (0 = no truncation)",
     )
+    parser.add_argument(
+        "--no-wandb-full-completions-artifact",
+        action="store_true",
+        help=(
+            "Disable uploading the untruncated full completions JSONL artifact. "
+            "By default this is enabled to avoid wandb table truncation limits."
+        ),
+    )
     args = parser.parse_args()
 
     compile_mode: Union[bool, str]
@@ -1081,5 +1146,6 @@ if __name__ == "__main__":
         wandb_completion_log_interval=args.wandb_completion_log_interval,
         wandb_log_final_completions=(not args.no_wandb_final_completions),
         wandb_completion_char_limit=args.wandb_completion_char_limit,
+        wandb_log_full_completions_artifact=(not args.no_wandb_full_completions_artifact),
     )
     run_experiment(cfg)
