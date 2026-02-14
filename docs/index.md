@@ -14,6 +14,8 @@ Welcome! TextPolicy is a lightweight RL toolkit for text generation on MLX, desi
 - Command-Line Interface: 09_cli.md
 - LoRA and QLoRA: 10_lora_qlora.md
 - SEPA Campaign and Significance: 11_sepa_significance.md
+- Running RL Advantages on GPU via Tinker: 12_tinker_gpu.md
+- Rigorous A/B Experiments on Tinker: 13_tinker_campaigns.md
 - Quickstart with uv: QUICKSTART_UV.md
 
 Hands-on examples are in the examples/ folder. Follow the learning path in examples/README.md to progress from simple rewards to full training.

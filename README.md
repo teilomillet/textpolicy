@@ -68,6 +68,27 @@ FAQ:
 - What does `step()` return? 
     - A dict with `observation`, `reward`, `terminated`, `truncated`, `info`. The runner enforces this.
 
+## GPU Training (Tinker)
+
+Run our advantage pipeline on GPUs via the [Tinker](https://tinker.dev) API:
+
+```bash
+export TINKER_API_KEY=<your-key>
+
+# Smoke test (5 steps)
+uv run python -m textpolicy.tinker.train_math --max-steps 5 --group-size 4
+
+# Full run (500 steps)
+uv run python -m textpolicy.tinker.train_math --max-steps 500
+
+# A/B campaign: baseline GRPO vs full pipeline
+uv run python scripts/tinker_campaign.py --max-steps 100 --execute
+```
+
+Docs:
+- Training guide: `docs/12_tinker_gpu.md`
+- Campaign methodology: `docs/13_tinker_campaigns.md`
+
 Examples:
 - 01–06: reward functions, batch processing, minimal training
 - 08: GRPO training with rollout + buffer
