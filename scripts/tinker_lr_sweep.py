@@ -131,7 +131,7 @@ def _run_probe(
 def _print_sweep_table(results: List[Dict[str, Any]]) -> None:
     """Print a formatted table of sweep results."""
     print(f"\n{'='*80}")
-    print(f"  LEARNING RATE SWEEP RESULTS")
+    print("  LEARNING RATE SWEEP RESULTS")
     print(f"{'='*80}")
     print(f"{'Algorithm':>10} {'LR':>10} {'Steps':>6} {'Datums':>7} "
           f"{'Correct%':>9} {'Running%':>9} {'MeanLoss':>10} {'Status':>8}")
@@ -219,7 +219,7 @@ def main() -> int:
         else DEFAULT_ALGORITHMS
     )
 
-    print(f"Learning Rate Sweep")
+    print("Learning Rate Sweep")
     print(f"  Root: {sweep_root}")
     print(f"  Model: {args.model}")
     print(f"  LoRA rank: {args.lora_rank}")
@@ -250,7 +250,7 @@ def main() -> int:
     # Find best lr for each algorithm
     best = _find_best_lr(results)
     print(f"\n{'='*80}")
-    print(f"  RECOMMENDED LEARNING RATES")
+    print("  RECOMMENDED LEARNING RATES")
     print(f"{'='*80}")
     for algo, (lr, rate) in best.items():
         print(f"  {algo}: lr={lr:.0e} (running correct rate: {rate*100:.1f}%)")
@@ -262,31 +262,31 @@ def main() -> int:
 
         if grpo_lr == full_lr:
             # Same lr for both — can use the campaign script
-            print(f"\n  Recommended campaign command (same lr for both arms):")
-            print(f"  nohup uv run python scripts/tinker_campaign.py \\")
+            print("\n  Recommended campaign command (same lr for both arms):")
+            print("  nohup uv run python scripts/tinker_campaign.py \\")
             print(f"      --max-steps 100 --batch-size {args.batch_size} \\")
             print(f"      --group-size {args.group_size} --lr {grpo_lr} \\")
             print(f"      --lora-rank {args.lora_rank} \\")
             print(f"      --sepa-steps {args.sepa_steps} --sepa-delay-steps {args.sepa_delay_steps} \\")
-            print(f"      --campaign-root results/tinker_campaign_v3_tuned \\")
-            print(f"      --save-every 25 --execute \\")
-            print(f"      > results/tinker_campaign_v3_tuned.log 2>&1 &")
+            print("      --campaign-root results/tinker_campaign_v3_tuned \\")
+            print("      --save-every 25 --execute \\")
+            print("      > results/tinker_campaign_v3_tuned.log 2>&1 &")
         else:
             # Different lr — need separate runs
-            print(f"\n  Different optimal lr per algorithm. Run separately:")
-            print(f"  # Baseline arm:")
-            print(f"  nohup uv run python -m textpolicy.tinker.train_math \\")
+            print("\n  Different optimal lr per algorithm. Run separately:")
+            print("  # Baseline arm:")
+            print("  nohup uv run python -m textpolicy.tinker.train_math \\")
             print(f"      --algorithm grpo --lr {grpo_lr} --lora-rank {args.lora_rank} \\")
             print(f"      --max-steps 100 --batch-size {args.batch_size} --group-size {args.group_size} \\")
-            print(f"      --log-dir results/tinker_campaign_v3_tuned/baseline \\")
-            print(f"      > results/tinker_campaign_v3_baseline.log 2>&1 &")
-            print(f"  # Candidate arm:")
-            print(f"  nohup uv run python -m textpolicy.tinker.train_math \\")
+            print("      --log-dir results/tinker_campaign_v3_tuned/baseline \\")
+            print("      > results/tinker_campaign_v3_baseline.log 2>&1 &")
+            print("  # Candidate arm:")
+            print("  nohup uv run python -m textpolicy.tinker.train_math \\")
             print(f"      --algorithm full --lr {full_lr} --lora-rank {args.lora_rank} \\")
             print(f"      --max-steps 100 --batch-size {args.batch_size} --group-size {args.group_size} \\")
             print(f"      --sepa-steps {args.sepa_steps} --sepa-delay-steps {args.sepa_delay_steps} \\")
-            print(f"      --log-dir results/tinker_campaign_v3_tuned/candidate \\")
-            print(f"      > results/tinker_campaign_v3_candidate.log 2>&1 &")
+            print("      --log-dir results/tinker_campaign_v3_tuned/candidate \\")
+            print("      > results/tinker_campaign_v3_candidate.log 2>&1 &")
 
     print(f"\n{'='*80}")
 

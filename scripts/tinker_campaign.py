@@ -162,10 +162,6 @@ def _compute_comparison(
     base_mean_reward = sum(base_rewards) / max(len(base_rewards), 1)
     cand_mean_reward = sum(cand_rewards) / max(len(cand_rewards), 1)
 
-    # Step-level summaries
-    base_step_rewards = [m["mean_reward"] for m in base_metrics if "mean_reward" in m]
-    cand_step_rewards = [m["mean_reward"] for m in cand_metrics if "mean_reward" in m]
-
     return {
         "baseline": {
             "total_generations": base_total,
@@ -428,7 +424,7 @@ def main() -> int:
         print(f"  Baseline: {baseline_dir}")
         print(f"  Candidate: {candidate_dir}")
         print(f"  Run script: {plan_path}")
-        print(f"\nTo execute: add --execute flag")
+        print("\nTo execute: add --execute flag")
         return 0
 
     # --- Execute both arms ---
@@ -486,7 +482,7 @@ def main() -> int:
         c = comparison["candidate"]
         d = comparison["delta"]
         print(f"\n{'='*60}")
-        print(f"  CAMPAIGN SUMMARY")
+        print("  CAMPAIGN SUMMARY")
         print(f"{'='*60}")
         print(f"  Baseline correct rate: {b['correct_rate']:.4f} ({b['correct']}/{b['total_generations']})")
         print(f"  Candidate correct rate: {c['correct_rate']:.4f} ({c['correct']}/{c['total_generations']})")

@@ -111,7 +111,7 @@ def main() -> int:
     args = parse_args()
     metrics_path = args.metrics_path
 
-    run = wandb.init(
+    wandb.init(
         project=args.project,
         entity=args.entity,
         name=args.run_name,

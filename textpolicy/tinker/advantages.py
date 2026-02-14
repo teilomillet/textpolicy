@@ -23,7 +23,6 @@ Source references (MLX originals, read-only):
 
 from __future__ import annotations
 
-import math
 import re
 from typing import List, Optional
 

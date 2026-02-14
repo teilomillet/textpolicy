@@ -36,10 +36,20 @@ import argparse
 import json
 import logging
 import os
-import re
 import time
 from pathlib import Path
-from typing import Any, Dict, List, Optional
+from typing import Dict, List, Optional
+
+from textpolicy.tinker.advantages import (
+    DEFAULT_STRATEGIC_GRAMS,
+    apply_gtpo_weighting,
+    apply_hicra,
+    apply_sepa_pooling,
+    compute_grpo_advantages,
+    compute_maxrl_advantages,
+    identify_planning_tokens,
+)
+from textpolicy.tinker.sepa import SEPAController
 
 # Load .env file if it exists (for TINKER_API_KEY)
 _env_path = Path(__file__).resolve().parents[2] / ".env"
@@ -52,21 +62,6 @@ if _env_path.exists():
                 os.environ.setdefault(key.strip(), value.strip())
 
 logger = logging.getLogger(__name__)
-
-# ---------------------------------------------------------------------------
-# Our advantage pipeline (pure Python, no tensor deps)
-# ---------------------------------------------------------------------------
-
-from textpolicy.tinker.advantages import (
-    compute_grpo_advantages,
-    compute_maxrl_advantages,
-    apply_gtpo_weighting,
-    apply_hicra,
-    apply_sepa_pooling,
-    identify_planning_tokens,
-    DEFAULT_STRATEGIC_GRAMS,
-)
-from textpolicy.tinker.sepa import SEPAController
 
 
 # ---------------------------------------------------------------------------
@@ -511,7 +506,7 @@ def train(args: argparse.Namespace) -> None:
         optim_future = training_client.optim_step(adam_params)
 
         fwd_bwd_result = fwd_bwd_future.result()
-        optim_result = optim_future.result()
+        optim_future.result()  # wait for optimizer step to complete
 
         step_time = time.time() - step_start
 
