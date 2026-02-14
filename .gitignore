@@ -218,3 +218,6 @@ results/
 
 # Model adapter artifacts from profiling/training runs
 *.safetensors
+
+# Local training logs
+logs/

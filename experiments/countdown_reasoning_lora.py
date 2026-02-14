@@ -55,7 +55,11 @@ from textpolicy.algorithms.grpo import (
     policy_loss,
 )
 from textpolicy.generation.lora import create_lora_setup
-from textpolicy.training import Trainer, build_gtpo_transform
+from textpolicy.training import (
+    Trainer,
+    build_gtpo_hicra_transform,
+    build_gtpo_transform,
+)
 
 
 @dataclass
@@ -84,6 +88,7 @@ class ReasoningConfig:
     sepa_schedule: str = "linear"
     sepa_delay_steps: int = 0
     sepa_correct_rate_gate: float = 0.0
+    transform_mode: str = "gtpo_hicra"
     use_maxrl: bool = False
 
     # Training
@@ -673,10 +678,34 @@ def run_experiment(config: ReasoningConfig) -> None:
 
     optimizer = optim.Adam(learning_rate=config.learning_rate)
 
+    allowed_transform_modes = {"gtpo_hicra", "gtpo", "gtpo_sepa", "hicra", "none"}
+    if config.transform_mode not in allowed_transform_modes:
+        raise ValueError(
+            f"Unknown transform_mode {config.transform_mode!r}. "
+            f"Expected one of {sorted(allowed_transform_modes)}."
+        )
+
     sepa_enabled = (config.sepa_steps > 0 or config.sepa_schedule == "auto")
     advantage_fn = compute_advantages_maxrl if config.use_maxrl else compute_advantages
     advantage_name = "MaxRL" if config.use_maxrl else "GRPO"
-    if sepa_enabled:
+    if config.transform_mode == "none":
+        print(f"{advantage_name} only: no token-level transform")
+    elif config.transform_mode == "hicra":
+        print(
+            f"HICRA only: gamma={config.hicra_gamma}, "
+            f"entropy_weight=0.0, advantage={advantage_name}"
+        )
+    elif config.transform_mode == "gtpo":
+        print(
+            f"GTPO only: α₁={config.alpha_1}, α₂={config.alpha_2}, "
+            f"threshold={config.reward_threshold}, advantage={advantage_name}"
+        )
+    elif config.transform_mode == "gtpo_sepa":
+        if not sepa_enabled:
+            raise ValueError(
+                "transform_mode='gtpo_sepa' requires SEPA enabled "
+                "(set sepa_steps > 0 or sepa_schedule='auto')."
+            )
         print(
             f"GTPO + SEPA: α₁={config.alpha_1}, α₂={config.alpha_2}, "
             f"threshold={config.reward_threshold}, "
@@ -686,11 +715,21 @@ def run_experiment(config: ReasoningConfig) -> None:
             f"advantage={advantage_name}"
         )
     else:
-        print(
-            f"GTPO + HICRA: α₁={config.alpha_1}, α₂={config.alpha_2}, "
-            f"threshold={config.reward_threshold}, γ_hicra={config.hicra_gamma}, "
-            f"advantage={advantage_name}"
-        )
+        if sepa_enabled:
+            print(
+                f"GTPO + SEPA: α₁={config.alpha_1}, α₂={config.alpha_2}, "
+                f"threshold={config.reward_threshold}, "
+                f"schedule={config.sepa_schedule}, sepa_steps={config.sepa_steps}, "
+                f"sepa_delay_steps={config.sepa_delay_steps}, "
+                f"sepa_correct_rate_gate={config.sepa_correct_rate_gate}, "
+                f"advantage={advantage_name}"
+            )
+        else:
+            print(
+                f"GTPO + HICRA: α₁={config.alpha_1}, α₂={config.alpha_2}, "
+                f"threshold={config.reward_threshold}, γ_hicra={config.hicra_gamma}, "
+                f"advantage={advantage_name}"
+            )
 
     # Enable per-step policy metrics only when wandb will actually be active.
     # Otherwise this triggers an extra model forward pass every step with no
@@ -712,20 +751,58 @@ def run_experiment(config: ReasoningConfig) -> None:
         adapter_save_path=str(output_dir / "lora_adapters.safetensors"),
     )
 
-    # 2. GTPO advantage transform (arXiv 2508.04349 Eq. 3, 5, 6)
-    transform = build_gtpo_transform(
-        alpha_1=config.alpha_1,
-        alpha_2=config.alpha_2,
-        reward_threshold=config.reward_threshold,
-        tokenizer=tokenizer,
-        strategic_grams=strategic_grams,
-        hicra_gamma=config.hicra_gamma,
-        sepa_steps=config.sepa_steps,
-        sepa_schedule=config.sepa_schedule,
-        sepa_delay_steps=config.sepa_delay_steps,
-        sepa_correct_rate_gate=config.sepa_correct_rate_gate,
-        use_maxrl_base=config.use_maxrl,
-    )
+    # 2. Token-level transform (GTPO/HICRA/SEPA) or raw prompt-level only.
+    if config.transform_mode == "none":
+        transform = None
+    elif config.transform_mode == "hicra":
+        transform = build_gtpo_hicra_transform(
+            tokenizer,
+            strategic_grams=strategic_grams,
+            hicra_alpha=config.hicra_gamma,
+            entropy_weight=0.0,
+        )
+    elif config.transform_mode == "gtpo":
+        transform = build_gtpo_transform(
+            alpha_1=config.alpha_1,
+            alpha_2=config.alpha_2,
+            reward_threshold=config.reward_threshold,
+            tokenizer=tokenizer,
+            strategic_grams=strategic_grams,
+            hicra_gamma=0.0,
+            sepa_steps=0,
+            sepa_schedule="linear",
+            sepa_delay_steps=0,
+            sepa_correct_rate_gate=0.0,
+            use_maxrl_base=config.use_maxrl,
+        )
+    elif config.transform_mode == "gtpo_sepa":
+        transform = build_gtpo_transform(
+            alpha_1=config.alpha_1,
+            alpha_2=config.alpha_2,
+            reward_threshold=config.reward_threshold,
+            tokenizer=tokenizer,
+            strategic_grams=strategic_grams,
+            hicra_gamma=0.0,
+            sepa_steps=config.sepa_steps,
+            sepa_schedule=config.sepa_schedule,
+            sepa_delay_steps=config.sepa_delay_steps,
+            sepa_correct_rate_gate=config.sepa_correct_rate_gate,
+            use_maxrl_base=config.use_maxrl,
+        )
+    else:
+        transform = build_gtpo_transform(
+            alpha_1=config.alpha_1,
+            alpha_2=config.alpha_2,
+            reward_threshold=config.reward_threshold,
+            tokenizer=tokenizer,
+            strategic_grams=strategic_grams,
+            hicra_gamma=config.hicra_gamma,
+            sepa_steps=config.sepa_steps,
+            sepa_schedule=config.sepa_schedule,
+            sepa_delay_steps=config.sepa_delay_steps,
+            sepa_correct_rate_gate=config.sepa_correct_rate_gate,
+            use_maxrl_base=config.use_maxrl,
+        )
 
     # 3. Trainer
     trainer = Trainer(
@@ -1054,6 +1131,15 @@ if __name__ == "__main__":
         ),
     )
     parser.add_argument(
+        "--transform-mode",
+        choices=["gtpo_hicra", "gtpo", "gtpo_sepa", "hicra", "none"],
+        default="gtpo_hicra",
+        help=(
+            "Token-level transform mode: "
+            "gtpo_hicra (default), gtpo, gtpo_sepa, hicra, or none."
+        ),
+    )
+    parser.add_argument(
         "--maxrl",
         action="store_true",
         help=(
@@ -1149,6 +1235,7 @@ if __name__ == "__main__":
         sepa_schedule=args.sepa_schedule,
         sepa_delay_steps=args.sepa_delay_steps,
         sepa_correct_rate_gate=args.sepa_correct_rate_gate,
+        transform_mode=args.transform_mode,
         use_maxrl=args.maxrl,
         wandb_project=args.wandb_project,
         wandb_run_name=args.wandb_run_name,
