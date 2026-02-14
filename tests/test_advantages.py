@@ -26,7 +26,6 @@ from textpolicy.tinker.advantages import (
     apply_hicra,
     apply_sepa_pooling,
     identify_planning_tokens,
-    DEFAULT_STRATEGIC_GRAMS,
 )
 from textpolicy.tinker.sepa import SEPAController
 from textpolicy.tinker.train_math import compute_token_advantages
@@ -249,7 +248,6 @@ class TestSEPAPooling:
         mask = [0, 1, 0]  # Token 1 is planning
         result = apply_sepa_pooling(entropies, mask, lambda_t=0.5)
 
-        exec_mean = (1.0 + 3.0) / 2  # = 2.0
         # Token 0: 0.5 * 2.0 + 0.5 * 1.0 = 1.5
         assert approx_eq(result[0], 1.5)
         # Token 1: planning, unchanged
@@ -494,7 +492,6 @@ class TestCrossValidation:
     def test_maxrl_matches_mlx(self):
         """MaxRL: Python port matches grpo.compute_advantages_maxrl."""
         try:
-            import mlx.core as mx
             from textpolicy.algorithms.grpo import compute_advantages_maxrl
         except ImportError:
             pytest.skip("MLX not available")

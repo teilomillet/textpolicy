@@ -26,7 +26,6 @@ try:
 except ImportError:
     HAS_WANDB = False
 
-import mlx.core as mx
 import mlx.optimizers as optim
 
 from textpolicy.algorithms import grpo
