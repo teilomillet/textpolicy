@@ -354,6 +354,9 @@ def train(args: argparse.Namespace) -> None:
         batch_correct = 0
         batch_max_token_hits = 0
         batch_total_completions = 0
+        # Accumulate across all prompt groups for SEPA auto-schedule
+        all_sampled_tokens = []
+        all_logprobs = []
 
         for future, (prompt_text, prompt_ids), answer in zip(
             sample_futures, batch_prompts, batch_answers
@@ -376,6 +379,9 @@ def train(args: argparse.Namespace) -> None:
                 rewards_G.append(reward)
                 sampled_tokens_G.append(completion_tokens)
                 logprobs_G.append(list(seq.logprobs))
+
+            all_sampled_tokens.extend(sampled_tokens_G)
+            all_logprobs.extend(logprobs_G)
 
             batch_rewards.extend(rewards_G)
             batch_correct += sum(1 for r in rewards_G if r > 0.5)
@@ -481,7 +487,7 @@ def train(args: argparse.Namespace) -> None:
             sepa_controller.observe_correct_rate(correct_rate)
 
             if sepa_controller.enabled and sepa_controller.sepa_schedule == "auto":
-                for tokens, logprobs in zip(sampled_tokens_G, logprobs_G):
+                for tokens, logprobs in zip(all_sampled_tokens, all_logprobs):
                     planning_mask = identify_planning_tokens(
                         tokens, tokenizer,
                         args.strategic_grams or DEFAULT_STRATEGIC_GRAMS,
