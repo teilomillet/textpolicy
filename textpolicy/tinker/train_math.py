@@ -4,11 +4,23 @@
 Train Qwen3-4B on MATH with textpolicy's advantage pipeline via Tinker.
 
 This script forks Tinker's cookbook rl_loop.py and replaces the advantage
-computation with our full pipeline:
-    MaxRL → GTPO → HICRA → SEPA → token-level advantages
+computation with our composable pipeline:
 
-Everything else (sampling, forward_backward, optim_step) uses Tinker's
-existing infrastructure unchanged.
+    [advantage-mode] → [transform-mode] → token-level advantages
+
+Advantage modes (episode-level):
+    grpo   — vanilla group-relative centering: A_i = r_i - mean(r)
+    maxrl  — inverse success-rate reweighting: A_i = (r_i - mean(r)) / mean(r)
+
+Transform modes (token-level):
+    none       — uniform: scalar advantage repeated for all tokens
+    gtpo       — entropy-weighted credit assignment
+    gtpo_hicra — GTPO + planning token amplification (additive boost)
+    gtpo_sepa  — GTPO + selective entropy pooling (execution variance reduction)
+
+The 2x4 combination gives 8 experimental conditions for ablation.
+
+Legacy: --algorithm grpo maps to grpo+none, --algorithm full maps to maxrl+gtpo_sepa.
 
 Usage:
     # Set your API key
@@ -17,13 +29,12 @@ Usage:
     # Run training (smoke test):
     python -m textpolicy.tinker.train_math --max-steps 5 --group-size 4
 
-    # Full run:
-    python -m textpolicy.tinker.train_math --max-steps 500
+    # 8-cell ablation examples:
+    python -m textpolicy.tinker.train_math --advantage-mode grpo --transform-mode none
+    python -m textpolicy.tinker.train_math --advantage-mode maxrl --transform-mode gtpo_sepa
 
-    # Custom hyperparameters:
-    python -m textpolicy.tinker.train_math \\
-        --gtpo-beta 0.15 --hicra-alpha 0.25 \\
-        --sepa-steps 300 --sepa-schedule linear
+    # Legacy (still works):
+    python -m textpolicy.tinker.train_math --algorithm full
 
 References:
     Tinker cookbook: tinker_cookbook/recipes/rl_loop.py
@@ -143,75 +154,134 @@ def load_math_dataset(
 # Token-level advantage computation
 # ---------------------------------------------------------------------------
 
-def compute_token_advantages(
+def compute_composable_advantages(
     rewards_G: List[float],
     sampled_tokens_G: List[List[int]],
     logprobs_G: List[List[float]],
     tokenizer,
     *,
+    advantage_mode: str = "grpo",
+    transform_mode: str = "none",
     gtpo_beta: float = 0.1,
     hicra_alpha: float = 0.2,
     sepa_lambda: float = 0.0,
     strategic_grams: Optional[List[str]] = None,
-) -> List[List[float]]:
+) -> tuple:
     """
-    Compute token-level advantages for a group of completions.
+    Compute token-level advantages with composable episode/token transforms.
 
-    Pipeline: MaxRL → GTPO → (SEPA →) HICRA → token-level advantages.
+    Args:
+        rewards_G: Per-completion rewards for one prompt group.
+        sampled_tokens_G: Token IDs per completion.
+        logprobs_G: Log-probabilities per token per completion.
+        tokenizer: HuggingFace tokenizer for planning token detection.
+        advantage_mode: Episode-level objective ('grpo' or 'maxrl').
+        transform_mode: Token-level transform ('none', 'gtpo', 'gtpo_hicra', 'gtpo_sepa').
+        gtpo_beta: GTPO entropy weighting strength.
+        hicra_alpha: HICRA planning amplification factor.
+        sepa_lambda: SEPA pooling strength (from SEPAController).
+        strategic_grams: Planning phrases for HICRA/SEPA.
+
+    Returns:
+        Tuple of (token_advantages, entropy_stats) where entropy_stats is a
+        dict with exec/plan entropy metrics (for H5 logging), or None if
+        transform_mode is 'none'.
     """
     if strategic_grams is None:
         strategic_grams = DEFAULT_STRATEGIC_GRAMS
 
-    # Step 1: MaxRL group-relative advantages (scalar per completion)
-    advantages_G = compute_maxrl_advantages(rewards_G)
+    # Step 1: Episode-level advantages (scalar per completion)
+    if advantage_mode == "maxrl":
+        advantages_G = compute_maxrl_advantages(rewards_G)
+    else:
+        advantages_G = compute_grpo_advantages(rewards_G)
 
-    # Step 2: For each completion, compute token-level advantages
+    # Step 2: Token-level expansion
+    if transform_mode == "none":
+        # Uniform: repeat scalar advantage for all tokens
+        all_token_advs = []
+        for tokens, advantage in zip(sampled_tokens_G, advantages_G):
+            all_token_advs.append([advantage] * len(tokens))
+        return all_token_advs, None
+
+    # For all GTPO-based transforms, we need entropies
     all_token_advs = []
+    all_exec_entropies = []
+    all_plan_entropies = []
+
+    needs_planning = transform_mode in ("gtpo_hicra", "gtpo_sepa")
+
     for tokens, logprobs, advantage in zip(
         sampled_tokens_G, logprobs_G, advantages_G
     ):
-        # Entropy proxy: -logprob (higher = more uncertain)
+        # Entropy proxy: -logprob
         entropies = [-lp for lp in logprobs]
 
-        # HICRA: identify planning tokens (needed for both SEPA and HICRA)
-        planning_mask = identify_planning_tokens(
-            tokens, tokenizer, strategic_grams
-        )
+        if needs_planning:
+            planning_mask = identify_planning_tokens(
+                tokens, tokenizer, strategic_grams
+            )
+        else:
+            planning_mask = [0] * len(tokens)
 
-        # SEPA: pool execution-token entropy toward their mean
-        if sepa_lambda > 0.0:
+        # Collect entropy stats (for H5 logging)
+        for h, m in zip(entropies, planning_mask):
+            if m:
+                all_plan_entropies.append(h)
+            else:
+                all_exec_entropies.append(h)
+
+        # SEPA: pool execution entropy (only for gtpo_sepa)
+        if transform_mode == "gtpo_sepa" and sepa_lambda > 0.0:
             entropies = apply_sepa_pooling(entropies, planning_mask, sepa_lambda)
 
         # GTPO: entropy-weighted credit assignment
         token_advs = apply_gtpo_weighting(advantage, entropies, beta=gtpo_beta)
 
-        # HICRA: amplify planning tokens
-        token_advs = apply_hicra(token_advs, planning_mask, alpha=hicra_alpha)
+        # HICRA: amplify planning tokens (only for gtpo_hicra)
+        if transform_mode == "gtpo_hicra":
+            token_advs = apply_hicra(token_advs, planning_mask, alpha=hicra_alpha)
 
         all_token_advs.append(token_advs)
 
-    return all_token_advs
+    # Compute entropy distribution stats for H5
+    entropy_stats = _compute_entropy_stats(all_exec_entropies, all_plan_entropies)
+
+    return all_token_advs, entropy_stats
 
 
-def compute_baseline_advantages(
-    rewards_G: List[float],
-    sampled_tokens_G: List[List[int]],
-) -> List[List[float]]:
-    """
-    Compute baseline GRPO advantages: scalar per completion, repeated for
-    all tokens. No GTPO/HICRA/SEPA — just group-relative centering.
+def _compute_entropy_stats(
+    exec_entropies: List[float],
+    plan_entropies: List[float],
+) -> Dict[str, float]:
+    """Compute summary stats for execution vs planning entropy distributions."""
+    stats: Dict[str, float] = {}
 
-    This is the control arm for A/B comparison.
-    """
-    # Simple reward centering: A_i = r_i - mean(r)
-    advantages_G = compute_grpo_advantages(rewards_G)
+    if exec_entropies:
+        n = len(exec_entropies)
+        mean_e = sum(exec_entropies) / n
+        var_e = sum((h - mean_e) ** 2 for h in exec_entropies) / n
+        stats["exec_entropy_mean"] = mean_e
+        stats["exec_entropy_var"] = var_e
+        stats["exec_entropy_count"] = float(n)
+    else:
+        stats["exec_entropy_mean"] = 0.0
+        stats["exec_entropy_var"] = 0.0
+        stats["exec_entropy_count"] = 0.0
 
-    # Repeat scalar advantage for every token (uniform weighting)
-    all_token_advs = []
-    for tokens, advantage in zip(sampled_tokens_G, advantages_G):
-        all_token_advs.append([advantage] * len(tokens))
+    if plan_entropies:
+        n = len(plan_entropies)
+        mean_p = sum(plan_entropies) / n
+        var_p = sum((h - mean_p) ** 2 for h in plan_entropies) / n
+        stats["plan_entropy_mean"] = mean_p
+        stats["plan_entropy_var"] = var_p
+        stats["plan_entropy_count"] = float(n)
+    else:
+        stats["plan_entropy_mean"] = 0.0
+        stats["plan_entropy_var"] = 0.0
+        stats["plan_entropy_count"] = 0.0
 
-    return all_token_advs
+    return stats
 
 
 # ---------------------------------------------------------------------------
@@ -289,6 +359,40 @@ def train(args: argparse.Namespace) -> None:
 
     metrics_path = log_path / "metrics.jsonl"
 
+    # --- Wandb ---
+    wandb_run = None
+    if args.wandb_project:
+        try:
+            import wandb
+            condition_label_init = f"{args.advantage_mode}+{args.transform_mode}"
+            run_name = args.wandb_run_name or condition_label_init
+            wandb_run = wandb.init(
+                project=args.wandb_project,
+                name=run_name,
+                config={
+                    "advantage_mode": args.advantage_mode,
+                    "transform_mode": args.transform_mode,
+                    "condition": condition_label_init,
+                    "model": args.model,
+                    "lora_rank": args.lora_rank,
+                    "lr": args.lr,
+                    "batch_size": args.batch_size,
+                    "group_size": args.group_size,
+                    "max_tokens": args.max_tokens,
+                    "temperature": args.temperature,
+                    "gtpo_beta": args.gtpo_beta,
+                    "hicra_alpha": args.hicra_alpha,
+                    "sepa_steps": args.sepa_steps,
+                    "sepa_schedule": args.sepa_schedule,
+                    "sepa_delay_steps": args.sepa_delay_steps,
+                    "sepa_correct_rate_gate": args.sepa_correct_rate_gate,
+                    "max_steps": args.max_steps,
+                },
+            )
+            logger.info("Wandb initialized: %s/%s", args.wandb_project, run_name)
+        except ImportError:
+            logger.warning("wandb not installed, skipping wandb logging")
+
     # --- Training loop ---
     example_idx = 0
     total_correct = 0
@@ -349,6 +453,7 @@ def train(args: argparse.Namespace) -> None:
         batch_correct = 0
         batch_max_token_hits = 0
         batch_total_completions = 0
+        batch_entropy_stats: List[Dict[str, float]] = []
         # Accumulate across all prompt groups for SEPA auto-schedule
         all_sampled_tokens = []
         all_logprobs = []
@@ -401,27 +506,25 @@ def train(args: argparse.Namespace) -> None:
                             "correct" if rewards_G[0] > 0.5 else "wrong")
                 continue
 
-            # Compute advantages using the selected algorithm
-            if args.algorithm == "grpo":
-                # Baseline: scalar GRPO advantages, uniform across tokens
-                token_advs_G = compute_baseline_advantages(
-                    rewards_G=rewards_G,
-                    sampled_tokens_G=sampled_tokens_G,
-                )
-                sepa_lambda = 0.0
-            else:
-                # Full pipeline: MaxRL → GTPO → SEPA → HICRA
+            # Compute advantages using composable pipeline
+            sepa_lambda = 0.0
+            if args.transform_mode == "gtpo_sepa":
                 sepa_lambda = sepa_controller.resolve_lambda(step=batch_idx)
-                token_advs_G = compute_token_advantages(
-                    rewards_G=rewards_G,
-                    sampled_tokens_G=sampled_tokens_G,
-                    logprobs_G=logprobs_G,
-                    tokenizer=tokenizer,
-                    gtpo_beta=args.gtpo_beta,
-                    hicra_alpha=args.hicra_alpha,
-                    sepa_lambda=sepa_lambda,
-                    strategic_grams=args.strategic_grams,
-                )
+
+            token_advs_G, entropy_stats = compute_composable_advantages(
+                rewards_G=rewards_G,
+                sampled_tokens_G=sampled_tokens_G,
+                logprobs_G=logprobs_G,
+                tokenizer=tokenizer,
+                advantage_mode=args.advantage_mode,
+                transform_mode=args.transform_mode,
+                gtpo_beta=args.gtpo_beta,
+                hicra_alpha=args.hicra_alpha,
+                sepa_lambda=sepa_lambda,
+                strategic_grams=args.strategic_grams,
+            )
+            if entropy_stats:
+                batch_entropy_stats.append(entropy_stats)
 
             # Build Datum objects for Tinker
             for seq, token_advs in zip(sample_result.sequences, token_advs_G):
@@ -473,12 +576,12 @@ def train(args: argparse.Namespace) -> None:
                         "metadata": {"correctness": reward >= 0.99},
                     }) + "\n")
 
-        # ---- 4. SEPA state updates (full pipeline only) ----
+        # ---- 4. SEPA state updates (gtpo_sepa transform only) ----
         total_completions += len(batch_rewards)
         total_correct += batch_correct
         correct_rate = batch_correct / max(len(batch_rewards), 1)
 
-        if args.algorithm == "full":
+        if args.transform_mode == "gtpo_sepa":
             sepa_controller.observe_correct_rate(correct_rate)
 
             if sepa_controller.enabled and sepa_controller.sepa_schedule == "auto":
@@ -528,40 +631,56 @@ def train(args: argparse.Namespace) -> None:
             batch_max_token_hits / max(batch_total_completions, 1)
         )
 
+        # Aggregate entropy stats across prompt groups for this step
+        step_entropy: Dict[str, float] = {}
+        if batch_entropy_stats:
+            for key in ("exec_entropy_mean", "exec_entropy_var",
+                        "plan_entropy_mean", "plan_entropy_var"):
+                values = [s[key] for s in batch_entropy_stats if key in s]
+                step_entropy[key] = sum(values) / len(values) if values else 0.0
+
+        condition_label = f"{args.advantage_mode}+{args.transform_mode}"
         step_metrics = {
             "step": batch_idx,
-            "algorithm": args.algorithm,
+            "advantage_mode": args.advantage_mode,
+            "transform_mode": args.transform_mode,
+            "condition": condition_label,
             "loss": loss_value,
             "mean_reward": mean_reward,
             "correct_rate": correct_rate,
             "running_correct_rate": running_correct_rate,
-            "sepa_lambda": sepa_lambda if args.algorithm == "full" else 0.0,
-            "sepa_gate_open": sepa_controller.gate_open if args.algorithm == "full" else False,
+            "sepa_lambda": sepa_lambda,
+            "sepa_gate_open": sepa_controller.gate_open if args.transform_mode == "gtpo_sepa" else False,
             "num_datums": len(datums),
             "max_token_hit_rate": max_token_hit_rate,
             "step_time_s": step_time,
         }
+        step_metrics.update(step_entropy)
 
         logger.info(
-            "Step %d | loss=%.4f | reward=%.2f | correct=%.1f%% | "
+            "Step %d [%s] | loss=%.4f | reward=%.2f | correct=%.1f%% | "
             "datums=%d | sepa_λ=%.3f | time=%.1fs",
-            batch_idx, loss_value, mean_reward,
-            correct_rate * 100, len(datums),
-            sepa_controller.resolve_lambda(step=batch_idx),
-            step_time,
+            batch_idx, condition_label, loss_value, mean_reward,
+            correct_rate * 100, len(datums), sepa_lambda, step_time,
         )
 
         with open(metrics_path, "a") as f:
             f.write(json.dumps(step_metrics) + "\n")
 
+        if wandb_run is not None:
+            wandb_run.log(step_metrics, step=batch_idx)
+
         # Emergence-compatible step record (for significance analysis)
+        step_record = {
+            "step": batch_idx,
+            "mean_reward": mean_reward,
+            "correct_count": batch_correct,
+            "total_count": len(batch_rewards),
+            "condition": condition_label,
+        }
+        step_record.update(step_entropy)
         with open(steps_path, "a") as sf:
-            sf.write(json.dumps({
-                "step": batch_idx,
-                "mean_reward": mean_reward,
-                "correct_count": batch_correct,
-                "total_count": len(batch_rewards),
-            }) + "\n")
+            sf.write(json.dumps(step_record) + "\n")
 
         # Periodic checkpoint
         if args.save_every and (batch_idx + 1) % args.save_every == 0:
@@ -572,11 +691,14 @@ def train(args: argparse.Namespace) -> None:
     # Save final checkpoint
     training_client.save_state(name="final")
     logger.info(
-        "Training complete. algorithm=%s, %d steps, running correct rate: %.1f%%",
-        args.algorithm, args.max_steps,
+        "Training complete. %s+%s, %d steps, running correct rate: %.1f%%",
+        args.advantage_mode, args.transform_mode, args.max_steps,
         100.0 * total_correct / max(total_completions, 1),
     )
     logger.info("Metrics saved to %s", metrics_path)
+
+    if wandb_run is not None:
+        wandb_run.finish()
 
 
 # ---------------------------------------------------------------------------
@@ -588,11 +710,23 @@ def parse_args() -> argparse.Namespace:
         description="Train on MATH with textpolicy advantages via Tinker"
     )
 
-    # Algorithm selection
+    # Composable algorithm selection (new)
     parser.add_argument(
-        "--algorithm", type=str, default="full",
+        "--advantage-mode", type=str, default=None,
+        choices=["grpo", "maxrl"],
+        help="Episode-level objective: 'grpo' (centering) or 'maxrl' (1/p reweighting)",
+    )
+    parser.add_argument(
+        "--transform-mode", type=str, default=None,
+        choices=["none", "gtpo", "gtpo_hicra", "gtpo_sepa"],
+        help="Token-level transform: 'none', 'gtpo', 'gtpo_hicra', 'gtpo_sepa'",
+    )
+
+    # Legacy algorithm selection (backward compat)
+    parser.add_argument(
+        "--algorithm", type=str, default=None,
         choices=["grpo", "full"],
-        help="Advantage algorithm: 'grpo' (baseline) or 'full' (MaxRL+GTPO+HICRA+SEPA)",
+        help="(Legacy) 'grpo' = grpo+none, 'full' = maxrl+gtpo_sepa",
     )
 
     # Model & Tinker
@@ -641,8 +775,32 @@ def parse_args() -> argparse.Namespace:
 
     # Logging
     parser.add_argument("--log-dir", type=str, default="logs/tinker_math")
+    parser.add_argument("--wandb-project", type=str, default=None,
+                        help="Wandb project name (enables wandb logging)")
+    parser.add_argument("--wandb-run-name", type=str, default=None,
+                        help="Wandb run name (default: auto-generated from condition)")
 
     args = parser.parse_args()
+
+    # Resolve composable vs legacy algorithm flags
+    if args.algorithm is not None:
+        # Legacy mode: map to composable flags
+        if args.advantage_mode is not None or args.transform_mode is not None:
+            parser.error(
+                "--algorithm cannot be used with --advantage-mode/--transform-mode"
+            )
+        if args.algorithm == "grpo":
+            args.advantage_mode = "grpo"
+            args.transform_mode = "none"
+        else:  # "full"
+            args.advantage_mode = "maxrl"
+            args.transform_mode = "gtpo_sepa"
+    else:
+        # Composable mode: defaults
+        if args.advantage_mode is None:
+            args.advantage_mode = "maxrl"
+        if args.transform_mode is None:
+            args.transform_mode = "gtpo_sepa"
 
     if args.strategic_grams:
         args.strategic_grams = json.loads(args.strategic_grams)
